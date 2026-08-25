@@ -596,7 +596,8 @@ class MainActivity : ComponentActivity() {
         "Gusto mo bang makipag laro sakin %s!",
         "%s! kumain kana ba",
         "%s! Tara laro tayo",
-        "Ikaw ba %s! ay nakapag pahinga ng maayos, wag ka ka babad sa pagkocode, tumagay ka rin",
+        "Ikaw ba %s! ay nakapag pahinga ng maayos, wag ka ka babad sa pagkocode, Tumagay ka rin",
+        "Nagyayaya ba ang tropa ng inuman?",
     )
 
     private val unknownGreetings = listOf(
@@ -608,6 +609,7 @@ class MainActivity : ComponentActivity() {
         "Ngayon ka lan ba naka kita ng laruan na kagaya ko",
         "Kumain na ba kayo",
         "tara laro tayo",
+        "Nagyayaya ba ang tropa ng inuman?",
         "Huwag mo ako kalimutan na e charge!",
         
         
@@ -801,7 +803,10 @@ class MainActivity : ComponentActivity() {
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
-                speak(custom.reply)
+                // randomReply() para pumili ng isa sa mga "||"-separated na variation ng
+                // sagot (kung meron) - kaya hindi laging pareho ang sinasabi kahit paulit
+                // ulit na tinatanong, mas mukhang buhay/AI ang dating imbes na robotic.
+                speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
                     val actionUpper = custom.action.uppercase()
                     if (actionUpper in movementActions) {
@@ -844,9 +849,18 @@ class MainActivity : ComponentActivity() {
                     speak(reply)
                     return "sino ako"
                 }
-                text.contains("sino ka") -> {
-                    speak("ako ay si rustech")
-                    return "sino ka"
+        text.contains("sino ka") || text.contains("ano pangalan mo") || 
+        text.contains("ano ngalan mo") || text.contains("ano name mo") || 
+        text.contains("sino ka ba") || text.contains("pangalan mo") || text.contains("name mo") -> {
+    val rustechReplies = listOf(
+        "Ako ay si Rustech.. Ang laruan mo na ROBOT!",
+        "Ako ay si Rustech, ang kaibigan mo!",
+        "Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo.",
+        "Rustech ang pangalan ko, ang paborito mong robot companion!",
+        "Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!"
+    )
+    speak(rustechReplies.random())
+    return "sino ka"
                 }
             }
         }
@@ -1065,7 +1079,10 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
                 }
                 row.addView(TextView(this@MainActivity).apply {
                     val actionPart = if (cmd.action.isNotBlank()) " [ESP32: ${cmd.action}]" else ""
-                    text = "\"${cmd.trigger}\" -> \"${cmd.reply}\"$actionPart"
+                    // Ipinapakita ang bawat "||"-separated na reply variation na naka-hiwalay
+                    // ng " / " sa listahan, para malinaw kahit may ilang variation na naka-save.
+                    val replyDisplay = cmd.reply.replace("||", " / ")
+                    text = "\"${cmd.trigger}\" -> \"$replyDisplay\"$actionPart"
                     textSize = 13f
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 })
@@ -1101,7 +1118,7 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val replyInput = EditText(this).apply {
-            hint = "Isasagot ng robot"
+            hint = "Isasagot ng robot (hiwalayin ng || kung gusto ng ilang variation)"
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val actionInput = EditText(this).apply {
@@ -1110,6 +1127,13 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
         }
         container.addView(triggerInput)
         container.addView(replyInput)
+        container.addView(
+            TextView(this).apply {
+                text = "Tip: pwede maglagay ng maraming sagot na pinaghihiwalay ng || (hal. \"sige||ok sige||heto na\") - random na pipiliin ng robot para di paulit-ulit."
+                textSize = 11f
+                setPadding(0, 4, 0, 12)
+            }
+        )
         container.addView(actionInput)
 
         val scrollView = ScrollView(this).apply { addView(container) }
