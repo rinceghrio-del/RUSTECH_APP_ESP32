@@ -109,6 +109,7 @@ class MainActivity : ComponentActivity() {
 
     private val closeFaceWidthRatio = 0.40f
     private val farFaceWidthRatio = 0.20f
+    private val tooFarFaceWidthRatio = 0.08f
 
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
@@ -953,13 +954,14 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
     val leftBoundary = screenCenterX - centerDeadzoneWidth
     val rightBoundary = screenCenterX + centerDeadzoneWidth
 
-       return when {
+           return when {
         // Mirrored ang front camera input:
         // Kapag ang mukha ay nasa kaliwa sa pixel coordinates (faceCenterX < leftBoundary),
         // kailangang pumaling ng robot sa KANAN (RIGHT) para pumunta sa gitna ang mukha.
         faceCenterX < leftBoundary -> "RIGHT"
         faceCenterX > rightBoundary -> "LEFT"
-        faceWidthRatio < farFaceWidthRatio -> "FORWARD" // nasa gitna pero malayo pa - lalapit
+        faceWidthRatio < tooFarFaceWidthRatio -> "STOP" // sobrang layo na / hindi na maasahang detection - wag nang lapitan
+        faceWidthRatio < farFaceWidthRatio -> "FORWARD" // nasa gitna, malayo pa pero kaya pa lapitan
         else -> "STOP" // maayos na distansya at nasa gitna
     }
 }
