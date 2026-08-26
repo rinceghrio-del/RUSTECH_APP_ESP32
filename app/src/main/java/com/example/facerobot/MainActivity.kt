@@ -89,7 +89,7 @@ class MainActivity : ComponentActivity() {
 
     private val prefs by lazy { getSharedPreferences("facerobot_prefs", MODE_PRIVATE) }
     private var esp32BaseUrl: String
-        get() = "http://" + prefs.getString("esp32_ip", "192.168.1.25")!!
+        get() = "http://" + prefs.getString("esp32_ip", "10.37.191.169")!!
         set(value) {
             val ipOnly = value.removePrefix("http://").removePrefix("https://").trim()
             prefs.edit().putString("esp32_ip", ipOnly).apply()
@@ -109,7 +109,7 @@ class MainActivity : ComponentActivity() {
 
     private val closeFaceWidthRatio = 0.40f
     private val farFaceWidthRatio = 0.20f
-    private val tooFarFaceWidthRatio = 0.08f
+    private val tooFarFaceWidthRatio = 0.12f
 
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
