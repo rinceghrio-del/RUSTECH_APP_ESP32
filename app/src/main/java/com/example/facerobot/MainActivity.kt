@@ -108,8 +108,8 @@ class MainActivity : ComponentActivity() {
     private val recognitionIntervalMs = 600L
 
     private val closeFaceWidthRatio = 0.40f
-    private val farFaceWidthRatio = 0.20f
-    private val tooFarFaceWidthRatio = 0.12f
+    private val farFaceWidthRatio = 0.23f
+    private val tooFarFaceWidthRatio = 0.15f
 
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
@@ -151,6 +151,7 @@ class MainActivity : ComponentActivity() {
     // mahabang galaw bago tumigil ang robot.
     private val voiceMovementDurationMs = 3000L
     private val movementActions = setOf("FORWARD", "BACKWARD", "LEFT", "RIGHT")
+    private var voiceOverrideActive = false
 
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
@@ -549,7 +550,9 @@ class MainActivity : ComponentActivity() {
 
         // Kukunin lang ang LEFT/RIGHT o STOP (Paggitna)
         val command = computeCommand(box, frameWidth)
-        sendCommandThrottled(command)
+        if (!voiceOverrideActive) {
+            sendCommandThrottled(command)
+        }
 
         val now = System.currentTimeMillis()
         if (faceEmbedder.isReady && now - lastRecognitionTime > recognitionIntervalMs) {
@@ -980,7 +983,8 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
      * autonomous/ultrasonic logic ng ESP32 bago pa matapos yung galaw. Dagdagan ang
      * durationMs kung gusto ng mas mahabang galaw.
      */
-    private fun sendTimedCommand(command: String, durationMs: Long) {
+        private fun sendTimedCommand(command: String, durationMs: Long) {
+        voiceOverrideActive = true
         val handler = Handler(mainLooper)
         val endTime = System.currentTimeMillis() + durationMs
         val runnable = object : Runnable {
@@ -990,6 +994,7 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
                     handler.postDelayed(this, 300)
                 } else {
                     sendCommandToEsp32("STOP")
+                    voiceOverrideActive = false
                 }
             }
         }
