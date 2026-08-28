@@ -131,6 +131,17 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getFloat("too_far_face_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
 
+    // ---------- Wake word ----------
+    // Kailangan munang marinig ang wake word bago tumugon/gumana ang mga voice command.
+    // Naka-save sa SharedPreferences kaya editable via Menu > Wake Word nang walang rebuild.
+    private var wakeWord: String
+        get() = prefs.getString("wake_word", "rustech") ?: "rustech"
+        set(value) { prefs.edit().putString("wake_word", value.trim()).apply() }
+
+    private var isAwake = false
+    private var wakeExpireTime = 0L
+    private val wakeWindowMs = 6000L // ilang ms bukas ang "pakikinig" pagkatapos marinig ang wake word
+
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
 
@@ -356,6 +367,17 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showEnrollDialog() }
         }
 
+        val wakeWordOption = Button(this).apply {
+            text = "🔔  Wake Word (\"$wakeWord\")"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showWakeWordDialog() }
+        }
+
         val distanceOption = Button(this).apply {
             text = "📏  Distance Settings"
             textSize = 14f
@@ -401,6 +423,9 @@ class MainActivity : ComponentActivity() {
         val spacer4 = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
+        val spacer5 = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 24)
+        }
 
         container.addView(
             ipOption,
@@ -409,6 +434,11 @@ class MainActivity : ComponentActivity() {
         container.addView(spacer2)
         container.addView(
             enrollOption,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+        container.addView(spacer5)
+        container.addView(
+            wakeWordOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
         container.addView(spacer)
@@ -833,10 +863,55 @@ class MainActivity : ComponentActivity() {
         override fun onTimeout() {}
     }
 
+    /**
+     * Wake-word gate: hindi tuluy-tuloy na pinoproseso bilang command ang lahat ng
+     * narinig ni Vosk. Kailangan munang marinig ang wake word (hal. "Rustech") bago
+     * bukas ang "pakikinig" sa loob ng [wakeWindowMs] - pagkatapos noon, kailangan ulit
+     * sabihin ang wake word. Kung nakasama na ang utos sa parehong sinabi kasama ng wake
+     * word (hal. "Rustech, kaliwa"), direkta na itong ipoproseso sa parehong utterance.
+     */
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
+        val now = System.currentTimeMillis()
+        val currentlyAwake = isAwake && now <= wakeExpireTime
+
+        if (!currentlyAwake) {
+            val wake = wakeWord.trim()
+            if (wake.isNotEmpty() && heardText.lowercase().contains(wake.lowercase())) {
+                isAwake = true
+                wakeExpireTime = now + wakeWindowMs
+
+                val remainder = removeWakeWord(heardText, wake).trim()
+                if (remainder.isNotEmpty()) {
+                    // May kasamang utos na sa parehong utterance - direktang iproseso
+                    val resultLabel = processVoiceCommand(listOf(remainder))
+                    addVoiceLogEntry(heardText, "wake + $resultLabel")
+                    isAwake = false
+                } else {
+                    speak("Oy, Kamusta?")
+                    addVoiceLogEntry(heardText, "wake word (\"$wakeWord\") - nagising, naghihintay ng utos")
+                }
+            } else {
+                addVoiceLogEntry(heardText, "naghihintay ng wake word (\"$wakeWord\")")
+            }
+            return
+        }
+
         val resultLabel = processVoiceCommand(candidates)
         addVoiceLogEntry(heardText, resultLabel)
+        // Ginamit na ang wake window para sa command na ito - kailangan ulit ng wake
+        // word bago tumugon ulit sa susunod na sasabihin.
+        isAwake = false
+        wakeExpireTime = 0L
+    }
+
+    /** Inaalis ang wake word mula sa narinig na text (case-insensitive) para ma-proseso
+     * na lang ang natirang bahagi bilang command, hal. "Rustech kaliwa" -> "kaliwa". */
+    private fun removeWakeWord(text: String, wake: String): String {
+        if (wake.isBlank()) return text
+        val idx = text.lowercase().indexOf(wake.lowercase())
+        if (idx == -1) return text
+        return text.removeRange(idx, idx + wake.length)
     }
 
     /**
@@ -1073,6 +1148,34 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
                 if (newIp.isNotEmpty()) {
                     esp32BaseUrl = newIp
                     statusText.text = "IP na-update: $newIp"
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * Dialog para baguhin ang wake word (default "rustech"). Kailangan munang marinig
+     * ito bago tumugon ang robot sa anumang voice command.
+     */
+    private fun showWakeWordDialog() {
+        val input = EditText(this).apply {
+            hint = "hal. rustech, hoy robot, kuya robot"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(wakeWord)
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("🔔 I-set ang Wake Word")
+            .setMessage("Ito ang kailangang sabihin muna bago makinig/tumugon ang robot sa mga utos.")
+            .setView(input)
+            .setPositiveButton("Save") { _, _ ->
+                val newWake = input.text.toString().trim()
+                if (newWake.isNotEmpty()) {
+                    wakeWord = newWake
+                    isAwake = false
+                    wakeExpireTime = 0L
+                    statusText.text = "Wake word na-update: \"$newWake\""
                 }
             }
             .setNegativeButton("Cancel", null)
