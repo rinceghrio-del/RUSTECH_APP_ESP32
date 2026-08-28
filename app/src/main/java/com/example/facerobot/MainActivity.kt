@@ -78,7 +78,15 @@ class MainActivity : ComponentActivity() {
     private var canEnroll = false
 
     private lateinit var cameraExecutor: ExecutorService
-    private val httpClient = OkHttpClient()
+    // Mataas na timeouts dahil sa malaking (~320MB) Vosk model download - ang default
+    // OkHttp timeout (10s) ay madaling ma-timeout kapag medyo mabagal o hindi stable
+    // ang connection habang dina-download ang model.
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS) // walang overall limit - malaking file ito
+        .build()
 
     private lateinit var yoloDetector: YoloPersonDetector
     private lateinit var faceEmbedder: FaceEmbedder
@@ -107,9 +115,21 @@ class MainActivity : ComponentActivity() {
     private var lastRecognitionTime = 0L
     private val recognitionIntervalMs = 600L
 
-    private val closeFaceWidthRatio = 0.40f
-    private val farFaceWidthRatio = 0.23f
-    private val tooFarFaceWidthRatio = 0.15f
+    // ---------- Distance thresholds (adjustable sa runtime via Menu > Distance Settings) ----------
+    // Naka-save sa SharedPreferences kaya hindi na kailangan mag-rebuild ng app para
+    // ma-tune ang distansya kung kelan mag-FORWARD/BACKWARD/STOP ang robot batay sa
+    // laki ng mukha (face width) kumpara sa buong camera frame width.
+    private var closeFaceWidthRatio: Float
+        get() = prefs.getFloat("close_face_ratio", 0.40f)
+        set(value) { prefs.edit().putFloat("close_face_ratio", value).apply() }
+
+    private var farFaceWidthRatio: Float
+        get() = prefs.getFloat("far_face_ratio", 0.23f)
+        set(value) { prefs.edit().putFloat("far_face_ratio", value).apply() }
+
+    private var tooFarFaceWidthRatio: Float
+        get() = prefs.getFloat("too_far_face_ratio", 0.15f)
+        set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
 
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
@@ -336,6 +356,17 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showEnrollDialog() }
         }
 
+        val distanceOption = Button(this).apply {
+            text = "📏  Distance Settings"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showDistanceSettingsDialog() }
+        }
+
         val commandsOption = Button(this).apply {
             text = "🎤  Mga Utos"
             textSize = 14f
@@ -367,6 +398,9 @@ class MainActivity : ComponentActivity() {
         val spacer3 = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
+        val spacer4 = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 24)
+        }
 
         container.addView(
             ipOption,
@@ -379,6 +413,11 @@ class MainActivity : ComponentActivity() {
         )
         container.addView(spacer)
         container.addView(
+            distanceOption,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+        container.addView(spacer4)
+        container.addView(
             commandsOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
@@ -388,8 +427,10 @@ class MainActivity : ComponentActivity() {
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
 
+        val scrollView = ScrollView(this).apply { addView(container) }
+
         android.app.AlertDialog.Builder(this)
-            .setView(container)
+            .setView(scrollView)
             .setNegativeButton("Isara", null)
             .show()
     }
@@ -616,8 +657,6 @@ class MainActivity : ComponentActivity() {
         "tara laro tayo",
         "Nagyayaya ba ang tropa ng inuman?",
         "Huwag mo ako kalimutan na e charge!",
-        
-        
     )
 
     private fun greetIfNeeded(name: String) {
@@ -1035,6 +1074,76 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
                     esp32BaseUrl = newIp
                     statusText.text = "IP na-update: $newIp"
                 }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /**
+     * Dialog para i-adjust ang 3 distance thresholds nang hindi na kailangang mag-rebuild.
+     * Value range: 0.0 - 1.0 (ratio ng face width laban sa buong camera frame width).
+     * Naka-save sa SharedPreferences kaya persistent kahit i-restart ang app.
+     */
+    private fun showDistanceSettingsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+
+        val closeInput = EditText(this).apply {
+            hint = "close (default 0.40)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(closeFaceWidthRatio.toString())
+        }
+        val farInput = EditText(this).apply {
+            hint = "far (default 0.23)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(farFaceWidthRatio.toString())
+        }
+        val tooFarInput = EditText(this).apply {
+            hint = "too far (default 0.15)"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(tooFarFaceWidthRatio.toString())
+        }
+
+        container.addView(TextView(this).apply { text = "Close (BACKWARD kapag lumagpas dito):" })
+        container.addView(closeInput)
+        container.addView(TextView(this).apply { text = "Far (FORWARD kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
+        container.addView(farInput)
+        container.addView(TextView(this).apply { text = "Too Far (STOP/give up kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
+        container.addView(tooFarInput)
+        container.addView(TextView(this).apply {
+            text = "Tip: dapat close > far > too far. Mas mababa = mas maagang mag-react ang robot."
+            textSize = 11f
+            setPadding(0, 16, 0, 0)
+        })
+
+        val scrollView = ScrollView(this).apply { addView(container) }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("📏 Distance Settings")
+            .setView(scrollView)
+            .setPositiveButton("I-save") { _, _ ->
+                val newClose = closeInput.text.toString().toFloatOrNull()
+                val newFar = farInput.text.toString().toFloatOrNull()
+                val newTooFar = tooFarInput.text.toString().toFloatOrNull()
+
+                if (newClose != null && newFar != null && newTooFar != null &&
+                    newClose > newFar && newFar > newTooFar
+                ) {
+                    closeFaceWidthRatio = newClose
+                    farFaceWidthRatio = newFar
+                    tooFarFaceWidthRatio = newTooFar
+                    statusText.text = "Na-update ang distance settings"
+                } else {
+                    statusText.text = "Invalid values — dapat close > far > too far"
+                }
+            }
+            .setNeutralButton("I-reset sa default") { _, _ ->
+                closeFaceWidthRatio = 0.40f
+                farFaceWidthRatio = 0.23f
+                tooFarFaceWidthRatio = 0.15f
+                statusText.text = "Na-reset sa default ang distance settings"
             }
             .setNegativeButton("Cancel", null)
             .show()
