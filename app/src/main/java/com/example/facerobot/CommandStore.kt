@@ -80,9 +80,8 @@ class CommandStore(context: Context) {
         prefs.edit().putString(KEY_COMMANDS, array.toString()).apply()
     }
 
-    /** Idinadagdag o pinapalitan (kung existing na ang trigger phrase) ang isang command. */
-        /** Idinadagdag o pinapalitan (kung existing na ang trigger phrase) ang isang command.
-     * Pwedeng maglagay ng maraming variant sa trigger, pinaghihiwalay ng "|" (hal.
+    
+     /* Pwedeng maglagay ng maraming variant sa trigger, pinaghihiwalay ng "|" (hal.
      * "idol|idul|i don't") - lahat sila magiging hiwalay na entry na parehong reply/action. */
     fun add(trigger: String, reply: String, action: String = "") {
         val variants = trigger.split("|").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
@@ -93,6 +92,10 @@ class CommandStore(context: Context) {
         persist()
     }
 
+    fun remove(trigger: String) {
+        commands.removeAll { it.trigger == trigger }
+        persist()
+    }
     /**
      * Isang beses lang tatakbo ito (may naka-save na flag) - naglalagay ng mga paunang
      * custom command na ginawa na ni idol, para hindi na kailangan i-type ulit tuwing
