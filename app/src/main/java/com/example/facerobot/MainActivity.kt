@@ -150,7 +150,7 @@ class MainActivity : ComponentActivity() {
  
     private var isAwake = false
     private var wakeExpireTime = 0L
-    private val wakeWindowMs = 6000L // ilang ms bukas ang "pakikinig" pagkatapos marinig ang wake word
+    private val wakeWindowMs = 20000L // ilang ms bukas ang "pakikinig" pagkatapos marinig ang wake word
  
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
