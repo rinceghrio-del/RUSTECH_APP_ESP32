@@ -93,7 +93,16 @@ class MainActivity : ComponentActivity() {
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var faceStore: FaceStore
     private lateinit var commandStore: CommandStore
- 
+
+     // ---------- Mic sensitivity (confidence threshold) ----------
+    // Bawat resulta ng Vosk ay may kasamang confidence score bawat salita (0.0 - 1.0).
+    // Kung mas mababa sa threshold na ito ang AVERAGE confidence ng buong utterance,
+    // itinuturing itong malabong narinig (malamang ingay/background lang) at hindi na
+    // ito ipoproseso bilang command o wake word. Naka-save sa SharedPreferences.
+    private var micConfidenceThreshold: Float
+        get() = prefs.getFloat("mic_confidence_threshold", 0.5f)
+        set(value) { prefs.edit().putFloat("mic_confidence_threshold", value.coerceIn(0f, 1f)).apply() }
+        
     private var appState = AppState.EYES
  
     private val prefs by lazy { getSharedPreferences("facerobot_prefs", MODE_PRIVATE) }
@@ -389,6 +398,17 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showDistanceSettingsDialog() }
         }
+
+                val micSensitivityOption = Button(this).apply {
+            text = "🎤  Mic Sensitivity (${(micConfidenceThreshold * 100).toInt()}%)"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showMicSensitivityDialog() }
+        }
  
         val commandsOption = Button(this).apply {
             text = "🎤  Mga Utos"
@@ -427,6 +447,9 @@ class MainActivity : ComponentActivity() {
         val spacer5 = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
+                val spacer7 = View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(0, 24)
+        }
  
         container.addView(
             ipOption,
@@ -445,6 +468,11 @@ class MainActivity : ComponentActivity() {
         container.addView(spacer)
         container.addView(
             distanceOption,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        )
+        container.addView(spacer7)
+        container.addView(
+            micSensitivityOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
         container.addView(spacer4)
@@ -836,6 +864,7 @@ class MainActivity : ComponentActivity() {
         val model = voskModel ?: return
         try {
             val recognizer = Recognizer(model, 16000.0f)
+            recognizer.setWords(true)
             val service = SpeechService(recognizer, 16000.0f)
             speechService = service
             service.startListening(voskListener)
@@ -850,17 +879,22 @@ class MainActivity : ComponentActivity() {
             // Hindi ginagamit - hinihintay ang buong (final) resulta na lang sa onResult
         }
  
-        override fun onResult(hypothesis: String?) {
-            val text = try {
-                JSONObject(hypothesis ?: "").optString("text", "").trim()
-            } catch (e: Exception) {
-                ""
-            }
-            if (text.isNotEmpty()) {
+                override fun onResult(hypothesis: String?) {
+            val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null }
+            val text = json?.optString("text", "")?.trim() ?: ""
+            if (text.isEmpty()) return
+
+            val avgConfidence = averageConfidence(json)
+            if (avgConfidence < micConfidenceThreshold) {
                 runOnUi {
-                    statusText.text = "[MIC] Narinig: $text"
-                    handleVoiceCommand(listOf(text))
+                    addVoiceLogEntry(text, "na-ignore (mababa ang confidence: ${(avgConfidence * 100).toInt()}%)")
                 }
+                return
+            }
+
+            runOnUi {
+                statusText.text = "[MIC] Narinig: $text"
+                handleVoiceCommand(listOf(text))
             }
         }
  
@@ -871,6 +905,21 @@ class MainActivity : ComponentActivity() {
         }
  
         override fun onTimeout() {}
+    }
+
+    /**
+     * Kinukuha ang average confidence (0.0 - 1.0) mula sa "result" array ng Vosk JSON.
+     * Kung walang available na confidence data, 1.0 (buong tiwala) ang default para
+     * hindi ma-block ang normal na operation.
+     */
+    private fun averageConfidence(json: JSONObject?): Float {
+        val resultArray = json?.optJSONArray("result") ?: return 1f
+        if (resultArray.length() == 0) return 1f
+        var sum = 0.0
+        for (i in 0 until resultArray.length()) {
+            sum += resultArray.getJSONObject(i).optDouble("conf", 1.0)
+        }
+        return (sum / resultArray.length()).toFloat()
     }
  
     /**
@@ -898,7 +947,7 @@ class MainActivity : ComponentActivity() {
                     addVoiceLogEntry(heardText, "wake + $resultLabel")
                     isAwake = false
                 } else {
-                    speak("Oo?")
+                    speak("OY? KAMUSTA?")
                     addVoiceLogEntry(heardText, "wake word (\"$wakeWord\") - nagising, naghihintay ng utos")
                 }
             } else {
@@ -1257,6 +1306,40 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
                 farFaceWidthRatio = 0.23f
                 tooFarFaceWidthRatio = 0.15f
                 statusText.text = "Na-reset sa default ang distance settings"
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+        /**
+     * Dialog para i-adjust ang minimum confidence (%) bago ituring na valid ang isang
+     * narinig na utterance. Mas mataas ang threshold = mas mahigpit (mas kaunting
+     * maling narinig mula sa ingay), pero posibleng mas madalas ma-miss kung hindi
+     * malinaw magsalita.
+     */
+    private fun showMicSensitivityDialog() {
+        val input = EditText(this).apply {
+            hint = "0-100 (default 50)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText((micConfidenceThreshold * 100).toInt().toString())
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("🎤 Mic Sensitivity")
+            .setMessage("Minimum confidence (%) bago ituring na valid ang narinig. Mas mataas = mas mahigpit/malinaw kailangan sabihin.")
+            .setView(input)
+            .setPositiveButton("I-save") { _, _ ->
+                val percent = input.text.toString().toIntOrNull()
+                if (percent != null && percent in 0..100) {
+                    micConfidenceThreshold = percent / 100f
+                    statusText.text = "Mic sensitivity na-update: $percent%"
+                } else {
+                    statusText.text = "Invalid value — dapat 0-100"
+                }
+            }
+            .setNeutralButton("I-reset sa default (50%)") { _, _ ->
+                micConfidenceThreshold = 0.5f
+                statusText.text = "Na-reset sa default ang mic sensitivity"
             }
             .setNegativeButton("Cancel", null)
             .show()
