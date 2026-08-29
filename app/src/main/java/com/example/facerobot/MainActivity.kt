@@ -953,7 +953,7 @@ class MainActivity : ComponentActivity() {
                     addVoiceLogEntry(heardText, "wake + $resultLabel")
                     isAwake = false
                 } else {
-                    speak("Oo?")
+                    speak("OY? KAMUSTA?")
                     addVoiceLogEntry(heardText, "wake word (\"$matchedVariant\") - nagising, naghihintay ng utos")
                 }
             } else {
