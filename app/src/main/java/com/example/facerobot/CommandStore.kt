@@ -81,15 +81,15 @@ class CommandStore(context: Context) {
     }
 
     /** Idinadagdag o pinapalitan (kung existing na ang trigger phrase) ang isang command. */
+        /** Idinadagdag o pinapalitan (kung existing na ang trigger phrase) ang isang command.
+     * Pwedeng maglagay ng maraming variant sa trigger, pinaghihiwalay ng "|" (hal.
+     * "idol|idul|i don't") - lahat sila magiging hiwalay na entry na parehong reply/action. */
     fun add(trigger: String, reply: String, action: String = "") {
-        val cleanTrigger = trigger.trim().lowercase()
-        commands.removeAll { it.trigger == cleanTrigger }
-        commands.add(VoiceCommand(cleanTrigger, reply.trim(), action.trim().uppercase()))
-        persist()
-    }
-
-    fun remove(trigger: String) {
-        commands.removeAll { it.trigger == trigger }
+        val variants = trigger.split("|").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+        for (cleanTrigger in variants) {
+            commands.removeAll { it.trigger == cleanTrigger }
+            commands.add(VoiceCommand(cleanTrigger, reply.trim(), action.trim().uppercase()))
+        }
         persist()
     }
 
@@ -115,8 +115,8 @@ class CommandStore(context: Context) {
             VoiceCommand("kumanan", "sige, kanan||heto, papuntang kanan ako", "RIGHT"),
             VoiceCommand("tumigil", "sige, tumitigil na ako||ok, hinto na", "STOP"),
             VoiceCommand("sayaw", "ok sige sasayaw ako.. wag ka tatawa ha!||sige, panoorin mo 'to", "DANCE"),
-            VoiceCommand("buksan ang laser", "sige, binubuksan ko na||ok, laser on", "LASER_ON"),
-            VoiceCommand("patayin ang laser", "sige pinapatay ko na||ok, laser off na", "LASER_OFF"),
+            VoiceCommand("buksan ang laser|laser on", "sige, binubuksan ko na||ok, laser on", "LASER_ON"),
+            VoiceCommand("patayin ang laser|laser off", "sige pinapatay ko na||ok, laser off na", "LASER_OFF"),
 
             // ===== Saan/ano ka papunta / ginagawa (may kasamang galaw para buhay) =====
             VoiceCommand(
