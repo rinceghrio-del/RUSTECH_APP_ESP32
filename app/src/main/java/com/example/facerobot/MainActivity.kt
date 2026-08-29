@@ -934,21 +934,27 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         val currentlyAwake = isAwake && now <= wakeExpireTime
  
-        if (!currentlyAwake) {
-            val wake = wakeWord.trim()
-            if (wake.isNotEmpty() && heardText.lowercase().contains(wake.lowercase())) {
+                if (!currentlyAwake) {
+            // Maramihang variant ang tinatanggap bilang wake word (hiwalay ng "|"), dahil
+            // hindi palaging pareho ang narinig ni Vosk sa parehong sinabing salita
+            // (hal. "idol" minsan naririnig na "idul" o kahit "i don't").
+            val wakeVariants = wakeWord.split("|").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+            val matchedVariant = wakeVariants
+                .filter { heardText.lowercase().contains(it) }
+                .maxByOrNull { it.length }
+
+            if (matchedVariant != null) {
                 isAwake = true
                 wakeExpireTime = now + wakeWindowMs
- 
-                val remainder = removeWakeWord(heardText, wake).trim()
+
+                val remainder = removeWakeWord(heardText, matchedVariant).trim()
                 if (remainder.isNotEmpty()) {
-                    // May kasamang utos na sa parehong utterance - direktang iproseso
                     val resultLabel = processVoiceCommand(listOf(remainder))
                     addVoiceLogEntry(heardText, "wake + $resultLabel")
                     isAwake = false
                 } else {
-                    speak("OY? KAMUSTA?")
-                    addVoiceLogEntry(heardText, "wake word (\"$wakeWord\") - nagising, naghihintay ng utos")
+                    speak("Oo?")
+                    addVoiceLogEntry(heardText, "wake word (\"$matchedVariant\") - nagising, naghihintay ng utos")
                 }
             } else {
                 addVoiceLogEntry(heardText, "naghihintay ng wake word (\"$wakeWord\")")
