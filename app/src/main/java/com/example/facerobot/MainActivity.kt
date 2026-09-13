@@ -649,9 +649,10 @@ class MainActivity : ComponentActivity() {
         val frameHeight = imageProxy.height
  
         // Kukunin lang ang LEFT/RIGHT o STOP (Paggitna)
-        val command = computeCommand(box, frameWidth)
+                val command = computeCommand(box, frameWidth)
+        val servoAngle = computeServoAngle(box, frameHeight)
         if (!voiceOverrideActive) {
-            sendCommandThrottled(command)
+            sendCommandThrottled(command, servoAngle)
         }
  
         val now = System.currentTimeMillis()
@@ -1147,13 +1148,27 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
         else -> "STOP" // maayos na distansya at nasa gitna
     }
 }
+
+private val SERVO_MAX_ANGLE = 110
+
+/**
+ * Kinukuha ang vertical position ng mukha (0.0 = taas, 1.0 = baba ng frame)
+ * at ico-convert sa servo angle (0-110°). Mataas ang mukha sa screen -> mataas
+ * din ang arm (malaking angle). Baguhin ang formula kung baligtad ang galaw.
+ */
+private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
+    val faceCenterY = box.centerY()
+    val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat() // 0=taas, 1=baba
+    val angle = ((1f - verticalRatio) * SERVO_MAX_ANGLE).toInt()
+    return angle.coerceIn(0, SERVO_MAX_ANGLE)
+}
  
-    private fun sendCommandThrottled(command: String) {
-        val now = System.currentTimeMillis()
-        if (now - lastSendTime < sendIntervalMs) return
-        lastSendTime = now
-        sendCommandToEsp32(command)
-    }
+    private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
+    val now = System.currentTimeMillis()
+    if (now - lastSendTime < sendIntervalMs) return
+    lastSendTime = now
+    sendCommandToEsp32(command, servoAngle)
+}
  
     /**
      * Para sa mga voice-triggered na galaw (hal. "kaliwa"/"kanan" o custom FORWARD/BACKWARD):
@@ -1180,20 +1195,20 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
         handler.post(runnable)
     }
  
-    private fun sendCommandToEsp32(command: String) {
-        val request = Request.Builder()
-            .url("$esp32BaseUrl/command?dir=$command")
-            .build()
- 
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                // Connection fail error handling
-            }
-            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                response.close()
-            }
-        })
+    private fun sendCommandToEsp32(command: String, servoAngle: Int? = null) {
+    var url = "$esp32BaseUrl/command?dir=$command"
+    if (servoAngle != null) {
+        url += "&servo=$servoAngle"
     }
+    val request = Request.Builder().url(url).build()
+
+    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+            response.close()
+        }
+    })
+}
  
     // ---------- Enroll UI ----------
  
