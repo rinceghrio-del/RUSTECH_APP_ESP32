@@ -1162,11 +1162,13 @@ private var servoBottomRatio: Float
     get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
     set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
-// Smoothing para hindi biglaan/sensitive ang galaw ng servo. Mas mababa ang
-// servoSmoothingFactor = mas smooth/mabagal ang galaw; mas mataas = mas
-// mabilis pero mas sensitive/pabago-bago. Simulan sa 0.2, i-adjust base sa feel.
+// Adaptive smoothing: mabilis ang galaw kapag malayo pa ang target angle (para
+// agad mahanap/maabot ang tamang posisyon), pero unti-unti/smooth na lang kapag
+// malapit na (para hindi na "twitchy" sa maliliit na galaw/jitter).
 private var smoothedServoAngle: Float = 0f
-private val servoSmoothingFactor = 0.2f
+private val servoSmoothingFactorFar = 0.5f   // mabilis - ginagamit kapag malayo pa
+private val servoSmoothingFactorNear = 0.12f  // smooth - ginagamit kapag malapit na
+private val servoSmoothingSwitchThreshold = 20f // degrees - dito nagpapalit ng "mode"
 
 private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
     val faceCenterY = box.centerY()
@@ -1176,10 +1178,14 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
     val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
     val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
 
-    // Unti-unting lumalapit ang smoothedServoAngle papunta sa rawAngle sa bawat
-    // frame, sa halip na direktang tumalon dito - kaya mas maayos/hindi biglaan
-    // ang galaw kahit medyo pabago-bago ang detected face position bawat frame.
-    smoothedServoAngle += (rawAngle - smoothedServoAngle) * servoSmoothingFactor
+    val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
+    val factor = if (distance > servoSmoothingSwitchThreshold) {
+        servoSmoothingFactorFar
+    } else {
+        servoSmoothingFactorNear
+    }
+
+    smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
 
     return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
 }
