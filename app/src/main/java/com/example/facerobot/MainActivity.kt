@@ -1,6 +1,5 @@
-
 package com.example.facerobot
- 
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -62,22 +61,25 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.zip.ZipInputStream
- 
+
 /**
  * FaceRobot MainActivity - Face Centering / Tracking Only Mode
  * Voice recognition: offline Vosk (Filipino) instead of Android's built-in SpeechRecognizer.
+ *
+ * NOTE: Wake-word gating has been removed. Lahat na ngayon ng narinig ni Vosk
+ * (na pumasa sa mic confidence threshold) ay direktang ipoproseso bilang command.
  */
 @androidx.camera.core.ExperimentalGetImage
 class MainActivity : ComponentActivity() {
- 
+
     private enum class AppState { EYES, CAMERA }
- 
+
     private lateinit var rootLayout: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
     private var canEnroll = false
- 
+
     private lateinit var cameraExecutor: ExecutorService
     // Mataas na timeouts dahil sa malaking (~320MB) Vosk model download - ang default
     // OkHttp timeout (10s) ay madaling ma-timeout kapag medyo mabagal o hindi stable
@@ -88,23 +90,23 @@ class MainActivity : ComponentActivity() {
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS) // walang overall limit - malaking file ito
         .build()
- 
+
     private lateinit var yoloDetector: YoloPersonDetector
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var faceStore: FaceStore
     private lateinit var commandStore: CommandStore
 
-     // ---------- Mic sensitivity (confidence threshold) ----------
+    // ---------- Mic sensitivity (confidence threshold) ----------
     // Bawat resulta ng Vosk ay may kasamang confidence score bawat salita (0.0 - 1.0).
     // Kung mas mababa sa threshold na ito ang AVERAGE confidence ng buong utterance,
     // itinuturing itong malabong narinig (malamang ingay/background lang) at hindi na
-    // ito ipoproseso bilang command o wake word. Naka-save sa SharedPreferences.
+    // ito ipoproseso bilang command. Naka-save sa SharedPreferences.
     private var micConfidenceThreshold: Float
         get() = prefs.getFloat("mic_confidence_threshold", 0.5f)
         set(value) { prefs.edit().putFloat("mic_confidence_threshold", value.coerceIn(0f, 1f)).apply() }
-        
+
     private var appState = AppState.EYES
- 
+
     private val prefs by lazy { getSharedPreferences("facerobot_prefs", MODE_PRIVATE) }
     private var esp32BaseUrl: String
         get() = "http://" + prefs.getString("esp32_ip", "10.37.191.169")!!
@@ -112,19 +114,19 @@ class MainActivity : ComponentActivity() {
             val ipOnly = value.removePrefix("http://").removePrefix("https://").trim()
             prefs.edit().putString("esp32_ip", ipOnly).apply()
         }
- 
+
     private var lastSendTime = 0L
     private val sendIntervalMs = 300L
- 
+
     private var lastYoloCheckTime = 0L
     private val yoloIntervalMs = 400L
- 
+
     private var consecutivePersonDetections = 0
     private val requiredConsecutiveDetections = 3
- 
+
     private var lastRecognitionTime = 0L
     private val recognitionIntervalMs = 600L
- 
+
     // ---------- Distance thresholds (adjustable sa runtime via Menu > Distance Settings) ----------
     // Naka-save sa SharedPreferences kaya hindi na kailangan mag-rebuild ng app para
     // ma-tune ang distansya kung kelan mag-FORWARD/BACKWARD/STOP ang robot batay sa
@@ -132,38 +134,27 @@ class MainActivity : ComponentActivity() {
     private var closeFaceWidthRatio: Float
         get() = prefs.getFloat("close_face_ratio", 0.40f)
         set(value) { prefs.edit().putFloat("close_face_ratio", value).apply() }
- 
+
     private var farFaceWidthRatio: Float
         get() = prefs.getFloat("far_face_ratio", 0.23f)
         set(value) { prefs.edit().putFloat("far_face_ratio", value).apply() }
- 
+
     private var tooFarFaceWidthRatio: Float
         get() = prefs.getFloat("too_far_face_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
- 
-    // ---------- Wake word ----------
-    // Kailangan munang marinig ang wake word bago tumugon/gumana ang mga voice command.
-    // Naka-save sa SharedPreferences kaya editable via Menu > Wake Word nang walang rebuild.
-    private var wakeWord: String
-        get() = prefs.getString("wake_word", "rustech") ?: "rustech"
-        set(value) { prefs.edit().putString("wake_word", value.trim()).apply() }
- 
-    private var isAwake = false
-    private var wakeExpireTime = 0L
-    private val wakeWindowMs = 20000L // ilang ms bukas ang "pakikinig" pagkatapos marinig ang wake word
- 
+
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
- 
+
     private var lastUnknownFaceEmbedding: FloatArray? = null
- 
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var lastGreetedName: String? = null
     private var lastGreetedTime = 0L
     private val greetingCooldownMs = 60_000L
     private var lastUnknownGreetTime = 0L
- 
+
     // ---------- Pet (aso/pusa) detection ----------
     private var lastPetGreetTime = 0L
     private val petGreetingCooldownMs = 45_000L
@@ -171,50 +162,50 @@ class MainActivity : ComponentActivity() {
         "pusa" to listOf("Meow! Kumusta pusa!", "Ay, may pusa! Ang cute!", "Hi pusa, gusto mo bang makipaglaro?"),
         "aso" to listOf("Woof woof! Kumusta aso!", "Ay, may aso! Kaibigan ko yan.", "Hi doggi!")
     )
- 
+
     // ---------- Vosk offline speech recognition ----------
     private var voskModel: Model? = null
     private var speechService: SpeechService? = null
     private var voskReady = false
     private var isSpeaking = false
     private var currentRecognizedName: String? = null
- 
+
     private val voskModelUrl = "https://alphacephei.com/vosk/models/vosk-model-tl-ph-generic-0.6.zip"
     private val voskModelDirName = "vosk-model-tl-ph-generic-0.6"
- 
+
     // ---------- Voice log (para ma-verify kung tama ba ang narinig ni Vosk) ----------
     // (oras, narinig na text, resulta/aksyon)
     private val voiceLog = mutableListOf<Triple<Long, String, String>>()
     private val voiceLogMaxSize = 100
- 
+
     // Ilang ms ang paulit-ulit na pagpapadala ng movement command galing sa boses
     // (kaliwa/kanan/sulong/atras) bago mag-STOP. Dagdagan ito kung gusto ng mas
     // mahabang galaw bago tumigil ang robot.
     private val voiceMovementDurationMs = 3000L
     private val movementActions = setOf("FORWARD", "BACKWARD", "LEFT", "RIGHT")
     private var voiceOverrideActive = false
- 
+
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
         .build()
     private val faceDetector = FaceDetection.getClient(faceDetectorOptions)
- 
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
- 
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         forceWifiForEsp32()
- 
+
         cameraExecutor = Executors.newSingleThreadExecutor()
         yoloDetector = YoloPersonDetector(this)
         faceEmbedder = FaceEmbedder(this)
         faceStore = FaceStore(this)
         commandStore = CommandStore(this)
         commandStore.seedDefaultsIfNeeded()
- 
+
         buildUi()
         showEyesUi()
- 
+
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val engine = tts ?: return@TextToSpeech
@@ -237,7 +228,7 @@ class MainActivity : ComponentActivity() {
                 ttsReady = true
             }
         }
- 
+
         val missingPermissions = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             missingPermissions.add(Manifest.permission.CAMERA)
@@ -245,7 +236,7 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             missingPermissions.add(Manifest.permission.RECORD_AUDIO)
         }
- 
+
         if (missingPermissions.isEmpty()) {
             startCamera()
             setupVosk()
@@ -254,14 +245,14 @@ class MainActivity : ComponentActivity() {
             ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
         }
     }
- 
+
     private fun forceWifiForEsp32() {
         try {
             val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
- 
+
             connectivityManager.requestNetwork(request, object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     connectivityManager.bindProcessToNetwork(network)
@@ -271,17 +262,17 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
         }
     }
- 
+
     // ---------- UI setup ----------
- 
+
     private fun buildUi() {
         rootLayout = FrameLayout(this)
         previewView = PreviewView(this)
- 
+
         val accentColor = 0xFF00E5C7.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
         val darkChipPressed = 0xFF2A2A3E.toInt()
- 
+
         statusText = TextView(this).apply {
             setTextColor(0xFFFFFFFF.toInt())
             textSize = 13f
@@ -294,7 +285,7 @@ class MainActivity : ComponentActivity() {
                 setStroke(2, 0x22FFFFFF)
             }
         }
- 
+
         menuButton = Button(this).apply {
             text = "☰"
             textSize = 20f
@@ -305,7 +296,7 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 200f)
             setOnClickListener { showMainMenuDialog() }
         }
- 
+
         rootLayout.addView(
             previewView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
@@ -320,10 +311,10 @@ class MainActivity : ComponentActivity() {
             FrameLayout.LayoutParams(150, 150)
                 .apply { gravity = Gravity.BOTTOM or Gravity.END; bottomMargin = 32; rightMargin = 24 }
         )
- 
+
         setContentView(rootLayout)
     }
- 
+
     private fun makeRippleRoundedDrawable(baseColor: Int, pressedColor: Int, radius: Float): Drawable {
         val shape = GradientDrawable().apply {
             setColor(baseColor)
@@ -335,20 +326,20 @@ class MainActivity : ComponentActivity() {
         }
         return RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), shape, mask)
     }
- 
+
     private fun showMainMenuDialog() {
         val accentColor = 0xFF00E5C7.toInt()
         val accentPressed = 0xFF00A896.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
         val darkChipPressed = 0xFF2A2A3E.toInt()
         val disabledChip = 0xFF3A3A3A.toInt()
- 
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 40, 40, 32)
             setBackgroundColor(0xFF121212.toInt())
         }
- 
+
         val ipOption = Button(this).apply {
             text = "📶  IP ng Robot (${esp32BaseUrl.removePrefix("http://")})"
             textSize = 14f
@@ -359,7 +350,7 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showIpSettingDialog() }
         }
- 
+
         val enrollOption = Button(this).apply {
             text = "✨  Mag-enroll ng bagong mukha"
             textSize = 14f
@@ -376,18 +367,7 @@ class MainActivity : ComponentActivity() {
             }
             setOnClickListener { showEnrollDialog() }
         }
- 
-        val wakeWordOption = Button(this).apply {
-            text = "🔔  Wake Word (\"$wakeWord\")"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showWakeWordDialog() }
-        }
- 
+
         val distanceOption = Button(this).apply {
             text = "📏  Distance Settings"
             textSize = 14f
@@ -399,7 +379,7 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showDistanceSettingsDialog() }
         }
 
-                val micSensitivityOption = Button(this).apply {
+        val micSensitivityOption = Button(this).apply {
             text = "🎤  Mic Sensitivity (${(micConfidenceThreshold * 100).toInt()}%)"
             textSize = 14f
             isAllCaps = false
@@ -409,7 +389,7 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showMicSensitivityDialog() }
         }
- 
+
         val commandsOption = Button(this).apply {
             text = "🎤  Mga Utos"
             textSize = 14f
@@ -420,7 +400,7 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showManageCommandsDialog() }
         }
- 
+
         val voiceLogOption = Button(this).apply {
             text = "🗒️  Voice Log"
             textSize = 14f
@@ -431,7 +411,7 @@ class MainActivity : ComponentActivity() {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showVoiceLogDialog() }
         }
- 
+
         val spacer = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
@@ -444,13 +424,10 @@ class MainActivity : ComponentActivity() {
         val spacer4 = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
-        val spacer5 = View(this).apply {
+        val spacer7 = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
-                val spacer7 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
- 
+
         container.addView(
             ipOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
@@ -458,11 +435,6 @@ class MainActivity : ComponentActivity() {
         container.addView(spacer2)
         container.addView(
             enrollOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer5)
-        container.addView(
-            wakeWordOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
         container.addView(spacer)
@@ -485,15 +457,15 @@ class MainActivity : ComponentActivity() {
             voiceLogOption,
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         )
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setView(scrollView)
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun showEyesUi() {
         appState = AppState.EYES
         canEnroll = false
@@ -507,37 +479,37 @@ class MainActivity : ComponentActivity() {
         consecutivePersonDetections = 0
         currentRecognizedName = null
     }
- 
+
     private fun showCameraUi() {
         appState = AppState.CAMERA
         lastPersonSeenTime = System.currentTimeMillis()
         statusText.text = "May tao! Sinusubukang kilalanin..."
     }
- 
+
     private fun runOnUi(block: () -> Unit) = runOnUiThread(block)
- 
+
     // ---------- Camera setup ----------
- 
+
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
- 
+
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
- 
+
                 val preview = Preview.Builder().build().also {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
- 
+
                 val imageAnalyzer = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also {
                         it.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(imageProxy) }
                     }
- 
+
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
- 
+
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
             } catch (e: Exception) {
@@ -548,33 +520,33 @@ class MainActivity : ComponentActivity() {
             }
         }, ContextCompat.getMainExecutor(this))
     }
- 
+
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100) {
             val grantedMap = permissions.zip(grantResults.toList()).toMap()
- 
+
             if (grantedMap[Manifest.permission.CAMERA] == PackageManager.PERMISSION_GRANTED) {
                 startCamera()
             } else if (permissions.contains(Manifest.permission.CAMERA)) {
                 statusText.text = "Naghahanap ng tao... (TINANGGIHAN ang camera permission)"
             }
- 
+
             if (grantedMap[Manifest.permission.RECORD_AUDIO] == PackageManager.PERMISSION_GRANTED) {
                 setupVosk()
             }
         }
     }
- 
+
     private fun processFrame(imageProxy: ImageProxy) {
         when (appState) {
             AppState.EYES -> processEyesFrame(imageProxy)
             AppState.CAMERA -> processCameraFrame(imageProxy)
         }
     }
- 
+
     private fun processEyesFrame(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
         if (!yoloDetector.isReady || now - lastYoloCheckTime < yoloIntervalMs) {
@@ -582,7 +554,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         lastYoloCheckTime = now
- 
+
         try {
             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
             val detections = yoloDetector.detect(
@@ -591,17 +563,17 @@ class MainActivity : ComponentActivity() {
             )
             val personDetections = detections.filter { it.classId == YoloPersonDetector.PERSON_CLASS_INDEX }
             val petDetections = detections.filter { it.classId in YoloPersonDetector.PET_CLASSES }
- 
+
             if (personDetections.isNotEmpty()) {
                 consecutivePersonDetections++
             } else {
                 consecutivePersonDetections = 0
             }
- 
+
             if (petDetections.isNotEmpty()) {
                 runOnUi { greetPetIfNeeded(petDetections.first().label) }
             }
- 
+
             if (consecutivePersonDetections >= requiredConsecutiveDetections) {
                 rootLayout.postDelayed({
                     if (appState == AppState.EYES && consecutivePersonDetections >= requiredConsecutiveDetections) {
@@ -618,17 +590,17 @@ class MainActivity : ComponentActivity() {
             imageProxy.close()
         }
     }
- 
+
     private fun processCameraFrame(imageProxy: ImageProxy) {
         val mediaImage = imageProxy.image
         if (mediaImage == null) {
             imageProxy.close()
             return
         }
- 
+
         val rotation = imageProxy.imageInfo.rotationDegrees
         val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
- 
+
         faceDetector.process(inputImage)
             .addOnSuccessListener { faces ->
                 if (faces.isNotEmpty()) {
@@ -640,21 +612,21 @@ class MainActivity : ComponentActivity() {
             .addOnFailureListener { it.printStackTrace() }
             .addOnCompleteListener { imageProxy.close() }
     }
- 
+
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
- 
+
         val box = face.boundingBox
         val frameWidth = imageProxy.width
         val frameHeight = imageProxy.height
- 
+
         // Kukunin lang ang LEFT/RIGHT o STOP (Paggitna)
-                val command = computeCommand(box, frameWidth)
+        val command = computeCommand(box, frameWidth)
         val servoAngle = computeServoAngle(box, frameHeight)
         if (!voiceOverrideActive) {
             sendCommandThrottled(command, servoAngle)
         }
- 
+
         val now = System.currentTimeMillis()
         if (faceEmbedder.isReady && now - lastRecognitionTime > recognitionIntervalMs) {
             lastRecognitionTime = now
@@ -662,7 +634,7 @@ class MainActivity : ComponentActivity() {
                 val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                 val adjustedBox = adjustBoxForRotation(box, frameWidth, frameHeight, rotation)
                 val faceCrop = ImageUtils.safeCrop(bitmap, adjustedBox)
- 
+
                 if (faceCrop != null) {
                     val embedding = faceEmbedder.getEmbedding(faceCrop)
                     if (embedding != null) {
@@ -693,7 +665,7 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
- 
+
     private val greetings = listOf(
         "Kumusta, %s!",
         "Hi %s, kumusta ka?",
@@ -705,7 +677,7 @@ class MainActivity : ComponentActivity() {
         "Ikaw ba %s! ay nakapag pahinga ng maayos, wag ka ka babad sa pagkocode, Tumagay ka rin",
         "Nagyayaya ba ang tropa ng inuman?",
     )
- 
+
     private val unknownGreetings = listOf(
         "Kumusta, ano ginagawa mo ngayon.",
         "Hi kaibigan na tao! Gusto mo bang makipag laro sa akin.",
@@ -718,38 +690,29 @@ class MainActivity : ComponentActivity() {
         "Nagyayaya ba ang tropa ng inuman?",
         "Huwag mo ako kalimutan na e charge!",
     )
- 
-    /** True kapag kasalukuyang nasa loob ng wake window (natawag na ang wake word). */
-    private fun isCurrentlyAwake(): Boolean {
-        return isAwake && System.currentTimeMillis() <= wakeExpireTime
-    }
- 
+
     private fun greetIfNeeded(name: String) {
-        if (!isCurrentlyAwake()) return
- 
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
         if (alreadyGreetedRecently) return
- 
+
         lastGreetedName = name
         lastGreetedTime = now
- 
+
         if (!ttsReady) return
         val phrase = greetings.random().format(name)
         speak(phrase)
     }
- 
+
     private fun greetUnknownIfNeeded() {
-        if (!isCurrentlyAwake()) return
- 
         val now = System.currentTimeMillis()
         if (now - lastUnknownGreetTime < greetingCooldownMs) return
         lastUnknownGreetTime = now
- 
+
         if (!ttsReady) return
         speak(unknownGreetings.random())
     }
- 
+
     private fun greetPetIfNeeded(label: String) {
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
@@ -758,9 +721,9 @@ class MainActivity : ComponentActivity() {
         val options = petGreetings[label] ?: return
         speak(options.random())
     }
- 
+
     // ---------- Vosk offline voice recognition ----------
- 
+
     /**
      * Sinisimulan ang setup ng Vosk. Kung wala pang na-download na Filipino model sa
      * internal storage, dina-download muna ito (isang beses lang) bago i-load.
@@ -773,24 +736,24 @@ class MainActivity : ComponentActivity() {
             downloadAndExtractVoskModel()
         }
     }
- 
+
     private fun voskModelDir(): File = File(filesDir, voskModelDirName)
- 
+
     private fun downloadAndExtractVoskModel() {
         Thread {
             try {
                 runOnUi { statusText.text = "⬇️ Dina-download ang Filipino voice model (~320MB, isang beses lang ito)..." }
- 
+
                 val request = Request.Builder().url(voskModelUrl).build()
                 val response = httpClient.newCall(request).execute()
                 if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
                 val body = response.body ?: throw java.io.IOException("Walang response body")
- 
+
                 val zipFile = File(cacheDir, "vosk_model.zip")
                 val totalBytes = body.contentLength()
                 var downloadedBytes = 0L
                 var lastUpdate = 0L
- 
+
                 body.byteStream().use { input ->
                     FileOutputStream(zipFile).use { output ->
                         val buffer = ByteArray(8192)
@@ -808,11 +771,11 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 response.close()
- 
+
                 runOnUi { statusText.text = "📦 Ina-extract ang voice model..." }
                 extractZip(zipFile, filesDir)
                 zipFile.delete()
- 
+
                 loadVoskModel(voskModelDir().absolutePath)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -820,7 +783,7 @@ class MainActivity : ComponentActivity() {
             }
         }.start()
     }
- 
+
     private fun extractZip(zipFile: File, targetDir: File) {
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             var entry = zis.nextEntry
@@ -843,7 +806,7 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
- 
+
     private fun loadVoskModel(modelPath: String) {
         Thread {
             try {
@@ -860,7 +823,7 @@ class MainActivity : ComponentActivity() {
             }
         }.start()
     }
- 
+
     private fun startVoskListening() {
         val model = voskModel ?: return
         try {
@@ -874,13 +837,13 @@ class MainActivity : ComponentActivity() {
             statusText.text = "❌ Mic error: ${e.message}"
         }
     }
- 
+
     private val voskListener = object : VoskListener {
         override fun onPartialResult(hypothesis: String?) {
             // Hindi ginagamit - hinihintay ang buong (final) resulta na lang sa onResult
         }
- 
-                override fun onResult(hypothesis: String?) {
+
+        override fun onResult(hypothesis: String?) {
             val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null }
             val text = json?.optString("text", "")?.trim() ?: ""
             if (text.isEmpty()) return
@@ -898,13 +861,13 @@ class MainActivity : ComponentActivity() {
                 handleVoiceCommand(listOf(text))
             }
         }
- 
+
         override fun onFinalResult(hypothesis: String?) {}
- 
+
         override fun onError(exception: Exception?) {
             exception?.printStackTrace()
         }
- 
+
         override fun onTimeout() {}
     }
 
@@ -922,64 +885,17 @@ class MainActivity : ComponentActivity() {
         }
         return (sum / resultArray.length()).toFloat()
     }
- 
+
     /**
-     * Wake-word gate: hindi tuluy-tuloy na pinoproseso bilang command ang lahat ng
-     * narinig ni Vosk. Kailangan munang marinig ang wake word (hal. "Rustech") bago
-     * bukas ang "pakikinig" sa loob ng [wakeWindowMs] - pagkatapos noon, kailangan ulit
-     * sabihin ang wake word. Kung nakasama na ang utos sa parehong sinabi kasama ng wake
-     * word (hal. "Rustech, kaliwa"), direkta na itong ipoproseso sa parehong utterance.
+     * Direktang ipoproseso bilang command ang anumang narinig ni Vosk na pumasa sa
+     * mic confidence threshold - wala nang wake word na kailangan sabihin muna.
      */
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
-        val now = System.currentTimeMillis()
-        val currentlyAwake = isAwake && now <= wakeExpireTime
- 
-                if (!currentlyAwake) {
-            // Maramihang variant ang tinatanggap bilang wake word (hiwalay ng "|"), dahil
-            // hindi palaging pareho ang narinig ni Vosk sa parehong sinabing salita
-            // (hal. "idol" minsan naririnig na "idul" o kahit "i don't").
-            val wakeVariants = wakeWord.split("|").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
-            val matchedVariant = wakeVariants
-                .filter { heardText.lowercase().contains(it) }
-                .maxByOrNull { it.length }
-
-            if (matchedVariant != null) {
-                isAwake = true
-                wakeExpireTime = now + wakeWindowMs
-
-                val remainder = removeWakeWord(heardText, matchedVariant).trim()
-                if (remainder.isNotEmpty()) {
-                    val resultLabel = processVoiceCommand(listOf(remainder))
-                    addVoiceLogEntry(heardText, "wake + $resultLabel")
-                    isAwake = false
-                } else {
-                    speak("OY? KAMUSTA?")
-                    addVoiceLogEntry(heardText, "wake word (\"$matchedVariant\") - nagising, naghihintay ng utos")
-                }
-            } else {
-                addVoiceLogEntry(heardText, "naghihintay ng wake word (\"$wakeWord\")")
-            }
-            return
-        }
- 
         val resultLabel = processVoiceCommand(candidates)
         addVoiceLogEntry(heardText, resultLabel)
-        // Ginamit na ang wake window para sa command na ito - kailangan ulit ng wake
-        // word bago tumugon ulit sa susunod na sasabihin.
-        isAwake = false
-        wakeExpireTime = 0L
     }
- 
-    /** Inaalis ang wake word mula sa narinig na text (case-insensitive) para ma-proseso
-     * na lang ang natirang bahagi bilang command, hal. "Rustech kaliwa" -> "kaliwa". */
-    private fun removeWakeWord(text: String, wake: String): String {
-        if (wake.isBlank()) return text
-        val idx = text.lowercase().indexOf(wake.lowercase())
-        if (idx == -1) return text
-        return text.removeRange(idx, idx + wake.length)
-    }
- 
+
     /**
      * Sinusubukan ang bawat alternative na resulta ng recognizer hanggang may tumama.
      * Nag-re-return ng short label kung ano ang tumama, para ma-log sa Voice Log.
@@ -1004,7 +920,7 @@ class MainActivity : ComponentActivity() {
                 }
                 return "custom: \"${custom.trigger}\""
             }
- 
+
             when {
                 // Motion Voice Commands
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
@@ -1022,7 +938,7 @@ class MainActivity : ComponentActivity() {
                     sendTimedCommand("RIGHT", voiceMovementDurationMs)
                     return "RIGHT"
                 }
- 
+
                 // Info Voice Commands
                 text.contains("sino ako") || text.contains("sino po ako") || text.contains("sino ba ako") -> {
                     val name = currentRecognizedName
@@ -1034,37 +950,37 @@ class MainActivity : ComponentActivity() {
                     speak(reply)
                     return "sino ako"
                 }
-        text.contains("sino ka") || text.contains("ano pangalan mo") || 
-        text.contains("ano ngalan mo") || text.contains("ano name mo") || 
-        text.contains("sino ka ba") || text.contains("pangalan mo") || text.contains("name mo") -> {
-    val rustechReplies = listOf(
-        "Ako ay si Rustech.. Ang laruan mo na ROBOT!",
-        "Ako ay si Rustech, ang kaibigan mo!",
-        "Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo.",
-        "Rustech ang pangalan ko, ang paborito mong robot companion!",
-        "Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!"
-    )
-    speak(rustechReplies.random())
-    return "sino ka"
+                text.contains("sino ka") || text.contains("ano pangalan mo") ||
+                text.contains("ano ngalan mo") || text.contains("ano name mo") ||
+                text.contains("sino ka ba") || text.contains("pangalan mo") || text.contains("name mo") -> {
+                    val rustechReplies = listOf(
+                        "Ako ay si Rustech.. Ang laruan mo na ROBOT!",
+                        "Ako ay si Rustech, ang kaibigan mo!",
+                        "Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo.",
+                        "Rustech ang pangalan ko, ang paborito mong robot companion!",
+                        "Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!"
+                    )
+                    speak(rustechReplies.random())
+                    return "sino ka"
                 }
             }
         }
         return "walang tumugma"
     }
- 
+
     private fun addVoiceLogEntry(heard: String, result: String) {
         voiceLog.add(0, Triple(System.currentTimeMillis(), heard, result))
         if (voiceLog.size > voiceLogMaxSize) {
             voiceLog.removeAt(voiceLog.size - 1)
         }
     }
- 
+
     private fun showVoiceLogDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         if (voiceLog.isEmpty()) {
             container.addView(TextView(this).apply {
                 text = "Wala pang narinig na boses sa session na ito."
@@ -1080,9 +996,9 @@ class MainActivity : ComponentActivity() {
                 })
             }
         }
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("🗒️ Voice Log")
             .setView(scrollView)
@@ -1090,14 +1006,14 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun speak(phrase: String) {
         if (!ttsReady) return
         isSpeaking = true
         speechService?.setPause(true)
         tts?.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
     }
- 
+
     private fun handleNoFace() {
         // Kapag walang mukha, hihinto lang at mag-aabang hanggang bumalik sa eyes mode
         sendCommandThrottled("STOP")
@@ -1106,7 +1022,7 @@ class MainActivity : ComponentActivity() {
             runOnUi { showEyesUi() }
         }
     }
- 
+
     private fun adjustBoxForRotation(box: Rect, frameWidth: Int, frameHeight: Int, rotationDegrees: Int): Rect {
         return when (rotationDegrees) {
             90 -> Rect(frameHeight - box.bottom, box.left, frameHeight - box.top, box.right)
@@ -1115,88 +1031,88 @@ class MainActivity : ComponentActivity() {
             else -> box
         }
     }
- 
-   /**
- * Priyoridad muna ang distansya: kung sobrang lapit na ang mukha (malapad na ang
- * bounding box kumpara sa frame), mag-BACKWARD muna. Kung hindi naman malapit,
- * saka lang natin susuriin ang Kaliwa/Kanan/Gitna para sa centering.
- */
-private fun computeCommand(box: Rect, frameWidth: Int): String {
-    val faceWidthRatio = box.width().toFloat() / frameWidth.toFloat()
-    if (faceWidthRatio > closeFaceWidthRatio) {
-        return "BACKWARD"
-    }
- 
-    val faceCenterX = box.centerX()
-    val screenCenterX = frameWidth / 2
- 
-    // Pinalapad ang deadzone (ginawang frameWidth / 3.5)
-    // Mas malapad na gitnang espasyo para may allowance bago mag-STOP
-    val centerDeadzoneWidth = (frameWidth / 3.5 / 2).toInt()
- 
-    val leftBoundary = screenCenterX - centerDeadzoneWidth
-    val rightBoundary = screenCenterX + centerDeadzoneWidth
- 
-           return when {
-        // Mirrored ang front camera input:
-        // Kapag ang mukha ay nasa kaliwa sa pixel coordinates (faceCenterX < leftBoundary),
-        // kailangang pumaling ng robot sa KANAN (RIGHT) para pumunta sa gitna ang mukha.
-        faceCenterX < leftBoundary -> "RIGHT"
-        faceCenterX > rightBoundary -> "LEFT"
-        faceWidthRatio < tooFarFaceWidthRatio -> "STOP" // sobrang layo na / hindi na maasahang detection - wag nang lapitan
-        faceWidthRatio < farFaceWidthRatio -> "FORWARD" // nasa gitna, malayo pa pero kaya pa lapitan
-        else -> "STOP" // maayos na distansya at nasa gitna
-    }
-}
 
-// Ang mga ratio na ito ang "safe zone" ng camera frame na gagamitin bilang batayan
-// ng buong 0°-110° na galaw ng servo - hindi buong 0%-100% ng frame, dahil bago pa
-// maabot ng mukha ang literal na gilid (lalo na sa ibaba), nawawala na ang face
-// detection (naka-crop na ang panga), kaya "natitigil" ang servo doon.
-private val SERVO_MAX_ANGLE = 110
-private var servoTopRatio: Float
-    get() = prefs.getFloat("servo_top_ratio", 0.15f)
-    set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
+    /**
+     * Priyoridad muna ang distansya: kung sobrang lapit na ang mukha (malapad na ang
+     * bounding box kumpara sa frame), mag-BACKWARD muna. Kung hindi naman malapit,
+     * saka lang natin susuriin ang Kaliwa/Kanan/Gitna para sa centering.
+     */
+    private fun computeCommand(box: Rect, frameWidth: Int): String {
+        val faceWidthRatio = box.width().toFloat() / frameWidth.toFloat()
+        if (faceWidthRatio > closeFaceWidthRatio) {
+            return "BACKWARD"
+        }
 
-private var servoBottomRatio: Float
-    get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
-    set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
+        val faceCenterX = box.centerX()
+        val screenCenterX = frameWidth / 2
 
-// Adaptive smoothing: mabilis ang galaw kapag malayo pa ang target angle (para
-// agad mahanap/maabot ang tamang posisyon), pero unti-unti/smooth na lang kapag
-// malapit na (para hindi na "twitchy" sa maliliit na galaw/jitter).
-private var smoothedServoAngle: Float = 0f
-private val servoSmoothingFactorFar = 0.2f   // mabilis - ginagamit kapag malayo pa
-private val servoSmoothingFactorNear = 0.12f  // smooth - ginagamit kapag malapit na
-private val servoSmoothingSwitchThreshold = 20f // degrees - dito nagpapalit ng "mode"
+        // Pinalapad ang deadzone (ginawang frameWidth / 3.5)
+        // Mas malapad na gitnang espasyo para may allowance bago mag-STOP
+        val centerDeadzoneWidth = (frameWidth / 3.5 / 2).toInt()
 
-private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
-    val faceCenterY = box.centerY()
-    val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
+        val leftBoundary = screenCenterX - centerDeadzoneWidth
+        val rightBoundary = screenCenterX + centerDeadzoneWidth
 
-    val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
-    val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
-    val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
-
-    val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
-    val factor = if (distance > servoSmoothingSwitchThreshold) {
-        servoSmoothingFactorFar
-    } else {
-        servoSmoothingFactorNear
+        return when {
+            // Mirrored ang front camera input:
+            // Kapag ang mukha ay nasa kaliwa sa pixel coordinates (faceCenterX < leftBoundary),
+            // kailangang pumaling ng robot sa KANAN (RIGHT) para pumunta sa gitna ang mukha.
+            faceCenterX < leftBoundary -> "RIGHT"
+            faceCenterX > rightBoundary -> "LEFT"
+            faceWidthRatio < tooFarFaceWidthRatio -> "STOP" // sobrang layo na / hindi na maasahang detection - wag nang lapitan
+            faceWidthRatio < farFaceWidthRatio -> "FORWARD" // nasa gitna, malayo pa pero kaya pa lapitan
+            else -> "STOP" // maayos na distansya at nasa gitna
+        }
     }
 
-    smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
+    // Ang mga ratio na ito ang "safe zone" ng camera frame na gagamitin bilang batayan
+    // ng buong 0°-110° na galaw ng servo - hindi buong 0%-100% ng frame, dahil bago pa
+    // maabot ng mukha ang literal na gilid (lalo na sa ibaba), nawawala na ang face
+    // detection (naka-crop na ang panga), kaya "natitigil" ang servo doon.
+    private val SERVO_MAX_ANGLE = 110
+    private var servoTopRatio: Float
+        get() = prefs.getFloat("servo_top_ratio", 0.15f)
+        set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
 
-    return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
-}
- 
+    private var servoBottomRatio: Float
+        get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
+        set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
+
+    // Adaptive smoothing: mabilis ang galaw kapag malayo pa ang target angle (para
+    // agad mahanap/maabot ang tamang posisyon), pero unti-unti/smooth na lang kapag
+    // malapit na (para hindi na "twitchy" sa maliliit na galaw/jitter).
+    private var smoothedServoAngle: Float = 0f
+    private val servoSmoothingFactorFar = 0.2f   // mabilis - ginagamit kapag malayo pa
+    private val servoSmoothingFactorNear = 0.12f  // smooth - ginagamit kapag malapit na
+    private val servoSmoothingSwitchThreshold = 20f // degrees - dito nagpapalit ng "mode"
+
+    private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
+        val faceCenterY = box.centerY()
+        val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
+
+        val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
+        val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
+        val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
+
+        val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
+        val factor = if (distance > servoSmoothingSwitchThreshold) {
+            servoSmoothingFactorFar
+        } else {
+            servoSmoothingFactorNear
+        }
+
+        smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
+
+        return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
+    }
+
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
-    val now = System.currentTimeMillis()
-    if (now - lastSendTime < sendIntervalMs) return
-    lastSendTime = now
-    sendCommandToEsp32(command, servoAngle)
-}
- 
+        val now = System.currentTimeMillis()
+        if (now - lastSendTime < sendIntervalMs) return
+        lastSendTime = now
+        sendCommandToEsp32(command, servoAngle)
+    }
+
     /**
      * Para sa mga voice-triggered na galaw (hal. "kaliwa"/"kanan" o custom FORWARD/BACKWARD):
      * paulit-ulit magpapadala ng command sa loob ng ilang segundo (bawat 300ms - mas mabilis
@@ -1204,7 +1120,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
      * autonomous/ultrasonic logic ng ESP32 bago pa matapos yung galaw. Dagdagan ang
      * durationMs kung gusto ng mas mahabang galaw.
      */
-        private fun sendTimedCommand(command: String, durationMs: Long) {
+    private fun sendTimedCommand(command: String, durationMs: Long) {
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
         val endTime = System.currentTimeMillis() + durationMs
@@ -1221,31 +1137,31 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         }
         handler.post(runnable)
     }
- 
-    private fun sendCommandToEsp32(command: String, servoAngle: Int? = null) {
-    var url = "$esp32BaseUrl/command?dir=$command"
-    if (servoAngle != null) {
-        url += "&servo=$servoAngle"
-    }
-    val request = Request.Builder().url(url).build()
 
-    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
-        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-            response.close()
+    private fun sendCommandToEsp32(command: String, servoAngle: Int? = null) {
+        var url = "$esp32BaseUrl/command?dir=$command"
+        if (servoAngle != null) {
+            url += "&servo=$servoAngle"
         }
-    })
-}
- 
+        val request = Request.Builder().url(url).build()
+
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.close()
+            }
+        })
+    }
+
     // ---------- Enroll UI ----------
- 
+
     private fun showIpSettingDialog() {
         val input = EditText(this).apply {
             hint = "hal. 192.168.1.25 o 192.168.43.100"
             inputType = InputType.TYPE_CLASS_TEXT
             setText(esp32BaseUrl.removePrefix("http://"))
         }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("I-set ang IP Address ng Robot")
             .setMessage("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save.")
@@ -1260,35 +1176,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
-    /**
-     * Dialog para baguhin ang wake word (default "rustech"). Kailangan munang marinig
-     * ito bago tumugon ang robot sa anumang voice command.
-     */
-    private fun showWakeWordDialog() {
-        val input = EditText(this).apply {
-            hint = "hal. rustech, hoy robot, kuya robot"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(wakeWord)
-        }
- 
-        android.app.AlertDialog.Builder(this)
-            .setTitle("🔔 I-set ang Wake Word")
-            .setMessage("Ito ang kailangang sabihin muna bago makinig/tumugon ang robot sa mga utos.")
-            .setView(input)
-            .setPositiveButton("Save") { _, _ ->
-                val newWake = input.text.toString().trim()
-                if (newWake.isNotEmpty()) {
-                    wakeWord = newWake
-                    isAwake = false
-                    wakeExpireTime = 0L
-                    statusText.text = "Wake word na-update: \"$newWake\""
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
- 
+
     /**
      * Dialog para i-adjust ang 3 distance thresholds nang hindi na kailangang mag-rebuild.
      * Value range: 0.0 - 1.0 (ratio ng face width laban sa buong camera frame width).
@@ -1299,7 +1187,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val closeInput = EditText(this).apply {
             hint = "close (default 0.40)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
@@ -1315,7 +1203,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText(tooFarFaceWidthRatio.toString())
         }
- 
+
         container.addView(TextView(this).apply { text = "Close (BACKWARD kapag lumagpas dito):" })
         container.addView(closeInput)
         container.addView(TextView(this).apply { text = "Far (FORWARD kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
@@ -1327,9 +1215,9 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             textSize = 11f
             setPadding(0, 16, 0, 0)
         })
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("📏 Distance Settings")
             .setView(scrollView)
@@ -1337,7 +1225,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
                 val newClose = closeInput.text.toString().toFloatOrNull()
                 val newFar = farInput.text.toString().toFloatOrNull()
                 val newTooFar = tooFarInput.text.toString().toFloatOrNull()
- 
+
                 if (newClose != null && newFar != null && newTooFar != null &&
                     newClose > newFar && newFar > newTooFar
                 ) {
@@ -1359,7 +1247,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .show()
     }
 
-        /**
+    /**
      * Dialog para i-adjust ang minimum confidence (%) bago ituring na valid ang isang
      * narinig na utterance. Mas mataas ang threshold = mas mahigpit (mas kaunting
      * maling narinig mula sa ingay), pero posibleng mas madalas ma-miss kung hindi
@@ -1392,19 +1280,19 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showEnrollDialog() {
         val embedding = lastUnknownFaceEmbedding
         if (embedding == null) {
             statusText.text = "Wala pang mukha na nakuha, subukan ulit"
             return
         }
- 
+
         val input = EditText(this).apply {
             hint = "Pangalan (hal. Rusty)"
             inputType = InputType.TYPE_CLASS_TEXT
         }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("Mag-enroll ng mukha")
             .setView(input)
@@ -1420,13 +1308,13 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showManageCommandsDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val existing = commandStore.all()
         if (existing.isEmpty()) {
             container.addView(TextView(this).apply {
@@ -1466,15 +1354,15 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
                 container.addView(row)
             }
         }
- 
+
         container.addView(View(this).apply {
             setBackgroundColor(0xFFCCCCCC.toInt())
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
                 .apply { topMargin = 32; bottomMargin = 32 }
         })
- 
+
         container.addView(TextView(this).apply { text = "Magdagdag ng bagong command:" })
- 
+
         val triggerInput = EditText(this).apply {
             hint = "Sasabihin (hal. anong oras na)"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -1497,9 +1385,9 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             }
         )
         container.addView(actionInput)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("Mga Voice Command")
             .setView(scrollView)
@@ -1515,7 +1403,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     /**
      * Dialog para baguhin ang trigger/reply/action ng isang existing command. Kung binago
      * ang trigger text, tinatanggal muna natin ang luma bago idagdag ang bago - kasi
@@ -1526,7 +1414,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val triggerInput = EditText(this).apply {
             hint = "Sasabihin"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -1548,9 +1436,9 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         container.addView(replyInput)
         container.addView(TextView(this).apply { text = "ESP32 action:"; setPadding(0, 24, 0, 0) })
         container.addView(actionInput)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("I-edit ang Command")
             .setView(scrollView)
@@ -1570,7 +1458,7 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
             .setNegativeButton("Cancel") { _, _ -> showManageCommandsDialog() }
             .show()
     }
- 
+
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
@@ -1583,4 +1471,3 @@ private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         speechService?.shutdown()
     }
 }
- 
