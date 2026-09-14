@@ -13,7 +13,7 @@ import android.graphics.drawable.RippleDrawable
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.F
+import android.net.NetworkRequest
 import android.os.Bundle
 import android.os.Handler
 import android.speech.tts.TextToSpeech
