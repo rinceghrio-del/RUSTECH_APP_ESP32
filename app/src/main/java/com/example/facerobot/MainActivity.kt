@@ -1149,17 +1149,25 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
     }
 }
 
-private val SERVO_MAX_ANGLE = 110
+// Ang mga ratio na ito ang "safe zone" ng camera frame na gagamitin bilang batayan
+// ng buong 0°-110° na galaw ng servo - hindi buong 0%-100% ng frame, dahil bago pa
+// maabot ng mukha ang literal na gilid (lalo na sa ibaba), nawawala na ang face
+// detection (naka-crop na ang panga), kaya "natitigil" ang servo doon.
+private var servoTopRatio: Float
+    get() = prefs.getFloat("servo_top_ratio", 0.15f)
+    set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
 
-/**
- * Kinukuha ang vertical position ng mukha (0.0 = taas, 1.0 = baba ng frame)
- * at ico-convert sa servo angle (0-110°). Mataas ang mukha sa screen -> mataas
- * din ang arm (malaking angle). Baguhin ang formula kung baligtad ang galaw.
- */
+private var servoBottomRatio: Float
+    get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
+    set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
+
 private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
     val faceCenterY = box.centerY()
-    val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat() // 0=taas, 1=baba
-    val angle = ((1f - verticalRatio) * SERVO_MAX_ANGLE).toInt()
+    val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
+
+    val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
+    val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
+    val angle = ((1f - normalized) * SERVO_MAX_ANGLE).toInt()
     return angle.coerceIn(0, SERVO_MAX_ANGLE)
 }
  
