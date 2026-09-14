@@ -1162,14 +1162,26 @@ private var servoBottomRatio: Float
     get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
     set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
+// Smoothing para hindi biglaan/sensitive ang galaw ng servo. Mas mababa ang
+// servoSmoothingFactor = mas smooth/mabagal ang galaw; mas mataas = mas
+// mabilis pero mas sensitive/pabago-bago. Simulan sa 0.2, i-adjust base sa feel.
+private var smoothedServoAngle: Float = 0f
+private val servoSmoothingFactor = 0.2f
+
 private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
     val faceCenterY = box.centerY()
     val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
 
     val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
     val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
-    val angle = ((1f - normalized) * SERVO_MAX_ANGLE).toInt()
-    return angle.coerceIn(0, SERVO_MAX_ANGLE)
+    val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
+
+    // Unti-unting lumalapit ang smoothedServoAngle papunta sa rawAngle sa bawat
+    // frame, sa halip na direktang tumalon dito - kaya mas maayos/hindi biglaan
+    // ang galaw kahit medyo pabago-bago ang detected face position bawat frame.
+    smoothedServoAngle += (rawAngle - smoothedServoAngle) * servoSmoothingFactor
+
+    return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
 }
  
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
