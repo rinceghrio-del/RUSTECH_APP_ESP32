@@ -13,7 +13,7 @@ import android.graphics.drawable.RippleDrawable
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
-import android.net.NetworkRequest
+import android.net.F
 import android.os.Bundle
 import android.os.Handler
 import android.speech.tts.TextToSpeech
@@ -1153,6 +1153,7 @@ private fun computeCommand(box: Rect, frameWidth: Int): String {
 // ng buong 0°-110° na galaw ng servo - hindi buong 0%-100% ng frame, dahil bago pa
 // maabot ng mukha ang literal na gilid (lalo na sa ibaba), nawawala na ang face
 // detection (naka-crop na ang panga), kaya "natitigil" ang servo doon.
+private val SERVO_MAX_ANGLE = 110
 private var servoTopRatio: Float
     get() = prefs.getFloat("servo_top_ratio", 0.15f)
     set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
