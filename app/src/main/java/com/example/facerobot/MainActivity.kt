@@ -1166,7 +1166,7 @@ private var servoBottomRatio: Float
 // agad mahanap/maabot ang tamang posisyon), pero unti-unti/smooth na lang kapag
 // malapit na (para hindi na "twitchy" sa maliliit na galaw/jitter).
 private var smoothedServoAngle: Float = 0f
-private val servoSmoothingFactorFar = 0.5f   // mabilis - ginagamit kapag malayo pa
+private val servoSmoothingFactorFar = 0.2f   // mabilis - ginagamit kapag malayo pa
 private val servoSmoothingFactorNear = 0.12f  // smooth - ginagamit kapag malapit na
 private val servoSmoothingSwitchThreshold = 20f // degrees - dito nagpapalit ng "mode"
 
