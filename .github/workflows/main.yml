@@ -3,7 +3,7 @@ name: Build APK
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:   # para pwede mo ring i-trigger manually sa GitHub Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -27,8 +27,14 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
 
+      - name: Decode keystore
+        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > $GITHUB_WORKSPACE/rustech-debug.keystore
+
       - name: Build debug APK
         run: gradle assembleDebug
+        env:
+          KEYSTORE_PATH: ${{ github.workspace }}/rustech-debug.keystore
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
 
       - name: Upload APK as downloadable artifact
         uses: actions/upload-artifact@v4
