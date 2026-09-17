@@ -1,5 +1,3 @@
-
-Mainactivity · KT
 package com.example.facerobot
  
 import android.Manifest
