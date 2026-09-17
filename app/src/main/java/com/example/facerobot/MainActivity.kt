@@ -466,6 +466,90 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    val greetingTracksOption = Button(this).apply {
+    text = "🎙️ Greeting Tracks"
+    textSize = 14f
+    isAllCaps = false
+    setTextColor(0xFFFFFFFF.toInt())
+    gravity = Gravity.START or Gravity.CENTER_VERTICAL
+    setPadding(40, 36, 40, 36)
+    background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+    setOnClickListener { showGreetingTracksDialog() }
+}
+
+    private fun showGreetingTracksDialog() {
+    val container = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(48, 24, 48, 24)
+    }
+
+    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+    val obj = JSONObject(json)
+    val keys = obj.keys().asSequence().toList()
+
+    if (keys.isEmpty()) {
+        container.addView(TextView(this).apply {
+            text = "Wala pang naka-set na greeting track."
+            setPadding(0, 0, 0, 24)
+        })
+    } else {
+        for (name in keys) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            row.addView(TextView(this@MainActivity).apply {
+                text = "$name -> Track ${obj.getInt(name)}"
+                textSize = 13f
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            })
+            row.addView(Button(this@MainActivity).apply {
+                text = "Tanggalin"
+                textSize = 10f
+                setOnClickListener {
+                    removeGreetingTrack(name)
+                    showGreetingTracksDialog()
+                }
+            })
+            container.addView(row)
+        }
+    }
+
+    container.addView(View(this).apply {
+        setBackgroundColor(0xFFCCCCCC.toInt())
+        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+            .apply { topMargin = 32; bottomMargin = 32 }
+    })
+
+    container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
+
+    val nameInput = EditText(this).apply {
+        hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
+        inputType = InputType.TYPE_CLASS_TEXT
+    }
+    val trackInput = EditText(this).apply {
+        hint = "Track number (hal. 25 para sa 0025.mp3)"
+        inputType = InputType.TYPE_CLASS_NUMBER
+    }
+    container.addView(nameInput)
+    container.addView(trackInput)
+
+    val scrollView = ScrollView(this).apply { addView(container) }
+
+    android.app.AlertDialog.Builder(this)
+        .setTitle("🎙️ Greeting Tracks (per pangalan)")
+        .setView(scrollView)
+        .setPositiveButton("Idagdag") { _, _ ->
+            val name = nameInput.text.toString().trim()
+            val track = trackInput.text.toString().toIntOrNull()
+            if (name.isNotEmpty() && track != null) {
+                setGreetingTrack(name, track)
+                statusText.text = "Na-set: $name -> Track $track"
+            }
+        }
+        .setNegativeButton("Isara", null)
+        .show()
+}
     private fun showEyesUi() {
         appState = AppState.EYES
         canEnroll = false
@@ -691,18 +775,53 @@ class MainActivity : ComponentActivity() {
         "Huwag mo ako kalimutan na e charge!",
     )
 
+    private fun greetingTrackFor(name: String): Int? {
+    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+    val obj = JSONObject(json)
+    return if (obj.has(name)) obj.getInt(name) else null
+}
+
+private fun setGreetingTrack(name: String, track: Int) {
+    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+    val obj = JSONObject(json)
+    obj.put(name, track)
+    prefs.edit().putString("greeting_tracks", obj.toString()).apply()
+}
+
+private fun removeGreetingTrack(name: String) {
+    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+    val obj = JSONObject(json)
+    obj.remove(name)
+    prefs.edit().putString("greeting_tracks", obj.toString()).apply()
+}
+
+private fun sendGreetingTrack(track: Int) {
+    val request = Request.Builder()
+        .url("$esp32BaseUrl/command?dir=GREET&track=$track")
+        .build()
+    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+            response.close()
+        }
+    })
+}
+
     private fun greetIfNeeded(name: String) {
-        val now = System.currentTimeMillis()
-        val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
-        if (alreadyGreetedRecently) return
+    if (!isCurrentlyAwake()) return
 
-        lastGreetedName = name
-        lastGreetedTime = now
+    val now = System.currentTimeMillis()
+    val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
+    if (alreadyGreetedRecently) return
 
-        if (!ttsReady) return
-        val phrase = greetings.random().format(name)
-        speak(phrase)
+    lastGreetedName = name
+    lastGreetedTime = now
+
+    val track = greetingTrackFor(name)
+    if (track != null) {
+        sendGreetingTrack(track)
     }
+}
 
     private fun greetUnknownIfNeeded() {
         val now = System.currentTimeMillis()
