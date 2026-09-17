@@ -81,14 +81,11 @@ class MainActivity : ComponentActivity() {
     private var canEnroll = false
 
     private lateinit var cameraExecutor: ExecutorService
-    // Mataas na timeouts dahil sa malaking (~320MB) Vosk model download - ang default
-    // OkHttp timeout (10s) ay madaling ma-timeout kapag medyo mabagal o hindi stable
-    // ang connection habang dina-download ang model.
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS) // walang overall limit - malaking file ito
+        .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
     private lateinit var yoloDetector: YoloPersonDetector
@@ -96,11 +93,6 @@ class MainActivity : ComponentActivity() {
     private lateinit var faceStore: FaceStore
     private lateinit var commandStore: CommandStore
 
-    // ---------- Mic sensitivity (confidence threshold) ----------
-    // Bawat resulta ng Vosk ay may kasamang confidence score bawat salita (0.0 - 1.0).
-    // Kung mas mababa sa threshold na ito ang AVERAGE confidence ng buong utterance,
-    // itinuturing itong malabong narinig (malamang ingay/background lang) at hindi na
-    // ito ipoproseso bilang command. Naka-save sa SharedPreferences.
     private var micConfidenceThreshold: Float
         get() = prefs.getFloat("mic_confidence_threshold", 0.5f)
         set(value) { prefs.edit().putFloat("mic_confidence_threshold", value.coerceIn(0f, 1f)).apply() }
@@ -127,10 +119,6 @@ class MainActivity : ComponentActivity() {
     private var lastRecognitionTime = 0L
     private val recognitionIntervalMs = 600L
 
-    // ---------- Distance thresholds (adjustable sa runtime via Menu > Distance Settings) ----------
-    // Naka-save sa SharedPreferences kaya hindi na kailangan mag-rebuild ng app para
-    // ma-tune ang distansya kung kelan mag-FORWARD/BACKWARD/STOP ang robot batay sa
-    // laki ng mukha (face width) kumpara sa buong camera frame width.
     private var closeFaceWidthRatio: Float
         get() = prefs.getFloat("close_face_ratio", 0.40f)
         set(value) { prefs.edit().putFloat("close_face_ratio", value).apply() }
@@ -155,7 +143,6 @@ class MainActivity : ComponentActivity() {
     private val greetingCooldownMs = 60_000L
     private var lastUnknownGreetTime = 0L
 
-    // ---------- Pet (aso/pusa) detection ----------
     private var lastPetGreetTime = 0L
     private val petGreetingCooldownMs = 45_000L
     private val petGreetings = mapOf(
@@ -163,7 +150,6 @@ class MainActivity : ComponentActivity() {
         "aso" to listOf("Woof woof! Kumusta aso!", "Ay, may aso! Kaibigan ko yan.", "Hi doggi!")
     )
 
-    // ---------- Vosk offline speech recognition ----------
     private var voskModel: Model? = null
     private var speechService: SpeechService? = null
     private var voskReady = false
@@ -173,14 +159,9 @@ class MainActivity : ComponentActivity() {
     private val voskModelUrl = "https://alphacephei.com/vosk/models/vosk-model-tl-ph-generic-0.6.zip"
     private val voskModelDirName = "vosk-model-tl-ph-generic-0.6"
 
-    // ---------- Voice log (para ma-verify kung tama ba ang narinig ni Vosk) ----------
-    // (oras, narinig na text, resulta/aksyon)
     private val voiceLog = mutableListOf<Triple<Long, String, String>>()
     private val voiceLogMaxSize = 100
 
-    // Ilang ms ang paulit-ulit na pagpapadala ng movement command galing sa boses
-    // (kaliwa/kanan/sulong/atras) bago mag-STOP. Dagdagan ito kung gusto ng mas
-    // mahabang galaw bago tumigil ang robot.
     private val voiceMovementDurationMs = 3000L
     private val movementActions = setOf("FORWARD", "BACKWARD", "LEFT", "RIGHT")
     private var voiceOverrideActive = false
@@ -368,6 +349,17 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showEnrollDialog() }
         }
 
+        val greetingTracksOption = Button(this).apply {
+            text = "🎙️  Greeting Tracks"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showGreetingTracksDialog() }
+        }
+
         val distanceOption = Button(this).apply {
             text = "📏  Distance Settings"
             textSize = 14f
@@ -412,51 +404,23 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showVoiceLogDialog() }
         }
 
-        val spacer = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
-        val spacer2 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
-        val spacer3 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
-        val spacer4 = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
-        val spacer7 = View(this).apply {
+        fun createSpacer() = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
 
-        container.addView(
-            ipOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer2)
-        container.addView(
-            enrollOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer)
-        container.addView(
-            distanceOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer7)
-        container.addView(
-            micSensitivityOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer4)
-        container.addView(
-            commandsOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
-        container.addView(spacer3)
-        container.addView(
-            voiceLogOption,
-            LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        )
+        container.addView(ipOption)
+        container.addView(createSpacer())
+        container.addView(enrollOption)
+        container.addView(createSpacer())
+        container.addView(greetingTracksOption)
+        container.addView(createSpacer())
+        container.addView(distanceOption)
+        container.addView(createSpacer())
+        container.addView(micSensitivityOption)
+        container.addView(createSpacer())
+        container.addView(commandsOption)
+        container.addView(createSpacer())
+        container.addView(voiceLogOption)
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
@@ -466,90 +430,80 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
-    val greetingTracksOption = Button(this).apply {
-    text = "🎙️ Greeting Tracks"
-    textSize = 14f
-    isAllCaps = false
-    setTextColor(0xFFFFFFFF.toInt())
-    gravity = Gravity.START or Gravity.CENTER_VERTICAL
-    setPadding(40, 36, 40, 36)
-    background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-    setOnClickListener { showGreetingTracksDialog() }
-}
-
     private fun showGreetingTracksDialog() {
-    val container = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        setPadding(48, 24, 48, 24)
-    }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
 
-    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
-    val obj = JSONObject(json)
-    val keys = obj.keys().asSequence().toList()
+        val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+        val obj = JSONObject(json)
+        val keys = obj.keys().asSequence().toList()
 
-    if (keys.isEmpty()) {
-        container.addView(TextView(this).apply {
-            text = "Wala pang naka-set na greeting track."
-            setPadding(0, 0, 0, 24)
-        })
-    } else {
-        for (name in keys) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            row.addView(TextView(this@MainActivity).apply {
-                text = "$name -> Track ${obj.getInt(name)}"
-                textSize = 13f
-                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        if (keys.isEmpty()) {
+            container.addView(TextView(this).apply {
+                text = "Wala pang naka-set na greeting track."
+                setPadding(0, 0, 0, 24)
             })
-            row.addView(Button(this@MainActivity).apply {
-                text = "Tanggalin"
-                textSize = 10f
-                setOnClickListener {
-                    removeGreetingTrack(name)
-                    showGreetingTracksDialog()
+        } else {
+            for (name in keys) {
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
                 }
-            })
-            container.addView(row)
-        }
-    }
-
-    container.addView(View(this).apply {
-        setBackgroundColor(0xFFCCCCCC.toInt())
-        layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
-            .apply { topMargin = 32; bottomMargin = 32 }
-    })
-
-    container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
-
-    val nameInput = EditText(this).apply {
-        hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
-        inputType = InputType.TYPE_CLASS_TEXT
-    }
-    val trackInput = EditText(this).apply {
-        hint = "Track number (hal. 25 para sa 0025.mp3)"
-        inputType = InputType.TYPE_CLASS_NUMBER
-    }
-    container.addView(nameInput)
-    container.addView(trackInput)
-
-    val scrollView = ScrollView(this).apply { addView(container) }
-
-    android.app.AlertDialog.Builder(this)
-        .setTitle("🎙️ Greeting Tracks (per pangalan)")
-        .setView(scrollView)
-        .setPositiveButton("Idagdag") { _, _ ->
-            val name = nameInput.text.toString().trim()
-            val track = trackInput.text.toString().toIntOrNull()
-            if (name.isNotEmpty() && track != null) {
-                setGreetingTrack(name, track)
-                statusText.text = "Na-set: $name -> Track $track"
+                row.addView(TextView(this@MainActivity).apply {
+                    text = "$name -> Track ${obj.getInt(name)}"
+                    textSize = 13f
+                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                })
+                row.addView(Button(this@MainActivity).apply {
+                    text = "Tanggalin"
+                    textSize = 10f
+                    setOnClickListener {
+                        removeGreetingTrack(name)
+                        showGreetingTracksDialog()
+                    }
+                })
+                container.addView(row)
             }
         }
-        .setNegativeButton("Isara", null)
-        .show()
-}
+
+        container.addView(View(this).apply {
+            setBackgroundColor(0xFFCCCCCC.toInt())
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+                .apply { topMargin = 32; bottomMargin = 32 }
+        })
+
+        container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
+
+        val nameInput = EditText(this).apply {
+            hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val trackInput = EditText(this).apply {
+            hint = "Track number (hal. 25 para sa 0025.mp3)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        container.addView(nameInput)
+        container.addView(trackInput)
+
+        val scrollView = ScrollView(this).apply { addView(container) }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("🎙️ Greeting Tracks (per pangalan)")
+            .setView(scrollView)
+            .setPositiveButton("Idagdag") { _, _ ->
+                val name = nameInput.text.toString().trim()
+                val track = trackInput.text.toString().toIntOrNull()
+                if (name.isNotEmpty() && track != null) {
+                    setGreetingTrack(name, track)
+                    statusText.text = "Na-set: $name -> Track $track"
+                }
+            }
+            .setNegativeButton("Isara", null)
+            .show()
+    }
+
     private fun showEyesUi() {
         appState = AppState.EYES
         canEnroll = false
@@ -704,7 +658,6 @@ class MainActivity : ComponentActivity() {
         val frameWidth = imageProxy.width
         val frameHeight = imageProxy.height
 
-        // Kukunin lang ang LEFT/RIGHT o STOP (Paggitna)
         val command = computeCommand(box, frameWidth)
         val servoAngle = computeServoAngle(box, frameHeight)
         if (!voiceOverrideActive) {
@@ -750,25 +703,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val greetings = listOf(
-        "Kumusta, %s!",
-        "Hi %s, kumusta ka?",
-        "Ay, si %s! Kumusta?",
-        "Magandang araw, %s!",
-        "Gusto mo bang makipag laro sakin %s!",
-        "%s! kumain kana ba",
-        "%s! Tara laro tayo",
-        "Ikaw ba %s! ay nakapag pahinga ng maayos, wag ka ka babad sa pagkocode, Tumagay ka rin",
-        "Nagyayaya ba ang tropa ng inuman?",
-    )
-
     private val unknownGreetings = listOf(
         "Kumusta, ano ginagawa mo ngayon.",
         "Hi kaibigan na tao! Gusto mo bang makipag laro sa akin.",
         "Kumusta! Saan pala kayo papunta?",
         "Hello! Pwede mo ba akong Kausapin?",
         "Hi! kausapin mo ako",
-        "Ngayon ka lan ba naka kita ng laruan na kagaya ko",
+        "Ngayon ka lang ba naka kita ng laruan na kagaya ko",
         "Kumain na ba kayo",
         "tara laro tayo",
         "Nagyayaya ba ang tropa ng inuman?",
@@ -776,52 +717,50 @@ class MainActivity : ComponentActivity() {
     )
 
     private fun greetingTrackFor(name: String): Int? {
-    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
-    val obj = JSONObject(json)
-    return if (obj.has(name)) obj.getInt(name) else null
-}
+        val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+        val obj = JSONObject(json)
+        return if (obj.has(name)) obj.getInt(name) else null
+    }
 
-private fun setGreetingTrack(name: String, track: Int) {
-    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
-    val obj = JSONObject(json)
-    obj.put(name, track)
-    prefs.edit().putString("greeting_tracks", obj.toString()).apply()
-}
+    private fun setGreetingTrack(name: String, track: Int) {
+        val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+        val obj = JSONObject(json)
+        obj.put(name, track)
+        prefs.edit().putString("greeting_tracks", obj.toString()).apply()
+    }
 
-private fun removeGreetingTrack(name: String) {
-    val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
-    val obj = JSONObject(json)
-    obj.remove(name)
-    prefs.edit().putString("greeting_tracks", obj.toString()).apply()
-}
+    private fun removeGreetingTrack(name: String) {
+        val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
+        val obj = JSONObject(json)
+        obj.remove(name)
+        prefs.edit().putString("greeting_tracks", obj.toString()).apply()
+    }
 
-private fun sendGreetingTrack(track: Int) {
-    val request = Request.Builder()
-        .url("$esp32BaseUrl/command?dir=GREET&track=$track")
-        .build()
-    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
-        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-            response.close()
-        }
-    })
-}
+    private fun sendGreetingTrack(track: Int) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=GREET&track=$track")
+            .build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.close()
+            }
+        })
+    }
 
     private fun greetIfNeeded(name: String) {
-    if (!isCurrentlyAwake()) return
+        val now = System.currentTimeMillis()
+        val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
+        if (alreadyGreetedRecently) return
 
-    val now = System.currentTimeMillis()
-    val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
-    if (alreadyGreetedRecently) return
+        lastGreetedName = name
+        lastGreetedTime = now
 
-    lastGreetedName = name
-    lastGreetedTime = now
-
-    val track = greetingTrackFor(name)
-    if (track != null) {
-        sendGreetingTrack(track)
+        val track = greetingTrackFor(name)
+        if (track != null) {
+            sendGreetingTrack(track)
+        }
     }
-}
 
     private fun greetUnknownIfNeeded() {
         val now = System.currentTimeMillis()
@@ -843,10 +782,6 @@ private fun sendGreetingTrack(track: Int) {
 
     // ---------- Vosk offline voice recognition ----------
 
-    /**
-     * Sinisimulan ang setup ng Vosk. Kung wala pang na-download na Filipino model sa
-     * internal storage, dina-download muna ito (isang beses lang) bago i-load.
-     */
     private fun setupVosk() {
         val modelDir = voskModelDir()
         if (modelDir.exists() && modelDir.list()?.isNotEmpty() == true) {
@@ -943,11 +878,6 @@ private fun sendGreetingTrack(track: Int) {
         }.start()
     }
 
-    // Ilang alternibong hypothesis (N-best) ang hihingin natin kay Vosk bawat utterance.
-    // Kapag mali pala ang pinaka-unang (top) guess niya, may pagkakataon pa ring
-    // matagpuan sa 2nd/3rd na alternative ang tamang salita sa halip na basta mag-fail
-    // ang command - malaking tulong ito sa Taglish/Filipino speech na mas mahirap
-    // i-recognize nang eksakto kumpara sa English.
     private val voskMaxAlternatives = 3
 
     private fun startVoskListening() {
@@ -966,16 +896,11 @@ private fun sendGreetingTrack(track: Int) {
     }
 
     private val voskListener = object : VoskListener {
-        override fun onPartialResult(hypothesis: String?) {
-            // Hindi ginagamit - hinihintay ang buong (final) resulta na lang sa onResult
-        }
+        override fun onPartialResult(hypothesis: String?) {}
 
         override fun onResult(hypothesis: String?) {
             val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null } ?: return
 
-            // Dahil naka-enable na ang setMaxAlternatives, ang format ng resulta ay may
-            // "alternatives" array ngayon (bawat isa may sariling "text" at "result" na
-            // per-word confidence) sa halip na iisang top-level "text" field lang.
             val alternativesArray = json.optJSONArray("alternatives")
             val candidates: List<Pair<String, Float>> = if (alternativesArray != null && alternativesArray.length() > 0) {
                 (0 until alternativesArray.length()).mapNotNull { i ->
@@ -984,20 +909,12 @@ private fun sendGreetingTrack(track: Int) {
                     if (altText.isEmpty()) null else altText to averageConfidence(alt)
                 }
             } else {
-                // Fallback kung sakaling walang "alternatives" field sa resulta (hal. hindi
-                // na-apply ang setMaxAlternatives sa ilang kadahilanan) - gamitin na lang
-                // ang lumang single-text na format.
                 val text = json.optString("text", "").trim()
                 if (text.isEmpty()) emptyList() else listOf(text to averageConfidence(json))
             }
 
             if (candidates.isEmpty()) return
 
-            // Ang confidence ng PINAKA-UNANG (top) alternative ang basehan natin kung
-            // ii-ignore natin ang buong utterance bilang ingay/hindi malinaw. Kahit
-            // mababa ang score ng top guess, susubukan pa rin nating tumingin sa mga
-            // sumunod na alternative sa processVoiceCommand() basta't pumasa ang unang
-            // check na ito.
             val topText = candidates.first().first
             val topConfidence = candidates.first().second
             if (topConfidence < micConfidenceThreshold) {
@@ -1023,11 +940,6 @@ private fun sendGreetingTrack(track: Int) {
         override fun onTimeout() {}
     }
 
-    /**
-     * Kinukuha ang average confidence (0.0 - 1.0) mula sa "result" array ng Vosk JSON.
-     * Kung walang available na confidence data, 1.0 (buong tiwala) ang default para
-     * hindi ma-block ang normal na operation.
-     */
     private fun averageConfidence(json: JSONObject?): Float {
         val resultArray = json?.optJSONArray("result") ?: return 1f
         if (resultArray.length() == 0) return 1f
@@ -1038,33 +950,20 @@ private fun sendGreetingTrack(track: Int) {
         return (sum / resultArray.length()).toFloat()
     }
 
-    /**
-     * Direktang ipoproseso bilang command ang anumang narinig ni Vosk na pumasa sa
-     * mic confidence threshold - wala nang wake word na kailangan sabihin muna.
-     */
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
         val resultLabel = processVoiceCommand(candidates)
         addVoiceLogEntry(heardText, resultLabel)
     }
 
-    /**
-     * Sinusubukan ang bawat alternative na resulta ng recognizer hanggang may tumama.
-     * Nag-re-return ng short label kung ano ang tumama, para ma-log sa Voice Log.
-     */
     private fun processVoiceCommand(candidates: List<String>): String {
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
-                // randomReply() para pumili ng isa sa mga "||"-separated na variation ng
-                // sagot (kung meron) - kaya hindi laging pareho ang sinasabi kahit paulit
-                // ulit na tinatanong, mas mukhang buhay/AI ang dating imbes na robotic.
                 speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
                     val actionUpper = custom.action.uppercase()
                     if (actionUpper in movementActions) {
-                        // Movement action din ito (FORWARD/BACKWARD/LEFT/RIGHT) - paulit-ulit
-                        // ipapadala para hindi ma-cut ng ESP32's FACE_COMMAND_TIMEOUT
                         sendTimedCommand(actionUpper, voiceMovementDurationMs)
                     } else {
                         sendCommandToEsp32(custom.action)
@@ -1074,7 +973,6 @@ private fun sendGreetingTrack(track: Int) {
             }
 
             when {
-                // Motion Voice Commands
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
                     speak("Hihinto na po!")
                     sendCommandToEsp32("STOP")
@@ -1090,8 +988,6 @@ private fun sendGreetingTrack(track: Int) {
                     sendTimedCommand("RIGHT", voiceMovementDurationMs)
                     return "RIGHT"
                 }
-
-                // Info Voice Commands
                 text.contains("sino ako") || text.contains("sino po ako") || text.contains("sino ba ako") -> {
                     val name = currentRecognizedName
                     val reply = when {
@@ -1167,7 +1063,6 @@ private fun sendGreetingTrack(track: Int) {
     }
 
     private fun handleNoFace() {
-        // Kapag walang mukha, hihinto lang at mag-aabang hanggang bumalik sa eyes mode
         sendCommandThrottled("STOP")
         val now = System.currentTimeMillis()
         if (now - lastPersonSeenTime > personTimeoutMs) {
@@ -1184,11 +1079,6 @@ private fun sendGreetingTrack(track: Int) {
         }
     }
 
-    /**
-     * Priyoridad muna ang distansya: kung sobrang lapit na ang mukha (malapad na ang
-     * bounding box kumpara sa frame), mag-BACKWARD muna. Kung hindi naman malapit,
-     * saka lang natin susuriin ang Kaliwa/Kanan/Gitna para sa centering.
-     */
     private fun computeCommand(box: Rect, frameWidth: Int): String {
         val faceWidthRatio = box.width().toFloat() / frameWidth.toFloat()
         if (faceWidthRatio > closeFaceWidthRatio) {
@@ -1198,29 +1088,20 @@ private fun sendGreetingTrack(track: Int) {
         val faceCenterX = box.centerX()
         val screenCenterX = frameWidth / 2
 
-        // Pinalapad ang deadzone (ginawang frameWidth / 3.5)
-        // Mas malapad na gitnang espasyo para may allowance bago mag-STOP
         val centerDeadzoneWidth = (frameWidth / 3.5 / 2).toInt()
 
         val leftBoundary = screenCenterX - centerDeadzoneWidth
         val rightBoundary = screenCenterX + centerDeadzoneWidth
 
         return when {
-            // Mirrored ang front camera input:
-            // Kapag ang mukha ay nasa kaliwa sa pixel coordinates (faceCenterX < leftBoundary),
-            // kailangang pumaling ng robot sa KANAN (RIGHT) para pumunta sa gitna ang mukha.
             faceCenterX < leftBoundary -> "RIGHT"
             faceCenterX > rightBoundary -> "LEFT"
-            faceWidthRatio < tooFarFaceWidthRatio -> "STOP" // sobrang layo na / hindi na maasahang detection - wag nang lapitan
-            faceWidthRatio < farFaceWidthRatio -> "FORWARD" // nasa gitna, malayo pa pero kaya pa lapitan
-            else -> "STOP" // maayos na distansya at nasa gitna
+            faceWidthRatio < tooFarFaceWidthRatio -> "STOP"
+            faceWidthRatio < farFaceWidthRatio -> "FORWARD"
+            else -> "STOP"
         }
     }
 
-    // Ang mga ratio na ito ang "safe zone" ng camera frame na gagamitin bilang batayan
-    // ng buong 0°-110° na galaw ng servo - hindi buong 0%-100% ng frame, dahil bago pa
-    // maabot ng mukha ang literal na gilid (lalo na sa ibaba), nawawala na ang face
-    // detection (naka-crop na ang panga), kaya "natitigil" ang servo doon.
     private val SERVO_MAX_ANGLE = 110
     private var servoTopRatio: Float
         get() = prefs.getFloat("servo_top_ratio", 0.15f)
@@ -1230,13 +1111,10 @@ private fun sendGreetingTrack(track: Int) {
         get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
         set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
-    // Adaptive smoothing: mabilis ang galaw kapag malayo pa ang target angle (para
-    // agad mahanap/maabot ang tamang posisyon), pero unti-unti/smooth na lang kapag
-    // malapit na (para hindi na "twitchy" sa maliliit na galaw/jitter).
     private var smoothedServoAngle: Float = 0f
-    private val servoSmoothingFactorFar = 0.2f   // mabilis - ginagamit kapag malayo pa
-    private val servoSmoothingFactorNear = 0.12f  // smooth - ginagamit kapag malapit na
-    private val servoSmoothingSwitchThreshold = 20f // degrees - dito nagpapalit ng "mode"
+    private val servoSmoothingFactorFar = 0.2f
+    private val servoSmoothingFactorNear = 0.12f
+    private val servoSmoothingSwitchThreshold = 20f
 
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         val faceCenterY = box.centerY()
@@ -1265,13 +1143,6 @@ private fun sendGreetingTrack(track: Int) {
         sendCommandToEsp32(command, servoAngle)
     }
 
-    /**
-     * Para sa mga voice-triggered na galaw (hal. "kaliwa"/"kanan" o custom FORWARD/BACKWARD):
-     * paulit-ulit magpapadala ng command sa loob ng ilang segundo (bawat 300ms - mas mabilis
-     * pa sa ESP32's FACE_COMMAND_TIMEOUT na 600ms) para hindi ma-override ng
-     * autonomous/ultrasonic logic ng ESP32 bago pa matapos yung galaw. Dagdagan ang
-     * durationMs kung gusto ng mas mahabang galaw.
-     */
     private fun sendTimedCommand(command: String, durationMs: Long) {
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
@@ -1329,11 +1200,6 @@ private fun sendGreetingTrack(track: Int) {
             .show()
     }
 
-    /**
-     * Dialog para i-adjust ang 3 distance thresholds nang hindi na kailangang mag-rebuild.
-     * Value range: 0.0 - 1.0 (ratio ng face width laban sa buong camera frame width).
-     * Naka-save sa SharedPreferences kaya persistent kahit i-restart ang app.
-     */
     private fun showDistanceSettingsDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -1399,12 +1265,6 @@ private fun sendGreetingTrack(track: Int) {
             .show()
     }
 
-    /**
-     * Dialog para i-adjust ang minimum confidence (%) bago ituring na valid ang isang
-     * narinig na utterance. Mas mataas ang threshold = mas mahigpit (mas kaunting
-     * maling narinig mula sa ingay), pero posibleng mas madalas ma-miss kung hindi
-     * malinaw magsalita.
-     */
     private fun showMicSensitivityDialog() {
         val input = EditText(this).apply {
             hint = "0-100 (default 50)"
@@ -1481,8 +1341,6 @@ private fun sendGreetingTrack(track: Int) {
                 }
                 row.addView(TextView(this@MainActivity).apply {
                     val actionPart = if (cmd.action.isNotBlank()) " [ESP32: ${cmd.action}]" else ""
-                    // Ipinapakita ang bawat "||"-separated na reply variation na naka-hiwalay
-                    // ng " / " sa listahan, para malinaw kahit may ilang variation na naka-save.
                     val replyDisplay = cmd.reply.replace("||", " / ")
                     text = "\"${cmd.trigger}\" -> \"$replyDisplay\"$actionPart"
                     textSize = 13f
@@ -1556,11 +1414,6 @@ private fun sendGreetingTrack(track: Int) {
             .show()
     }
 
-    /**
-     * Dialog para baguhin ang trigger/reply/action ng isang existing command. Kung binago
-     * ang trigger text, tinatanggal muna natin ang luma bago idagdag ang bago - kasi
-     * exact-match lang ang findMatch ng CommandStore.add() para mag-upsert.
-     */
     private fun showEditCommandDialog(cmd: CommandStore.VoiceCommand) {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
