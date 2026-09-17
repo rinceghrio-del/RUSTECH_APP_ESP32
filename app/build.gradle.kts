@@ -37,6 +37,14 @@ android {
             useLegacyPackaging = true
         }
     }
+signingConfigs {
+    getByName("debug") {
+        storeFile = file(System.getenv("KEYSTORE_PATH") ?: "$rootDir/rustech-debug.keystore")
+        storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "rustech123"
+        keyAlias = "rustech"
+        keyPassword = System.getenv("KEYSTORE_PASSWORD") ?: "rustech123"
+    }
+}
 }
 
 dependencies {
