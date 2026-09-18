@@ -538,7 +538,7 @@ class MainActivity : ComponentActivity() {
                     gravity = Gravity.CENTER_VERTICAL
                 }
                 row.addView(TextView(this@MainActivity).apply {
-                    text = "$name -> Track ${obj.getInt(name)}"
+                    text = "$name -> Tracks ${obj.getString(name)}"
                     textSize = 13f
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 })
@@ -567,8 +567,8 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val trackInput = EditText(this).apply {
-            hint = "Track number (hal. 25 para sa 0025.mp3)"
-            inputType = InputType.TYPE_CLASS_NUMBER
+            hint = "Track numbers, comma-separated (hal. 25,26,27)"
+            inputType = InputType.TYPE_CLASS_TEXT
         }
         container.addView(nameInput)
         container.addView(trackInput)
@@ -580,10 +580,10 @@ class MainActivity : ComponentActivity() {
             .setView(scrollView)
             .setPositiveButton("Idagdag") { _, _ ->
                 val name = nameInput.text.toString().trim()
-                val track = trackInput.text.toString().toIntOrNull()
-                if (name.isNotEmpty() && track != null) {
-                    setGreetingTrack(name, track)
-                    statusText.text = "Na-set: $name -> Track $track"
+                val tracksCsv = trackInput.text.toString().trim()
+                if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
+                    setGreetingTracks(name, tracksCsv)
+                    statusText.text = "Na-set: $name -> Tracks $tracksCsv"
                 }
             }
             .setNegativeButton("Isara", null)
@@ -802,16 +802,21 @@ class MainActivity : ComponentActivity() {
         "Huwag mo ako kalimutan na e charge!",
     )
 
-    private fun greetingTrackFor(name: String): Int? {
+    // ---------- Greeting Tracks (per-enrolled-name DFPlayer greeting) ----------
+    // Ang bawat pangalan ay maaaring may MARAMING track (comma-separated sa JSON
+    // value, hal. "25,26,27") - random na pipiliin tuwing may nakilala, para hindi
+    // paulit-ulit kahit parehong tao palagi ang nakikita.
+    private fun greetingTracksFor(name: String): List<Int> {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
-        return if (obj.has(name)) obj.getInt(name) else null
+        if (!obj.has(name)) return emptyList()
+        return obj.getString(name).split(",").mapNotNull { it.trim().toIntOrNull() }
     }
 
-    private fun setGreetingTrack(name: String, track: Int) {
+    private fun setGreetingTracks(name: String, tracksCsv: String) {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
-        obj.put(name, track)
+        obj.put(name, tracksCsv.trim())
         prefs.edit().putString("greeting_tracks", obj.toString()).apply()
     }
 
@@ -822,18 +827,6 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putString("greeting_tracks", obj.toString()).apply()
     }
 
-    private fun sendGreetingTrack(track: Int) {
-        val request = Request.Builder()
-            .url("$esp32BaseUrl/command?dir=GREET&track=$track")
-            .build()
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
-            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                response.close()
-            }
-        })
-    }
-
     private fun greetIfNeeded(name: String) {
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
@@ -842,9 +835,9 @@ class MainActivity : ComponentActivity() {
         lastGreetedName = name
         lastGreetedTime = now
 
-        val track = greetingTrackFor(name)
-        if (track != null) {
-            sendGreetingTrack(track)
+        val tracks = greetingTracksFor(name)
+        if (tracks.isNotEmpty()) {
+            sendPlayTrack(tracks.random())
         }
     }
 
