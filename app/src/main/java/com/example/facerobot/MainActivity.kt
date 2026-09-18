@@ -1,5 +1,5 @@
 package com.example.facerobot
- 
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -61,7 +61,7 @@ import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.zip.ZipInputStream
- 
+
 /**
  * FaceRobot MainActivity - Face Centering / Tracking Only Mode
  * Voice recognition: offline Vosk (Filipino) instead of Android's built-in SpeechRecognizer.
@@ -71,15 +71,15 @@ import java.util.zip.ZipInputStream
  */
 @androidx.camera.core.ExperimentalGetImage
 class MainActivity : ComponentActivity() {
- 
+
     private enum class AppState { EYES, CAMERA }
- 
+
     private lateinit var rootLayout: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
     private var canEnroll = false
- 
+
     private lateinit var cameraExecutor: ExecutorService
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -87,18 +87,18 @@ class MainActivity : ComponentActivity() {
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
         .build()
- 
+
     private lateinit var yoloDetector: YoloPersonDetector
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var faceStore: FaceStore
     private lateinit var commandStore: CommandStore
- 
+
     private var micConfidenceThreshold: Float
         get() = prefs.getFloat("mic_confidence_threshold", 0.5f)
         set(value) { prefs.edit().putFloat("mic_confidence_threshold", value.coerceIn(0f, 1f)).apply() }
- 
+
     private var appState = AppState.EYES
- 
+
     private val prefs by lazy { getSharedPreferences("facerobot_prefs", MODE_PRIVATE) }
     private var esp32BaseUrl: String
         get() = "http://" + prefs.getString("esp32_ip", "10.37.191.169")!!
@@ -106,89 +106,89 @@ class MainActivity : ComponentActivity() {
             val ipOnly = value.removePrefix("http://").removePrefix("https://").trim()
             prefs.edit().putString("esp32_ip", ipOnly).apply()
         }
- 
+
     private var lastSendTime = 0L
     private val sendIntervalMs = 300L
- 
+
     private var lastYoloCheckTime = 0L
     private val yoloIntervalMs = 400L
- 
+
     private var consecutivePersonDetections = 0
     private val requiredConsecutiveDetections = 3
- 
+
     private var lastRecognitionTime = 0L
     private val recognitionIntervalMs = 600L
- 
+
     private var closeFaceWidthRatio: Float
         get() = prefs.getFloat("close_face_ratio", 0.40f)
         set(value) { prefs.edit().putFloat("close_face_ratio", value).apply() }
- 
+
     private var farFaceWidthRatio: Float
         get() = prefs.getFloat("far_face_ratio", 0.23f)
         set(value) { prefs.edit().putFloat("far_face_ratio", value).apply() }
- 
+
     private var tooFarFaceWidthRatio: Float
         get() = prefs.getFloat("too_far_face_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
- 
+
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
- 
+
     private var lastUnknownFaceEmbedding: FloatArray? = null
- 
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private var lastGreetedName: String? = null
     private var lastGreetedTime = 0L
     private val greetingCooldownMs = 60_000L
     private var lastUnknownGreetTime = 0L
- 
+
     private var lastPetGreetTime = 0L
     private val petGreetingCooldownMs = 45_000L
     private val petGreetings = mapOf(
         "pusa" to listOf("Meow! Kumusta pusa!", "Ay, may pusa! Ang cute!", "Hi pusa, gusto mo bang makipaglaro?"),
         "aso" to listOf("Woof woof! Kumusta aso!", "Ay, may aso! Kaibigan ko yan.", "Hi doggi!")
     )
- 
+
     private var voskModel: Model? = null
     private var speechService: SpeechService? = null
     private var voskReady = false
     private var isSpeaking = false
     private var currentRecognizedName: String? = null
- 
+
     private val voskModelUrl = "https://alphacephei.com/vosk/models/vosk-model-tl-ph-generic-0.6.zip"
     private val voskModelDirName = "vosk-model-tl-ph-generic-0.6"
- 
+
     private val voiceLog = mutableListOf<Triple<Long, String, String>>()
     private val voiceLogMaxSize = 100
- 
+
     private val voiceMovementDurationMs = 3000L
     private val movementActions = setOf("FORWARD", "BACKWARD", "LEFT", "RIGHT")
     private var voiceOverrideActive = false
- 
+
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
         .build()
     private val faceDetector = FaceDetection.getClient(faceDetectorOptions)
-    
+
     private val dfPlayerPlayRegex = Regex("dfplayer\\s*play\\s*(\\d+)", RegexOption.IGNORE_CASE)
-    
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
- 
+
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         forceWifiForEsp32()
- 
+
         cameraExecutor = Executors.newSingleThreadExecutor()
         yoloDetector = YoloPersonDetector(this)
         faceEmbedder = FaceEmbedder(this)
         faceStore = FaceStore(this)
         commandStore = CommandStore(this)
         commandStore.seedDefaultsIfNeeded()
- 
+
         buildUi()
         showEyesUi()
- 
+
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 val engine = tts ?: return@TextToSpeech
@@ -211,7 +211,7 @@ class MainActivity : ComponentActivity() {
                 ttsReady = true
             }
         }
- 
+
         val missingPermissions = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             missingPermissions.add(Manifest.permission.CAMERA)
@@ -219,7 +219,7 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             missingPermissions.add(Manifest.permission.RECORD_AUDIO)
         }
- 
+
         if (missingPermissions.isEmpty()) {
             startCamera()
             setupVosk()
@@ -229,50 +229,89 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-  private fun executeEsp32Actions(actionField: String) {
-    val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
-    val dfParts = parts.filter { dfPlayerPlayRegex.containsMatchIn(it) }
-    val otherParts = parts.filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
+    /**
+     * Pinag-uuri ang isang action field ("||"-separated) sa DFPlayer track command(s) at
+     * sa iba pang ESP32 command(s), tapos ipinapadala nang maayos ang pagkakasunod-sunod:
+     * hinihintay muna ang aktwal na resulta (tagumpay man o pagkabigo) ng DFPlayer request
+     * bago ipadala ang movement/ibang commands, sa halip na basta mag-antay ng fixed delay.
+     * Mas maaasahan ito kapag "busy" pa ang ESP32 sa pag-uusap sa DFPlayer module.
+     */
+    private fun executeEsp32Actions(actionField: String) {
+        val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
+        val dfTracks = parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+        val otherParts = parts.filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
 
-    for (part in dfParts) {
-        val track = dfPlayerPlayRegex.find(part)?.groupValues?.get(1)?.toIntOrNull()
-        if (track != null) {
-            sendPlayTrack(track)
+        if (dfTracks.isEmpty()) {
+            runMovementParts(otherParts)
+            return
+        }
+
+        // Hintayin munang matapos (onResponse) o mag-fail (onFailure) ang UNANG
+        // DFPlayer track bago ipadala ang movement/ibang commands - kaysa manghula
+        // tayo ng magic delay number na baka minsan hindi sapat.
+        sendPlayTrackThen(dfTracks.first()) {
+            runMovementParts(otherParts)
+        }
+        // Kung sakaling may isa pang "dfplayer play N" sa parehong combo (bihira),
+        // ipadala na lang agad ang mga sumunod nang walang hintayan.
+        dfTracks.drop(1).forEach { sendPlayTrack(it) }
+    }
+
+    private fun runMovementParts(otherParts: List<String>) {
+        for (part in otherParts) {
+            val partUpper = part.uppercase()
+            if (partUpper in movementActions) {
+                sendTimedCommand(partUpper, voiceMovementDurationMs)
+            } else {
+                sendCommandToEsp32(part)
+            }
         }
     }
 
-    if (otherParts.isNotEmpty()) {
-        // Konting stagger (250ms) bago ipadala ang movement commands - kung
-        // sabay-sabay (halos parehong milliseconds) papasok ang DFPlayer at
-        // movement requests sa ESP32's single-threaded HTTP server, posibleng
-        // mag-collide/mag-timeout ang isa sa mga connection (kaya minsan
-        // "walang sagot" kahit tama ang code). Sapat ang maliit na antala na
-        // ito para makapag-finish muna ang DFPlayer request bago dumating
-        // ang susunod, pero hindi naman ito kapansin-pansing delay.
-        Handler(mainLooper).postDelayed({
-            for (part in otherParts) {
-                val partUpper = part.uppercase()
-                if (partUpper in movementActions) {
-                    sendTimedCommand(partUpper, voiceMovementDurationMs)
-                } else {
-                    sendCommandToEsp32(part)
+    private fun sendPlayTrack(track: Int) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
+            .build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP FAILED: ${e.message}") }
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP ${response.code}") }
+                }
+                response.close()
+            }
+        })
+    }
+
+    /**
+     * Kagaya ng sendPlayTrack() pero may onDone callback na tatawagin PAGKATAPOS ng
+     * aktwal na resulta ng request (tagumpay man o pagkabigo) - dito isasabay ang
+     * pagpapadala ng susunod na command sa combo, imbes na basta mag-antay ng fixed
+     * delay na baka hindi sapat kung "busy" pa ang ESP32 (hal. nagsusulat pa sa
+     * DFPlayer serial).
+     */
+    private fun sendPlayTrackThen(track: Int, onDone: () -> Unit) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
+            .build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi {
+                    addVoiceLogEntry("DFPlayer track $track", "HTTP FAILED: ${e.message}")
+                    onDone()
                 }
             }
-        }, 250)
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP ${response.code}") }
+                }
+                response.close()
+                runOnUi { onDone() }
+            }
+        })
     }
-}
-
-private fun sendPlayTrack(track: Int) {
-    val request = Request.Builder()
-        .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
-        .build()
-    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
-        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-            response.close()
-        }
-    })
-}
 
     private fun forceWifiForEsp32() {
         try {
@@ -280,7 +319,7 @@ private fun sendPlayTrack(track: Int) {
             val request = NetworkRequest.Builder()
                 .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
- 
+
             connectivityManager.requestNetwork(request, object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     connectivityManager.bindProcessToNetwork(network)
@@ -290,17 +329,17 @@ private fun sendPlayTrack(track: Int) {
             e.printStackTrace()
         }
     }
- 
+
     // ---------- UI setup ----------
- 
+
     private fun buildUi() {
         rootLayout = FrameLayout(this)
         previewView = PreviewView(this)
- 
+
         val accentColor = 0xFF00E5C7.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
         val darkChipPressed = 0xFF2A2A3E.toInt()
- 
+
         statusText = TextView(this).apply {
             setTextColor(0xFFFFFFFF.toInt())
             textSize = 13f
@@ -313,7 +352,7 @@ private fun sendPlayTrack(track: Int) {
                 setStroke(2, 0x22FFFFFF)
             }
         }
- 
+
         menuButton = Button(this).apply {
             text = "☰"
             textSize = 20f
@@ -324,7 +363,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 200f)
             setOnClickListener { showMainMenuDialog() }
         }
- 
+
         rootLayout.addView(
             previewView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
@@ -339,10 +378,10 @@ private fun sendPlayTrack(track: Int) {
             FrameLayout.LayoutParams(150, 150)
                 .apply { gravity = Gravity.BOTTOM or Gravity.END; bottomMargin = 32; rightMargin = 24 }
         )
- 
+
         setContentView(rootLayout)
     }
- 
+
     private fun makeRippleRoundedDrawable(baseColor: Int, pressedColor: Int, radius: Float): Drawable {
         val shape = GradientDrawable().apply {
             setColor(baseColor)
@@ -354,20 +393,20 @@ private fun sendPlayTrack(track: Int) {
         }
         return RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), shape, mask)
     }
- 
+
     private fun showMainMenuDialog() {
         val accentColor = 0xFF00E5C7.toInt()
         val accentPressed = 0xFF00A896.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
         val darkChipPressed = 0xFF2A2A3E.toInt()
         val disabledChip = 0xFF3A3A3A.toInt()
- 
+
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 40, 40, 32)
             setBackgroundColor(0xFF121212.toInt())
         }
- 
+
         val ipOption = Button(this).apply {
             text = "📶  IP ng Robot (${esp32BaseUrl.removePrefix("http://")})"
             textSize = 14f
@@ -378,7 +417,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showIpSettingDialog() }
         }
- 
+
         val enrollOption = Button(this).apply {
             text = "✨  Mag-enroll ng bagong mukha"
             textSize = 14f
@@ -395,7 +434,7 @@ private fun sendPlayTrack(track: Int) {
             }
             setOnClickListener { showEnrollDialog() }
         }
- 
+
         val greetingTracksOption = Button(this).apply {
             text = "🎙️  Greeting Tracks"
             textSize = 14f
@@ -406,7 +445,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showGreetingTracksDialog() }
         }
- 
+
         val distanceOption = Button(this).apply {
             text = "📏  Distance Settings"
             textSize = 14f
@@ -417,7 +456,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showDistanceSettingsDialog() }
         }
- 
+
         val micSensitivityOption = Button(this).apply {
             text = "🎤  Mic Sensitivity (${(micConfidenceThreshold * 100).toInt()}%)"
             textSize = 14f
@@ -428,7 +467,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showMicSensitivityDialog() }
         }
- 
+
         val commandsOption = Button(this).apply {
             text = "🎤  Mga Utos"
             textSize = 14f
@@ -439,7 +478,7 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showManageCommandsDialog() }
         }
- 
+
         val voiceLogOption = Button(this).apply {
             text = "🗒️  Voice Log"
             textSize = 14f
@@ -450,11 +489,11 @@ private fun sendPlayTrack(track: Int) {
             background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
             setOnClickListener { showVoiceLogDialog() }
         }
- 
+
         fun createSpacer() = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
- 
+
         container.addView(ipOption)
         container.addView(createSpacer())
         container.addView(enrollOption)
@@ -468,25 +507,25 @@ private fun sendPlayTrack(track: Int) {
         container.addView(commandsOption)
         container.addView(createSpacer())
         container.addView(voiceLogOption)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setView(scrollView)
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun showGreetingTracksDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         val keys = obj.keys().asSequence().toList()
- 
+
         if (keys.isEmpty()) {
             container.addView(TextView(this).apply {
                 text = "Wala pang naka-set na greeting track."
@@ -514,15 +553,15 @@ private fun sendPlayTrack(track: Int) {
                 container.addView(row)
             }
         }
- 
+
         container.addView(View(this).apply {
             setBackgroundColor(0xFFCCCCCC.toInt())
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
                 .apply { topMargin = 32; bottomMargin = 32 }
         })
- 
+
         container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
- 
+
         val nameInput = EditText(this).apply {
             hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -533,9 +572,9 @@ private fun sendPlayTrack(track: Int) {
         }
         container.addView(nameInput)
         container.addView(trackInput)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("🎙️ Greeting Tracks (per pangalan)")
             .setView(scrollView)
@@ -550,7 +589,7 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun showEyesUi() {
         appState = AppState.EYES
         canEnroll = false
@@ -564,37 +603,37 @@ private fun sendPlayTrack(track: Int) {
         consecutivePersonDetections = 0
         currentRecognizedName = null
     }
- 
+
     private fun showCameraUi() {
         appState = AppState.CAMERA
         lastPersonSeenTime = System.currentTimeMillis()
         statusText.text = "May tao! Sinusubukang kilalanin..."
     }
- 
+
     private fun runOnUi(block: () -> Unit) = runOnUiThread(block)
- 
+
     // ---------- Camera setup ----------
- 
+
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
- 
+
         cameraProviderFuture.addListener({
             try {
                 val cameraProvider = cameraProviderFuture.get()
- 
+
                 val preview = Preview.Builder().build().also {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
- 
+
                 val imageAnalyzer = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build()
                     .also {
                         it.setAnalyzer(cameraExecutor) { imageProxy -> processFrame(imageProxy) }
                     }
- 
+
                 val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
- 
+
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
             } catch (e: Exception) {
@@ -605,33 +644,33 @@ private fun sendPlayTrack(track: Int) {
             }
         }, ContextCompat.getMainExecutor(this))
     }
- 
+
     override fun onRequestPermissionsResult(
         requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == 100) {
             val grantedMap = permissions.zip(grantResults.toList()).toMap()
- 
+
             if (grantedMap[Manifest.permission.CAMERA] == PackageManager.PERMISSION_GRANTED) {
                 startCamera()
             } else if (permissions.contains(Manifest.permission.CAMERA)) {
                 statusText.text = "Naghahanap ng tao... (TINANGGIHAN ang camera permission)"
             }
- 
+
             if (grantedMap[Manifest.permission.RECORD_AUDIO] == PackageManager.PERMISSION_GRANTED) {
                 setupVosk()
             }
         }
     }
- 
+
     private fun processFrame(imageProxy: ImageProxy) {
         when (appState) {
             AppState.EYES -> processEyesFrame(imageProxy)
             AppState.CAMERA -> processCameraFrame(imageProxy)
         }
     }
- 
+
     private fun processEyesFrame(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
         if (!yoloDetector.isReady || now - lastYoloCheckTime < yoloIntervalMs) {
@@ -639,7 +678,7 @@ private fun sendPlayTrack(track: Int) {
             return
         }
         lastYoloCheckTime = now
- 
+
         try {
             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
             val detections = yoloDetector.detect(
@@ -648,17 +687,17 @@ private fun sendPlayTrack(track: Int) {
             )
             val personDetections = detections.filter { it.classId == YoloPersonDetector.PERSON_CLASS_INDEX }
             val petDetections = detections.filter { it.classId in YoloPersonDetector.PET_CLASSES }
- 
+
             if (personDetections.isNotEmpty()) {
                 consecutivePersonDetections++
             } else {
                 consecutivePersonDetections = 0
             }
- 
+
             if (petDetections.isNotEmpty()) {
                 runOnUi { greetPetIfNeeded(petDetections.first().label) }
             }
- 
+
             if (consecutivePersonDetections >= requiredConsecutiveDetections) {
                 rootLayout.postDelayed({
                     if (appState == AppState.EYES && consecutivePersonDetections >= requiredConsecutiveDetections) {
@@ -675,17 +714,17 @@ private fun sendPlayTrack(track: Int) {
             imageProxy.close()
         }
     }
- 
+
     private fun processCameraFrame(imageProxy: ImageProxy) {
         val mediaImage = imageProxy.image
         if (mediaImage == null) {
             imageProxy.close()
             return
         }
- 
+
         val rotation = imageProxy.imageInfo.rotationDegrees
         val inputImage = InputImage.fromMediaImage(mediaImage, rotation)
- 
+
         faceDetector.process(inputImage)
             .addOnSuccessListener { faces ->
                 if (faces.isNotEmpty()) {
@@ -697,20 +736,20 @@ private fun sendPlayTrack(track: Int) {
             .addOnFailureListener { it.printStackTrace() }
             .addOnCompleteListener { imageProxy.close() }
     }
- 
+
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
- 
+
         val box = face.boundingBox
         val frameWidth = imageProxy.width
         val frameHeight = imageProxy.height
- 
+
         val command = computeCommand(box, frameWidth)
         val servoAngle = computeServoAngle(box, frameHeight)
         if (!voiceOverrideActive) {
             sendCommandThrottled(command, servoAngle)
         }
- 
+
         val now = System.currentTimeMillis()
         if (faceEmbedder.isReady && now - lastRecognitionTime > recognitionIntervalMs) {
             lastRecognitionTime = now
@@ -718,7 +757,7 @@ private fun sendPlayTrack(track: Int) {
                 val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                 val adjustedBox = adjustBoxForRotation(box, frameWidth, frameHeight, rotation)
                 val faceCrop = ImageUtils.safeCrop(bitmap, adjustedBox)
- 
+
                 if (faceCrop != null) {
                     val embedding = faceEmbedder.getEmbedding(faceCrop)
                     if (embedding != null) {
@@ -749,7 +788,7 @@ private fun sendPlayTrack(track: Int) {
             }
         }
     }
- 
+
     private val unknownGreetings = listOf(
         "Kumusta, ano ginagawa mo ngayon.",
         "Hi kaibigan na tao! Gusto mo bang makipag laro sa akin.",
@@ -762,27 +801,27 @@ private fun sendPlayTrack(track: Int) {
         "Nagyayaya ba ang tropa ng inuman?",
         "Huwag mo ako kalimutan na e charge!",
     )
- 
+
     private fun greetingTrackFor(name: String): Int? {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         return if (obj.has(name)) obj.getInt(name) else null
     }
- 
+
     private fun setGreetingTrack(name: String, track: Int) {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         obj.put(name, track)
         prefs.edit().putString("greeting_tracks", obj.toString()).apply()
     }
- 
+
     private fun removeGreetingTrack(name: String) {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         obj.remove(name)
         prefs.edit().putString("greeting_tracks", obj.toString()).apply()
     }
- 
+
     private fun sendGreetingTrack(track: Int) {
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=GREET&track=$track")
@@ -794,30 +833,30 @@ private fun sendPlayTrack(track: Int) {
             }
         })
     }
- 
+
     private fun greetIfNeeded(name: String) {
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
         if (alreadyGreetedRecently) return
- 
+
         lastGreetedName = name
         lastGreetedTime = now
- 
+
         val track = greetingTrackFor(name)
         if (track != null) {
             sendGreetingTrack(track)
         }
     }
- 
+
     private fun greetUnknownIfNeeded() {
         val now = System.currentTimeMillis()
         if (now - lastUnknownGreetTime < greetingCooldownMs) return
         lastUnknownGreetTime = now
- 
+
         if (!ttsReady) return
         speak(unknownGreetings.random())
     }
- 
+
     private fun greetPetIfNeeded(label: String) {
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
@@ -826,9 +865,9 @@ private fun sendPlayTrack(track: Int) {
         val options = petGreetings[label] ?: return
         speak(options.random())
     }
- 
+
     // ---------- Vosk offline voice recognition ----------
- 
+
     private fun setupVosk() {
         val modelDir = voskModelDir()
         if (modelDir.exists() && modelDir.list()?.isNotEmpty() == true) {
@@ -837,24 +876,24 @@ private fun sendPlayTrack(track: Int) {
             downloadAndExtractVoskModel()
         }
     }
- 
+
     private fun voskModelDir(): File = File(filesDir, voskModelDirName)
- 
+
     private fun downloadAndExtractVoskModel() {
         Thread {
             try {
                 runOnUi { statusText.text = "⬇️ Dina-download ang Filipino voice model (~320MB, isang beses lang ito)..." }
- 
+
                 val request = Request.Builder().url(voskModelUrl).build()
                 val response = httpClient.newCall(request).execute()
                 if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
                 val body = response.body ?: throw java.io.IOException("Walang response body")
- 
+
                 val zipFile = File(cacheDir, "vosk_model.zip")
                 val totalBytes = body.contentLength()
                 var downloadedBytes = 0L
                 var lastUpdate = 0L
- 
+
                 body.byteStream().use { input ->
                     FileOutputStream(zipFile).use { output ->
                         val buffer = ByteArray(8192)
@@ -872,11 +911,11 @@ private fun sendPlayTrack(track: Int) {
                     }
                 }
                 response.close()
- 
+
                 runOnUi { statusText.text = "📦 Ina-extract ang voice model..." }
                 extractZip(zipFile, filesDir)
                 zipFile.delete()
- 
+
                 loadVoskModel(voskModelDir().absolutePath)
             } catch (e: Exception) {
                 e.printStackTrace()
@@ -884,7 +923,7 @@ private fun sendPlayTrack(track: Int) {
             }
         }.start()
     }
- 
+
     private fun extractZip(zipFile: File, targetDir: File) {
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             var entry = zis.nextEntry
@@ -907,7 +946,7 @@ private fun sendPlayTrack(track: Int) {
             }
         }
     }
- 
+
     private fun loadVoskModel(modelPath: String) {
         Thread {
             try {
@@ -924,9 +963,9 @@ private fun sendPlayTrack(track: Int) {
             }
         }.start()
     }
- 
+
     private val voskMaxAlternatives = 3
- 
+
     private fun startVoskListening() {
         val model = voskModel ?: return
         try {
@@ -941,13 +980,13 @@ private fun sendPlayTrack(track: Int) {
             statusText.text = "❌ Mic error: ${e.message}"
         }
     }
- 
+
     private val voskListener = object : VoskListener {
         override fun onPartialResult(hypothesis: String?) {}
- 
+
         override fun onResult(hypothesis: String?) {
             val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null } ?: return
- 
+
             val alternativesArray = json.optJSONArray("alternatives")
             val candidates: List<Pair<String, Float>> = if (alternativesArray != null && alternativesArray.length() > 0) {
                 (0 until alternativesArray.length()).mapNotNull { i ->
@@ -959,9 +998,9 @@ private fun sendPlayTrack(track: Int) {
                 val text = json.optString("text", "").trim()
                 if (text.isEmpty()) emptyList() else listOf(text to averageConfidence(json))
             }
- 
+
             if (candidates.isEmpty()) return
- 
+
             val topText = candidates.first().first
             val topConfidence = candidates.first().second
             if (topConfidence < micConfidenceThreshold) {
@@ -970,23 +1009,23 @@ private fun sendPlayTrack(track: Int) {
                 }
                 return
             }
- 
+
             val candidateTexts = candidates.map { it.first }
             runOnUi {
                 statusText.text = "[MIC] Narinig: $topText"
                 handleVoiceCommand(candidateTexts)
             }
         }
- 
+
         override fun onFinalResult(hypothesis: String?) {}
- 
+
         override fun onError(exception: Exception?) {
             exception?.printStackTrace()
         }
- 
+
         override fun onTimeout() {}
     }
- 
+
     private fun averageConfidence(json: JSONObject?): Float {
         val resultArray = json?.optJSONArray("result") ?: return 1f
         if (resultArray.length() == 0) return 1f
@@ -996,24 +1035,24 @@ private fun sendPlayTrack(track: Int) {
         }
         return (sum / resultArray.length()).toFloat()
     }
- 
+
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
         val resultLabel = processVoiceCommand(candidates)
         addVoiceLogEntry(heardText, resultLabel)
     }
- 
+
     private fun processVoiceCommand(candidates: List<String>): String {
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
                 speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
-                 executeEsp32Actions(custom.action)
-    }
+                    executeEsp32Actions(custom.action)
+                }
                 return "custom: \"${custom.trigger}\""
             }
- 
+
             when {
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
                     speak("Hihinto na po!")
@@ -1057,20 +1096,20 @@ private fun sendPlayTrack(track: Int) {
         }
         return "walang tumugma"
     }
- 
+
     private fun addVoiceLogEntry(heard: String, result: String) {
         voiceLog.add(0, Triple(System.currentTimeMillis(), heard, result))
         if (voiceLog.size > voiceLogMaxSize) {
             voiceLog.removeAt(voiceLog.size - 1)
         }
     }
- 
+
     private fun showVoiceLogDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         if (voiceLog.isEmpty()) {
             container.addView(TextView(this).apply {
                 text = "Wala pang narinig na boses sa session na ito."
@@ -1086,9 +1125,9 @@ private fun sendPlayTrack(track: Int) {
                 })
             }
         }
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("🗒️ Voice Log")
             .setView(scrollView)
@@ -1096,14 +1135,14 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun speak(phrase: String) {
         if (!ttsReady) return
         isSpeaking = true
         speechService?.setPause(true)
         tts?.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
     }
- 
+
     private fun handleNoFace() {
         sendCommandThrottled("STOP")
         val now = System.currentTimeMillis()
@@ -1111,7 +1150,7 @@ private fun sendPlayTrack(track: Int) {
             runOnUi { showEyesUi() }
         }
     }
- 
+
     private fun adjustBoxForRotation(box: Rect, frameWidth: Int, frameHeight: Int, rotationDegrees: Int): Rect {
         return when (rotationDegrees) {
             90 -> Rect(frameHeight - box.bottom, box.left, frameHeight - box.top, box.right)
@@ -1120,21 +1159,21 @@ private fun sendPlayTrack(track: Int) {
             else -> box
         }
     }
- 
+
     private fun computeCommand(box: Rect, frameWidth: Int): String {
         val faceWidthRatio = box.width().toFloat() / frameWidth.toFloat()
         if (faceWidthRatio > closeFaceWidthRatio) {
             return "BACKWARD"
         }
- 
+
         val faceCenterX = box.centerX()
         val screenCenterX = frameWidth / 2
- 
+
         val centerDeadzoneWidth = (frameWidth / 3.5 / 2).toInt()
- 
+
         val leftBoundary = screenCenterX - centerDeadzoneWidth
         val rightBoundary = screenCenterX + centerDeadzoneWidth
- 
+
         return when {
             faceCenterX < leftBoundary -> "RIGHT"
             faceCenterX > rightBoundary -> "LEFT"
@@ -1143,48 +1182,48 @@ private fun sendPlayTrack(track: Int) {
             else -> "STOP"
         }
     }
- 
+
     private val SERVO_MAX_ANGLE = 110
     private var servoTopRatio: Float
         get() = prefs.getFloat("servo_top_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
- 
+
     private var servoBottomRatio: Float
         get() = prefs.getFloat("servo_bottom_ratio", 0.70f)
         set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
- 
+
     private var smoothedServoAngle: Float = 0f
     private val servoSmoothingFactorFar = 0.2f
     private val servoSmoothingFactorNear = 0.12f
     private val servoSmoothingSwitchThreshold = 20f
- 
+
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         val faceCenterY = box.centerY()
         val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
- 
+
         val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
         val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
         val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
- 
+
         val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
         val factor = if (distance > servoSmoothingSwitchThreshold) {
             servoSmoothingFactorFar
         } else {
             servoSmoothingFactorNear
         }
- 
+
         smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
- 
+
         return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
     }
- 
+
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
         val now = System.currentTimeMillis()
         if (now - lastSendTime < sendIntervalMs) return
         lastSendTime = now
         sendCommandToEsp32(command, servoAngle)
     }
- 
+
     private fun sendTimedCommand(command: String, durationMs: Long) {
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
@@ -1202,14 +1241,14 @@ private fun sendPlayTrack(track: Int) {
         }
         handler.post(runnable)
     }
- 
+
     private fun sendCommandToEsp32(command: String, servoAngle: Int? = null) {
         var url = "$esp32BaseUrl/command?dir=$command"
         if (servoAngle != null) {
             url += "&servo=$servoAngle"
         }
         val request = Request.Builder().url(url).build()
- 
+
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
@@ -1217,16 +1256,16 @@ private fun sendPlayTrack(track: Int) {
             }
         })
     }
- 
+
     // ---------- Enroll UI ----------
- 
+
     private fun showIpSettingDialog() {
         val input = EditText(this).apply {
             hint = "hal. 192.168.1.25 o 192.168.43.100"
             inputType = InputType.TYPE_CLASS_TEXT
             setText(esp32BaseUrl.removePrefix("http://"))
         }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("I-set ang IP Address ng Robot")
             .setMessage("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save.")
@@ -1241,13 +1280,13 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showDistanceSettingsDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val closeInput = EditText(this).apply {
             hint = "close (default 0.40)"
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
@@ -1263,7 +1302,7 @@ private fun sendPlayTrack(track: Int) {
             inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
             setText(tooFarFaceWidthRatio.toString())
         }
- 
+
         container.addView(TextView(this).apply { text = "Close (BACKWARD kapag lumagpas dito):" })
         container.addView(closeInput)
         container.addView(TextView(this).apply { text = "Far (FORWARD kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
@@ -1275,9 +1314,9 @@ private fun sendPlayTrack(track: Int) {
             textSize = 11f
             setPadding(0, 16, 0, 0)
         })
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("📏 Distance Settings")
             .setView(scrollView)
@@ -1285,7 +1324,7 @@ private fun sendPlayTrack(track: Int) {
                 val newClose = closeInput.text.toString().toFloatOrNull()
                 val newFar = farInput.text.toString().toFloatOrNull()
                 val newTooFar = tooFarInput.text.toString().toFloatOrNull()
- 
+
                 if (newClose != null && newFar != null && newTooFar != null &&
                     newClose > newFar && newFar > newTooFar
                 ) {
@@ -1306,14 +1345,14 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showMicSensitivityDialog() {
         val input = EditText(this).apply {
             hint = "0-100 (default 50)"
             inputType = InputType.TYPE_CLASS_NUMBER
             setText((micConfidenceThreshold * 100).toInt().toString())
         }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("🎤 Mic Sensitivity")
             .setMessage("Minimum confidence (%) bago ituring na valid ang narinig. Mas mataas = mas mahigpit/malinaw kailangan sabihin.")
@@ -1334,19 +1373,19 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showEnrollDialog() {
         val embedding = lastUnknownFaceEmbedding
         if (embedding == null) {
             statusText.text = "Wala pang mukha na nakuha, subukan ulit"
             return
         }
- 
+
         val input = EditText(this).apply {
             hint = "Pangalan (hal. Rusty)"
             inputType = InputType.TYPE_CLASS_TEXT
         }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("Mag-enroll ng mukha")
             .setView(input)
@@ -1362,13 +1401,13 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Cancel", null)
             .show()
     }
- 
+
     private fun showManageCommandsDialog() {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val existing = commandStore.all()
         if (existing.isEmpty()) {
             container.addView(TextView(this).apply {
@@ -1407,15 +1446,15 @@ private fun sendPlayTrack(track: Int) {
                 container.addView(row)
             }
         }
- 
+
         container.addView(View(this).apply {
             setBackgroundColor(0xFFCCCCCC.toInt())
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
                 .apply { topMargin = 32; bottomMargin = 32 }
         })
- 
+
         container.addView(TextView(this).apply { text = "Magdagdag ng bagong command:" })
- 
+
         val triggerInput = EditText(this).apply {
             hint = "Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi)"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -1433,7 +1472,7 @@ private fun sendPlayTrack(track: Int) {
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val actionInput = EditText(this).apply {
-            hint = "ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP - iwanan blangko kung wala)"
+            hint = "ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N - hiwalayin ng || kung gusto ng sabay)"
             inputType = InputType.TYPE_CLASS_TEXT
         }
         container.addView(replyInput)
@@ -1445,9 +1484,9 @@ private fun sendPlayTrack(track: Int) {
             }
         )
         container.addView(actionInput)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("Mga Voice Command")
             .setView(scrollView)
@@ -1463,13 +1502,13 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Isara", null)
             .show()
     }
- 
+
     private fun showEditCommandDialog(cmd: CommandStore.VoiceCommand) {
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
- 
+
         val triggerInput = EditText(this).apply {
             hint = "Sasabihin"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -1491,9 +1530,9 @@ private fun sendPlayTrack(track: Int) {
         container.addView(replyInput)
         container.addView(TextView(this).apply { text = "ESP32 action:"; setPadding(0, 24, 0, 0) })
         container.addView(actionInput)
- 
+
         val scrollView = ScrollView(this).apply { addView(container) }
- 
+
         android.app.AlertDialog.Builder(this)
             .setTitle("I-edit ang Command")
             .setView(scrollView)
@@ -1513,7 +1552,7 @@ private fun sendPlayTrack(track: Int) {
             .setNegativeButton("Cancel") { _, _ -> showManageCommandsDialog() }
             .show()
     }
- 
+
     override fun onDestroy() {
         super.onDestroy()
         cameraExecutor.shutdown()
@@ -1526,4 +1565,3 @@ private fun sendPlayTrack(track: Int) {
         speechService?.shutdown()
     }
 }
- 
