@@ -130,6 +130,10 @@ class MainActivity : ComponentActivity() {
     private var tooFarFaceWidthRatio: Float
         get() = prefs.getFloat("too_far_face_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
+        
+    private var unknownGreetingTracksRaw: String
+    get() = prefs.getString("unknown_greeting_tracks", "") ?: ""
+    set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
     private var lastPersonSeenTime = 0L
     private val personTimeoutMs = 4000L
@@ -256,7 +260,10 @@ class MainActivity : ComponentActivity() {
         // ipadala na lang agad ang mga sumunod nang walang hintayan.
         dfTracks.drop(1).forEach { sendPlayTrack(it) }
     }
-
+    
+    private fun unknownGreetingTrackList(): List<Int> =
+    unknownGreetingTracksRaw.split(",").mapNotNull { it.trim().toIntOrNull() }
+    
     private fun runMovementParts(otherParts: List<String>) {
         for (part in otherParts) {
             val partUpper = part.uppercase()
@@ -522,6 +529,8 @@ class MainActivity : ComponentActivity() {
             setPadding(48, 24, 48, 24)
         }
 
+        
+
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         val keys = obj.keys().asSequence().toList()
@@ -563,29 +572,45 @@ class MainActivity : ComponentActivity() {
         container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
 
         val nameInput = EditText(this).apply {
-            hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-        val trackInput = EditText(this).apply {
-            hint = "Track numbers, comma-separated (hal. 25,26,27)"
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-        container.addView(nameInput)
-        container.addView(trackInput)
+    hint = "Eksaktong pangalan (kagaya ng naka-enroll) - IWANAN BLANGKO kung hindi kilala"
+    inputType = InputType.TYPE_CLASS_TEXT
+}
+val trackInput = EditText(this).apply {
+    hint = "Track numbers, comma-separated (hal. 25,26,27)"
+    inputType = InputType.TYPE_CLASS_TEXT
+}
+container.addView(nameInput)
+container.addView(trackInput)
+
+container.addView(View(this).apply {
+    setBackgroundColor(0xFFCCCCCC.toInt())
+    layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+        .apply { topMargin = 32; bottomMargin = 32 }
+})
+container.addView(TextView(this).apply {
+    text = "🎲 Random tracks para sa HINDI kilalang tao (comma-separated):"
+})
+val unknownTracksInput = EditText(this).apply {
+    hint = "hal. 32,33,34,35,36,37"
+    inputType = InputType.TYPE_CLASS_TEXT
+    setText(unknownGreetingTracksRaw)
+}
+container.addView(unknownTracksInput)
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
         android.app.AlertDialog.Builder(this)
             .setTitle("🎙️ Greeting Tracks (per pangalan)")
             .setView(scrollView)
-            .setPositiveButton("Idagdag") { _, _ ->
-                val name = nameInput.text.toString().trim()
-                val tracksCsv = trackInput.text.toString().trim()
-                if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
-                    setGreetingTracks(name, tracksCsv)
-                    statusText.text = "Na-set: $name -> Tracks $tracksCsv"
-                }
-            }
+            .setPositiveButton("Idagdag/I-save") { _, _ ->
+    val name = nameInput.text.toString().trim()
+    val tracksCsv = trackInput.text.toString().trim()
+    if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
+        setGreetingTracks(name, tracksCsv)
+    }
+    unknownGreetingTracksRaw = unknownTracksInput.text.toString().trim()
+    statusText.text = "Na-save ang greeting tracks"
+}
             .setNegativeButton("Isara", null)
             .show()
     }
@@ -842,13 +867,18 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun greetUnknownIfNeeded() {
-        val now = System.currentTimeMillis()
-        if (now - lastUnknownGreetTime < greetingCooldownMs) return
-        lastUnknownGreetTime = now
+    val now = System.currentTimeMillis()
+    if (now - lastUnknownGreetTime < greetingCooldownMs) return
+    lastUnknownGreetTime = now
 
-        if (!ttsReady) return
+    val tracks = unknownGreetingTrackList()
+    if (tracks.isNotEmpty()) {
+        sendPlayTrack(tracks.random())
+    } else if (ttsReady) {
+        // Fallback sa TTS kung wala pang na-set na DFPlayer tracks
         speak(unknownGreetings.random())
     }
+}
 
     private fun greetPetIfNeeded(label: String) {
         val now = System.currentTimeMillis()
