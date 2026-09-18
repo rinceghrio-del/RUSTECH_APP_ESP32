@@ -1056,8 +1056,8 @@ class MainActivity : ComponentActivity() {
             when {
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
                     speak("Hihinto na po!")
-                    sendCommandToEsp32("STOP")
-                    return "STOP"
+                    sendCommandToEsp32("FORCE_STOP")
+                    return "FORCE_STOP"
                 }
                 text.contains("kaliwa") || text.contains("left") -> {
                     speak("Lilikot sa kaliwa.")
