@@ -231,16 +231,24 @@ class MainActivity : ComponentActivity() {
 
   private fun executeEsp32Actions(actionField: String) {
     val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
-    for (part in parts) {
-        val dfMatch = dfPlayerPlayRegex.find(part)
-        if (dfMatch != null) {
-            val track = dfMatch.groupValues[1].toIntOrNull()
-            if (track != null) {
-                sendPlayTrack(track)
-            }
-            continue
-        }
 
+    // Ang DFPlayer/sound parts ang ipinapadala MUNA, bago ang movement commands.
+    // Dahil paulit-ulit magpapadala ng FORWARD/LEFT/atbp ang sendTimedCommand()
+    // (bawat 300ms sa loob ng ilang segundo), kung una itong ipoproseso, maiipit
+    // ang PLAY request sa likod ng backlog ng mga paulit-ulit na movement request
+    // papunta sa parehong ESP32 host - kaya delayed ang tunog. Sa pag-una sa
+    // DFPlayer, hindi na ito maaantala.
+    val dfParts = parts.filter { dfPlayerPlayRegex.containsMatchIn(it) }
+    val otherParts = parts.filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
+
+    for (part in dfParts) {
+        val track = dfPlayerPlayRegex.find(part)?.groupValues?.get(1)?.toIntOrNull()
+        if (track != null) {
+            sendPlayTrack(track)
+        }
+    }
+
+    for (part in otherParts) {
         val partUpper = part.uppercase()
         if (partUpper in movementActions) {
             sendTimedCommand(partUpper, voiceMovementDurationMs)
