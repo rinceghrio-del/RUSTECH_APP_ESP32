@@ -231,13 +231,6 @@ class MainActivity : ComponentActivity() {
 
   private fun executeEsp32Actions(actionField: String) {
     val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
-
-    // Ang DFPlayer/sound parts ang ipinapadala MUNA, bago ang movement commands.
-    // Dahil paulit-ulit magpapadala ng FORWARD/LEFT/atbp ang sendTimedCommand()
-    // (bawat 300ms sa loob ng ilang segundo), kung una itong ipoproseso, maiipit
-    // ang PLAY request sa likod ng backlog ng mga paulit-ulit na movement request
-    // papunta sa parehong ESP32 host - kaya delayed ang tunog. Sa pag-una sa
-    // DFPlayer, hindi na ito maaantala.
     val dfParts = parts.filter { dfPlayerPlayRegex.containsMatchIn(it) }
     val otherParts = parts.filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
 
@@ -248,13 +241,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    for (part in otherParts) {
-        val partUpper = part.uppercase()
-        if (partUpper in movementActions) {
-            sendTimedCommand(partUpper, voiceMovementDurationMs)
-        } else {
-            sendCommandToEsp32(part)
-        }
+    if (otherParts.isNotEmpty()) {
+        // Konting stagger (250ms) bago ipadala ang movement commands - kung
+        // sabay-sabay (halos parehong milliseconds) papasok ang DFPlayer at
+        // movement requests sa ESP32's single-threaded HTTP server, posibleng
+        // mag-collide/mag-timeout ang isa sa mga connection (kaya minsan
+        // "walang sagot" kahit tama ang code). Sapat ang maliit na antala na
+        // ito para makapag-finish muna ang DFPlayer request bago dumating
+        // ang susunod, pero hindi naman ito kapansin-pansing delay.
+        Handler(mainLooper).postDelayed({
+            for (part in otherParts) {
+                val partUpper = part.uppercase()
+                if (partUpper in movementActions) {
+                    sendTimedCommand(partUpper, voiceMovementDurationMs)
+                } else {
+                    sendCommandToEsp32(part)
+                }
+            }
+        }, 250)
     }
 }
 
