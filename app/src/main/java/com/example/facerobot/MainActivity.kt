@@ -170,7 +170,9 @@ class MainActivity : ComponentActivity() {
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
         .build()
     private val faceDetector = FaceDetection.getClient(faceDetectorOptions)
- 
+    
+    private val dfPlayerPlayRegex = Regex("dfplayer\\s*play\\s*(\\d+)", RegexOption.IGNORE_CASE)
+    
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
  
@@ -226,7 +228,40 @@ class MainActivity : ComponentActivity() {
             ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
         }
     }
- 
+
+  private fun executeEsp32Actions(actionField: String) {
+    val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
+    for (part in parts) {
+        val dfMatch = dfPlayerPlayRegex.find(part)
+        if (dfMatch != null) {
+            val track = dfMatch.groupValues[1].toIntOrNull()
+            if (track != null) {
+                sendPlayTrack(track)
+            }
+            continue
+        }
+
+        val partUpper = part.uppercase()
+        if (partUpper in movementActions) {
+            sendTimedCommand(partUpper, voiceMovementDurationMs)
+        } else {
+            sendCommandToEsp32(part)
+        }
+    }
+}
+
+private fun sendPlayTrack(track: Int) {
+    val request = Request.Builder()
+        .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
+        .build()
+    httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+        override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+            response.close()
+        }
+    })
+}
+
     private fun forceWifiForEsp32() {
         try {
             val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -962,13 +997,8 @@ class MainActivity : ComponentActivity() {
             if (custom != null) {
                 speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
-                    val actionUpper = custom.action.uppercase()
-                    if (actionUpper in movementActions) {
-                        sendTimedCommand(actionUpper, voiceMovementDurationMs)
-                    } else {
-                        sendCommandToEsp32(custom.action)
-                    }
-                }
+                 executeEsp32Actions(custom.action)
+    }
                 return "custom: \"${custom.trigger}\""
             }
  
