@@ -203,6 +203,7 @@ class MainActivity : ComponentActivity() {
 
         buildUi()
         showEyesUi()
+        startEspHeartbeat()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -241,6 +242,14 @@ class MainActivity : ComponentActivity() {
         } else {
             statusText.text = "Naghahanap ng tao... (hinihintay permissions...)"
             ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
+        }
+    }
+
+    private val pingHandler = Handler(android.os.Looper.getMainLooper())
+    private val pingRunnable = object : Runnable {
+        override fun run() {
+            pingEsp32()
+            pingHandler.postDelayed(this, 3000)
         }
     }
 
@@ -1310,6 +1319,21 @@ container.addView(unknownTracksInput)
         sendCommandToEsp32(command, servoAngle)
     }
 
+    private fun startEspHeartbeat() {
+        pingHandler.removeCallbacks(pingRunnable)
+        pingHandler.post(pingRunnable)
+    }
+
+    private fun pingEsp32() {
+        val request = Request.Builder().url("$esp32BaseUrl/ping").build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.close()
+            }
+        })
+    }
+
     private fun sendTimedCommand(command: String, durationMs: Long) {
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
@@ -1641,6 +1665,7 @@ container.addView(unknownTracksInput)
 
     override fun onDestroy() {
         super.onDestroy()
+        pingHandler.removeCallbacksAndMessages(null)
         cameraExecutor.shutdown()
         faceDetector.close()
         yoloDetector.close()
