@@ -1,5 +1,4 @@
 
-Roboeyesview · KT
 package com.example.facerobot.ui
  
 import android.animation.ValueAnimator
