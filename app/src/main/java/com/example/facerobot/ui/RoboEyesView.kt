@@ -52,7 +52,9 @@ class RoboEyesView @JvmOverloads constructor(
     private var nextLookChangeAtMs = 0L
 
     fun setMood(newMood: Mood) {
+        if (mood == newMood) return
         mood = newMood
+        scheduleNextLookChange() // agad na susunod sa bagong mood (hal. SEARCHING = mas malawak lumingon)
         invalidate()
     }
 
@@ -60,16 +62,28 @@ class RoboEyesView @JvmOverloads constructor(
         super.onAttachedToWindow()
         scheduleNextBlink()
         scheduleNextLookChange()
-        startLoop()
+        if (visibility == VISIBLE) startLoop()
     }
 
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        stopLoop()
+    }
+
+    // Huwag nang mag-animate kapag nakatago ang eyes (Camera mode) para hindi sayang ang CPU/baterya
+    override fun onVisibilityChanged(changedView: View, visibility: Int) {
+        super.onVisibilityChanged(changedView, visibility)
+        if (!isAttachedToWindow) return
+        if (isShown) startLoop() else stopLoop()
+    }
+
+    private fun stopLoop() {
         animator?.cancel()
         animator = null
     }
 
     private fun startLoop() {
+        if (animator != null) return
         animator = ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 16
             interpolator = LinearInterpolator()
