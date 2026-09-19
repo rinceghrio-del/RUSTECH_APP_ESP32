@@ -26,6 +26,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.camera.core.CameraSelector
@@ -36,6 +37,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import com.example.facerobot.ui.RoboEyesView
 import com.example.facerobot.vision.FaceEmbedder
 import com.example.facerobot.vision.FaceStore
 import com.example.facerobot.vision.ImageUtils
@@ -76,6 +78,7 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var previewView: PreviewView
+    private lateinit var roboEyesView: RoboEyesView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
     private var canEnroll = false
@@ -98,6 +101,13 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putFloat("mic_confidence_threshold", value.coerceIn(0f, 1f)).apply() }
 
     private var appState = AppState.EYES
+
+    // true = RoboEyes ang ipapakita sa screen, false = Camera preview.
+    // Kahit alin ang naka-display, tuloy pa rin ang camera analysis (face tracking,
+    // recognition, ESP32 commands, voice) dahil tinatakpan lang ng eyes ang preview.
+    private var showRoboEyes: Boolean
+        get() = prefs.getBoolean("display_roboeyes", true)
+        set(value) { prefs.edit().putBoolean("display_roboeyes", value).apply() }
 
     private val prefs by lazy { getSharedPreferences("facerobot_prefs", MODE_PRIVATE) }
     private var esp32BaseUrl: String
@@ -342,6 +352,7 @@ class MainActivity : ComponentActivity() {
     private fun buildUi() {
         rootLayout = FrameLayout(this)
         previewView = PreviewView(this)
+        roboEyesView = RoboEyesView(this)
 
         val accentColor = 0xFF00E5C7.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
@@ -375,6 +386,12 @@ class MainActivity : ComponentActivity() {
             previewView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         )
+        // Nasa ibabaw ng previewView (opaque na itim) - HUWAG gawing GONE ang previewView,
+        // dahil titigil ang camera frames kapag nawala ang surface niya.
+        rootLayout.addView(
+            roboEyesView,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
         rootLayout.addView(
             statusText,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
@@ -387,6 +404,11 @@ class MainActivity : ComponentActivity() {
         )
 
         setContentView(rootLayout)
+        applyDisplayMode()
+    }
+
+    private fun applyDisplayMode() {
+        roboEyesView.visibility = if (showRoboEyes) View.VISIBLE else View.GONE
     }
 
     private fun makeRippleRoundedDrawable(baseColor: Int, pressedColor: Int, radius: Float): Drawable {
@@ -412,6 +434,31 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(40, 40, 40, 32)
             setBackgroundColor(0xFF121212.toInt())
+        }
+
+        val displayToggle = Switch(this).apply {
+            fun refreshText() {
+                text = if (showRoboEyes) "👀  Display: RoboEyes" else "📷  Display: Camera"
+            }
+            refreshText()
+            textSize = 14f
+            isChecked = showRoboEyes
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            thumbTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(accentColor, 0xFF888888.toInt())
+            )
+            trackTintList = ColorStateList(
+                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                intArrayOf(accentPressed, 0xFF444444.toInt())
+            )
+            setOnCheckedChangeListener { _, checked ->
+                showRoboEyes = checked
+                applyDisplayMode()
+                refreshText()
+            }
         }
 
         val ipOption = Button(this).apply {
@@ -501,6 +548,8 @@ class MainActivity : ComponentActivity() {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
 
+        container.addView(displayToggle)
+        container.addView(createSpacer())
         container.addView(ipOption)
         container.addView(createSpacer())
         container.addView(enrollOption)
@@ -627,11 +676,13 @@ container.addView(unknownTracksInput)
         lastUnknownGreetTime = 0L
         consecutivePersonDetections = 0
         currentRecognizedName = null
+        roboEyesView.setMood(RoboEyesView.Mood.IDLE)
     }
 
     private fun showCameraUi() {
         appState = AppState.CAMERA
         lastPersonSeenTime = System.currentTimeMillis()
+        roboEyesView.setMood(RoboEyesView.Mood.ALERT)
         statusText.text = "May tao! Sinusubukang kilalanin..."
     }
 
@@ -764,6 +815,7 @@ container.addView(unknownTracksInput)
 
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
+        runOnUi { roboEyesView.setMood(RoboEyesView.Mood.ALERT) }
 
         val box = face.boundingBox
         val frameWidth = imageProxy.width
@@ -1171,6 +1223,8 @@ container.addView(unknownTracksInput)
         val now = System.currentTimeMillis()
         if (now - lastPersonSeenTime > personTimeoutMs) {
             runOnUi { showEyesUi() }
+        } else {
+            runOnUi { roboEyesView.setMood(RoboEyesView.Mood.SEARCHING) }
         }
     }
 
