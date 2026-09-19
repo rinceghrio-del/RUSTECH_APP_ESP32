@@ -146,6 +146,7 @@ class MainActivity : ComponentActivity() {
     set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
     private var lastPersonSeenTime = 0L
+    private var faceTooClose = false
     private val personTimeoutMs = 4000L
 
     private var lastUnknownFaceEmbedding: FloatArray? = null
@@ -676,6 +677,7 @@ container.addView(unknownTracksInput)
         lastUnknownGreetTime = 0L
         consecutivePersonDetections = 0
         currentRecognizedName = null
+        faceTooClose = false
         roboEyesView.setMood(RoboEyesView.Mood.IDLE)
     }
 
@@ -815,11 +817,18 @@ container.addView(unknownTracksInput)
 
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
-        runOnUi { roboEyesView.setMood(RoboEyesView.Mood.ALERT) }
+        
 
         val box = face.boundingBox
         val frameWidth = imageProxy.width
         val frameHeight = imageProxy.height
+
+        val faceRatio = box.width().toFloat() / frameWidth.toFloat()
+        if (!faceTooClose && faceRatio > closeFaceWidthRatio) faceTooClose = true
+        else if (faceTooClose && faceRatio < closeFaceWidthRatio * 0.9f) faceTooClose = false
+        runOnUi {
+            roboEyesView.setMood(if (faceTooClose) RoboEyesView.Mood.ANGRY else RoboEyesView.Mood.ALERT)
+        }
 
         val command = computeCommand(box, frameWidth)
         val servoAngle = computeServoAngle(box, frameHeight)
