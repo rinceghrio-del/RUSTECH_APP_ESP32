@@ -99,6 +99,18 @@ class MainActivity : ComponentActivity() {
         .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
+    // Hiwalay na client para sa camera-nav hints + ping: MAIKLI ang timeouts at sarili nitong dispatcher.
+    // Ang pangkalahatang httpClient ay may 30s/60s timeout - kapag nag-hang ang isang request, napupuno ang
+    // dispatcher slots at naiipit ang lahat ng hints/ping (kaya "minsan hindi gumagana" ang camera avoidance).
+    private val navClient = httpClient.newBuilder()
+        .connectTimeout(700, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .readTimeout(900, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .writeTimeout(900, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .callTimeout(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+        .retryOnConnectionFailure(false)
+        .dispatcher(okhttp3.Dispatcher().apply { maxRequestsPerHost = 4 })
+        .build()
+
     private lateinit var yoloDetector: YoloPersonDetector
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var faceStore: FaceStore
@@ -225,6 +237,13 @@ class MainActivity : ComponentActivity() {
     private var navLastDecision = ObstacleAnalyzer.Decision.CLEAR
     private var navLastDecisionTime = 0L
 
+    // Isang hint / isang ping lang ang sabay na nasa ere - iwas-pile-up at iwas-lumang hints
+    @Volatile private var navHintInFlight = false
+    @Volatile private var pingInFlight = false
+    private var lastNavHintName = ""
+    private var lastNavHintSentTime = 0L
+    private val navKeepAliveMs = 400L    // ESP32 hint timeout = 700ms, kaya ulitin bago mag-expire
+
     private val navHandler = Handler(android.os.Looper.getMainLooper())
     private val navSendRunnable = object : Runnable {
         override fun run() {
@@ -244,7 +263,7 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putBoolean("nav_enabled", value).apply() }
 
     private var navScanEnabled: Boolean
-        get() = prefs.getBoolean("nav_scan_enabled", true)
+        get() = prefs.getBoolean("nav_scan_enabled", false)
         set(value) { prefs.edit().putBoolean("nav_scan_enabled", value).apply() }
 
     private var navInvert: Boolean
@@ -262,6 +281,16 @@ class MainActivity : ComponentActivity() {
     private var navBlockThreshold: Float
         get() = prefs.getFloat("nav_block_threshold", 0.75f)
         set(value) { prefs.edit().putFloat("nav_block_threshold", value.coerceIn(0.50f, 0.95f)).apply() }
+
+    // Banda ng larawan (% ng taas) na sinusuri para sa harang. Ibaba ang dalawa kung hindi makatingin
+    // pababa ang camera (hal. 45 at 90), para ang sahig ang masuri at hindi ang kisame/malayong pader.
+    private var navRowTopPercent: Int
+        get() = prefs.getInt("nav_row_top", 30)
+        set(value) { prefs.edit().putInt("nav_row_top", value.coerceIn(0, 80)).apply() }
+
+    private var navRowBottomPercent: Int
+        get() = prefs.getInt("nav_row_bottom", 75)
+        set(value) { prefs.edit().putInt("nav_row_bottom", value.coerceIn(20, 100)).apply() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1425,13 +1454,17 @@ class MainActivity : ComponentActivity() {
      * (Ang lumang firmware na "PONG" lang ang sagot ay hindi papasok sa nav mode.)
      */
     private fun pingEsp32() {
+        if (pingInFlight) return
+        pingInFlight = true
         val request = Request.Builder().url("$esp32BaseUrl/ping").build()
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        navClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                pingInFlight = false
                 runOnUi { onEspPingResult(null) }
             }
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
                 val body = try { response.use { it.body?.string() } } catch (e: Exception) { null }
+                pingInFlight = false
                 runOnUi { onEspPingResult(body) }
             }
         })
@@ -1440,7 +1473,7 @@ class MainActivity : ComponentActivity() {
     private fun onEspPingResult(body: String?) {
         if (body == null) {
             pingFailCount++
-            if (navActive && pingFailCount >= 3) exitNavMode("nawala ang link sa robot")
+            if (navActive && pingFailCount >= 5) exitNavMode("nawala ang link sa robot")
             return
         }
         pingFailCount = 0
@@ -1537,7 +1570,11 @@ class MainActivity : ComponentActivity() {
             val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
             // Sa test/calibrate, laging tilt A lang ang gamit. Sa totoong nav, sumusunod sa kasalukuyang servo pose.
             val pose = if (navScanEnabled && navActive && !navCalibrating && !navTestMode) navPose else 0
-            val cfg = ObstacleAnalyzer.Config(blockThreshold = navBlockThreshold)
+            val cfg = ObstacleAnalyzer.Config(
+                blockThreshold = navBlockThreshold,
+                rowTop = navRowTopPercent / 100f,
+                rowBottom = navRowBottomPercent / 100f
+            )
             val result = analyzer.analyze(upright, pose, cfg, now)
             if (result != null) runOnUi { onNavResult(result) }
         } catch (e: Exception) {
@@ -1563,8 +1600,10 @@ class MainActivity : ComponentActivity() {
             else -> "🧭 NAV"
         }
         statusText.text = String.format(
-            Locale.US, "%s  L%.2f  C%.2f  R%.2f  (T%.2f) → %s%s",
-            prefix, r.left, r.center, r.right, navBlockThreshold, label, if (r.flat) "  [flat]" else ""
+            Locale.US, "%s  L%.2f  C%.2f  R%.2f  (T%.2f)  servo %d → %s%s",
+            prefix, r.left, r.center, r.right, navBlockThreshold,
+            if (navScanEnabled && navPose == 1) navServoB else navServoA,
+            label, if (r.flat) "  [flat]" else ""
         )
 
         if (navCalibrating) {
@@ -1594,8 +1633,29 @@ class MainActivity : ComponentActivity() {
             ObstacleAnalyzer.Decision.RIGHT -> if (navInvert) "NAV_LEFT" else "NAV_RIGHT"
         }
         val angle = if (navScanEnabled && navPose == 1) navServoB else navServoA
+        val now = System.currentTimeMillis()
+
+        // Ipadala agad kapag nagbago ang desisyon/servo; kung pareho pa rin, keep-alive lang bawat ~400ms
+        val changed = name != lastNavHintName || angle != lastNavServoAngle
+        if (!changed && now - lastNavHintSentTime < navKeepAliveMs) return
+        // Huwag mag-pile up: kapag may hint pang hinihintay ang sagot, laktawan ito (susunod na cycle na)
+        if (navHintInFlight) return
+
+        lastNavHintName = name
+        lastNavHintSentTime = now
         lastNavServoAngle = angle
-        sendCommandToEsp32(name, angle)
+        navHintInFlight = true
+
+        val request = Request.Builder().url("$esp32BaseUrl/command?dir=$name&servo=$angle").build()
+        navClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                navHintInFlight = false
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.close()
+                navHintInFlight = false
+            }
+        })
     }
 
     private fun enterNavMode() {
@@ -1610,6 +1670,9 @@ class MainActivity : ComponentActivity() {
         lastNavPoseSwitch = now
         navLastDecision = ObstacleAnalyzer.Decision.CLEAR
         navLastDecisionTime = now
+        lastNavHintName = ""
+        lastNavHintSentTime = 0L
+        navHintInFlight = false
         navServoSettleUntil = now + 500L
         roboEyesView.setMood(RoboEyesView.Mood.ALERT)
         statusText.text = "🧭 NAV mode: camera obstacle avoidance"
@@ -1805,6 +1868,17 @@ class MainActivity : ComponentActivity() {
             setText(String.format(Locale.US, "%.2f", navBlockThreshold))
         }
 
+        val rowTopInput = EditText(this).apply {
+            hint = "Band itaas % (default 30)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(navRowTopPercent.toString())
+        }
+        val rowBottomInput = EditText(this).apply {
+            hint = "Band baba % (default 75)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(navRowBottomPercent.toString())
+        }
+
         val calibrateButton = Button(this).apply {
             text = "🎯  Calibrate danger (harang ~30cm)"
             isAllCaps = false
@@ -1821,6 +1895,13 @@ class MainActivity : ComponentActivity() {
         container.addView(servoBInput)
         container.addView(TextView(this).apply { text = "Danger threshold (mas mababa = mas maaga mag-iwas):"; setPadding(0, 24, 0, 0) })
         container.addView(thresholdInput)
+        container.addView(TextView(this).apply { text = "Band na sinusuri (% ng taas ng larawan, 0 = itaas): itaas at baba"; setPadding(0, 24, 0, 0) })
+        container.addView(rowTopInput)
+        container.addView(rowBottomInput)
+        container.addView(TextView(this).apply {
+            text = "Kung hindi makatingin pababa ang camera at kisame/pader ang nakikita, ibaba ang band (hal. 45 at 90)."
+            textSize = 11f
+        })
         container.addView(calibrateButton)
         container.addView(TextView(this).apply {
             text = "Tip: sa Test mode, tignan ang L / C / R sa taas. Ilagay ang robot ~30cm sa harap ng harang - " +
@@ -1848,6 +1929,12 @@ class MainActivity : ComponentActivity() {
                 servoAInput.text.toString().toIntOrNull()?.let { navServoA = it }
                 servoBInput.text.toString().toIntOrNull()?.let { navServoB = it }
                 thresholdInput.text.toString().toFloatOrNull()?.let { navBlockThreshold = it }
+                val newTop = rowTopInput.text.toString().toIntOrNull()
+                val newBottom = rowBottomInput.text.toString().toIntOrNull()
+                if (newTop != null && newBottom != null && newBottom - newTop >= 15) {
+                    navRowTopPercent = newTop
+                    navRowBottomPercent = newBottom
+                }
 
                 if (testSwitch.isChecked) startNavTest() else stopNavTest()
                 if (!navEnabled && navActive) exitNavMode("naka-OFF ang Camera Nav")
