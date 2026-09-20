@@ -32,7 +32,9 @@ class ObstacleAnalyzer(modelFile: File) : AutoCloseable {
 
     data class Config(
         val blockThreshold: Float = 0.75f,
-        val clearMargin: Float = 0.10f
+        val clearMargin: Float = 0.10f,
+        val rowTop: Float = 0.30f,      // simula ng banda (fraction ng taas ng larawan)
+        val rowBottom: Float = 0.75f    // dulo ng banda - ibaba ang dalawa kapag hindi makatingin pababa ang camera
     )
 
     data class Result(
@@ -47,8 +49,6 @@ class ObstacleAnalyzer(modelFile: File) : AutoCloseable {
         const val SIZE = 256
         private const val GRID = 64
         private const val CELL = SIZE / GRID          // 4
-        private const val ROW_TOP = 0.30f             // simula ng banda (fraction ng taas)
-        private const val ROW_BOTTOM = 0.75f          // dulo ng banda
         private const val LEFT_CUT = 0.35f            // hangganan ng kaliwang zone
         private const val RIGHT_CUT = 0.65f           // hangganan ng kanang zone
         private const val TOP_FRACTION = 0.30f        // pinakamalapit na % ng cells sa zone na iaaverage
@@ -151,8 +151,8 @@ class ObstacleAnalyzer(modelFile: File) : AutoCloseable {
         // --- 5. Zone scores ---
         val fresh = FloatArray(3)
         if (!flat) {
-            val y0 = (ROW_TOP * GRID).toInt()
-            val y1 = (ROW_BOTTOM * GRID).toInt()
+            val y0 = (cfg.rowTop * GRID).toInt().coerceIn(0, GRID - 6)
+            val y1 = (cfg.rowBottom * GRID).toInt().coerceIn(y0 + 6, GRID)
             val cuts = intArrayOf(0, (LEFT_CUT * GRID).toInt(), (RIGHT_CUT * GRID).toInt(), GRID)
             for (z in 0..2) {
                 var n = 0
