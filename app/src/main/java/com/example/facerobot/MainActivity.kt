@@ -3,7 +3,9 @@ package com.example.facerobot
 import android.Manifest
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -41,6 +43,7 @@ import com.example.facerobot.ui.RoboEyesView
 import com.example.facerobot.vision.FaceEmbedder
 import com.example.facerobot.vision.FaceStore
 import com.example.facerobot.vision.ImageUtils
+import com.example.facerobot.vision.ObstacleAnalyzer
 import com.example.facerobot.vision.YoloPersonDetector
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
@@ -70,6 +73,11 @@ import java.util.zip.ZipInputStream
  *
  * NOTE: Wake-word gating has been removed. Lahat na ngayon ng narinig ni Vosk
  * (na pumasa sa mic confidence threshold) ay direktang ipoproseso bilang command.
+ *
+ * CAMERA NAV (bago): kapag naka-STATE_MOVING (AUTO) ang ESP32 robot, ang camera ng app ay nagiging
+ * obstacle sensor gamit ang MiDaS depth model (tignan ang vision/ObstacleAnalyzer.kt). Nagpapadala ang app ng
+ * NAV_LEFT / NAV_RIGHT / NAV_BACK / NAV_CLEAR hints (+ servo tilt) sa ESP32. Ang ESP32 pa rin ang may huling
+ * desisyon; ultrasonic/IR avoidance ang laging mauuna.
  */
 @androidx.camera.core.ExperimentalGetImage
 class MainActivity : ComponentActivity() {
@@ -140,10 +148,10 @@ class MainActivity : ComponentActivity() {
     private var tooFarFaceWidthRatio: Float
         get() = prefs.getFloat("too_far_face_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("too_far_face_ratio", value).apply() }
-        
+
     private var unknownGreetingTracksRaw: String
-    get() = prefs.getString("unknown_greeting_tracks", "") ?: ""
-    set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
+        get() = prefs.getString("unknown_greeting_tracks", "") ?: ""
+        set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
     private var lastPersonSeenTime = 0L
     private var faceTooClose = false
@@ -188,6 +196,73 @@ class MainActivity : ComponentActivity() {
 
     private val dfPlayerPlayRegex = Regex("dfplayer\\s*play\\s*(\\d+)", RegexOption.IGNORE_CASE)
 
+    // ---------- CAMERA NAV (depth-based obstacle avoidance habang MOVING ang ESP32) ----------
+
+    private var obstacleAnalyzer: ObstacleAnalyzer? = null
+    private var depthModelBusy = false
+    private val depthModelFileName = "midas_small.tflite"
+    private val depthModelUrl = "https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite"
+    private val depthModelMinBytes = 50_000_000L
+
+    @Volatile private var navActive = false          // naka-nav mode ba ngayon (MOVING ang ESP32)
+    @Volatile private var navTestMode = false        // live scores lang, walang utos sa robot
+    private var navTestUntil = 0L
+    @Volatile private var navCalibrating = false
+    private var navCalibEndTime = 0L
+    private val navCalibSamples = mutableListOf<Float>()
+
+    private var lastNavAnalysisTime = 0L
+    private val navAnalysisIntervalMs = 180L         // pinakamabilis na pag-analyze ng frame
+    private val navSendIntervalMs = 250L             // gaano kadalas ipadala ang hint sa ESP32
+    private var navServoSettleUntil = 0L             // hintayin munang tumigil ang servo bago mag-analyze
+    @Volatile private var navPose = 0                // 0 = tilt A, 1 = tilt B
+    private var lastNavPoseSwitch = 0L
+    private val navPoseSwitchMs = 1400L
+    private var navNonMovingPolls = 0
+    private var pingFailCount = 0
+    private var lastNavServoAngle = 0
+
+    private var navLastDecision = ObstacleAnalyzer.Decision.CLEAR
+    private var navLastDecisionTime = 0L
+
+    private val navHandler = Handler(android.os.Looper.getMainLooper())
+    private val navSendRunnable = object : Runnable {
+        override fun run() {
+            if (!navActive) return
+            if (!navTestMode) {
+                val age = System.currentTimeMillis() - navLastDecisionTime
+                // Kapag luma na ang huling desisyon (natigil ang analysis), huwag ipagpatuloy ang liko - CLEAR na lang
+                val decision = if (age > 1200L) ObstacleAnalyzer.Decision.CLEAR else navLastDecision
+                sendNavHint(decision)
+            }
+            navHandler.postDelayed(this, navSendIntervalMs)
+        }
+    }
+
+    private var navEnabled: Boolean
+        get() = prefs.getBoolean("nav_enabled", true)
+        set(value) { prefs.edit().putBoolean("nav_enabled", value).apply() }
+
+    private var navScanEnabled: Boolean
+        get() = prefs.getBoolean("nav_scan_enabled", true)
+        set(value) { prefs.edit().putBoolean("nav_scan_enabled", value).apply() }
+
+    private var navInvert: Boolean
+        get() = prefs.getBoolean("nav_invert", false)
+        set(value) { prefs.edit().putBoolean("nav_invert", value).apply() }
+
+    private var navServoA: Int
+        get() = prefs.getInt("nav_servo_a", 30)
+        set(value) { prefs.edit().putInt("nav_servo_a", value.coerceIn(0, 110)).apply() }
+
+    private var navServoB: Int
+        get() = prefs.getInt("nav_servo_b", 55)
+        set(value) { prefs.edit().putInt("nav_servo_b", value.coerceIn(0, 110)).apply() }
+
+    private var navBlockThreshold: Float
+        get() = prefs.getFloat("nav_block_threshold", 0.75f)
+        set(value) { prefs.edit().putFloat("nav_block_threshold", value.coerceIn(0.50f, 0.95f)).apply() }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -204,6 +279,7 @@ class MainActivity : ComponentActivity() {
         buildUi()
         showEyesUi()
         startEspHeartbeat()
+        setupDepthModel()
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -249,7 +325,7 @@ class MainActivity : ComponentActivity() {
     private val pingRunnable = object : Runnable {
         override fun run() {
             pingEsp32()
-            pingHandler.postDelayed(this, 3000)
+            pingHandler.postDelayed(this, 1000)
         }
     }
 
@@ -280,10 +356,10 @@ class MainActivity : ComponentActivity() {
         // ipadala na lang agad ang mga sumunod nang walang hintayan.
         dfTracks.drop(1).forEach { sendPlayTrack(it) }
     }
-    
+
     private fun unknownGreetingTrackList(): List<Int> =
-    unknownGreetingTracksRaw.split(",").mapNotNull { it.trim().toIntOrNull() }
-    
+        unknownGreetingTracksRaw.split(",").mapNotNull { it.trim().toIntOrNull() }
+
     private fun runMovementParts(otherParts: List<String>) {
         for (part in otherParts) {
             val partUpper = part.uppercase()
@@ -543,6 +619,17 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showManageCommandsDialog() }
         }
 
+        val navOption = Button(this).apply {
+            text = "🧭  Camera Nav (obstacle avoidance)"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showNavSettingsDialog() }
+        }
+
         val voiceLogOption = Button(this).apply {
             text = "🗒️  Voice Log"
             textSize = 14f
@@ -572,6 +659,8 @@ class MainActivity : ComponentActivity() {
         container.addView(createSpacer())
         container.addView(commandsOption)
         container.addView(createSpacer())
+        container.addView(navOption)
+        container.addView(createSpacer())
         container.addView(voiceLogOption)
 
         val scrollView = ScrollView(this).apply { addView(container) }
@@ -587,8 +676,6 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
-
-        
 
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
@@ -631,30 +718,30 @@ class MainActivity : ComponentActivity() {
         container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
 
         val nameInput = EditText(this).apply {
-    hint = "Eksaktong pangalan (kagaya ng naka-enroll) - IWANAN BLANGKO kung hindi kilala"
-    inputType = InputType.TYPE_CLASS_TEXT
-}
-val trackInput = EditText(this).apply {
-    hint = "Track numbers, comma-separated (hal. 25,26,27)"
-    inputType = InputType.TYPE_CLASS_TEXT
-}
-container.addView(nameInput)
-container.addView(trackInput)
+            hint = "Eksaktong pangalan (kagaya ng naka-enroll) - IWANAN BLANGKO kung hindi kilala"
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        val trackInput = EditText(this).apply {
+            hint = "Track numbers, comma-separated (hal. 25,26,27)"
+            inputType = InputType.TYPE_CLASS_TEXT
+        }
+        container.addView(nameInput)
+        container.addView(trackInput)
 
-container.addView(View(this).apply {
-    setBackgroundColor(0xFFCCCCCC.toInt())
-    layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
-        .apply { topMargin = 32; bottomMargin = 32 }
-})
-container.addView(TextView(this).apply {
-    text = "🎲 Random tracks para sa HINDI kilalang tao (comma-separated):"
-})
-val unknownTracksInput = EditText(this).apply {
-    hint = "hal. 32,33,34,35,36,37"
-    inputType = InputType.TYPE_CLASS_TEXT
-    setText(unknownGreetingTracksRaw)
-}
-container.addView(unknownTracksInput)
+        container.addView(View(this).apply {
+            setBackgroundColor(0xFFCCCCCC.toInt())
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
+                .apply { topMargin = 32; bottomMargin = 32 }
+        })
+        container.addView(TextView(this).apply {
+            text = "🎲 Random tracks para sa HINDI kilalang tao (comma-separated):"
+        })
+        val unknownTracksInput = EditText(this).apply {
+            hint = "hal. 32,33,34,35,36,37"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(unknownGreetingTracksRaw)
+        }
+        container.addView(unknownTracksInput)
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
@@ -662,14 +749,14 @@ container.addView(unknownTracksInput)
             .setTitle("🎙️ Greeting Tracks (per pangalan)")
             .setView(scrollView)
             .setPositiveButton("Idagdag/I-save") { _, _ ->
-    val name = nameInput.text.toString().trim()
-    val tracksCsv = trackInput.text.toString().trim()
-    if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
-        setGreetingTracks(name, tracksCsv)
-    }
-    unknownGreetingTracksRaw = unknownTracksInput.text.toString().trim()
-    statusText.text = "Na-save ang greeting tracks"
-}
+                val name = nameInput.text.toString().trim()
+                val tracksCsv = trackInput.text.toString().trim()
+                if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
+                    setGreetingTracks(name, tracksCsv)
+                }
+                unknownGreetingTracksRaw = unknownTracksInput.text.toString().trim()
+                statusText.text = "Na-save ang greeting tracks"
+            }
             .setNegativeButton("Isara", null)
             .show()
     }
@@ -752,6 +839,14 @@ container.addView(unknownTracksInput)
     }
 
     private fun processFrame(imageProxy: ImageProxy) {
+        // Camera Nav: kapag naka-MOVING ang robot (o nagte-test/nagca-calibrate), ang frames ay napupunta
+        // sa depth analysis at hindi sa face tracking.
+        if (navTestMode && System.currentTimeMillis() > navTestUntil) navTestMode = false
+        if (navActive || navCalibrating || navTestMode) {
+            processNavFrame(imageProxy)
+            return
+        }
+
         when (appState) {
             AppState.EYES -> processEyesFrame(imageProxy)
             AppState.CAMERA -> processCameraFrame(imageProxy)
@@ -826,7 +921,7 @@ container.addView(unknownTracksInput)
 
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
-        
+
 
         val box = face.boundingBox
         val frameWidth = imageProxy.width
@@ -937,18 +1032,18 @@ container.addView(unknownTracksInput)
     }
 
     private fun greetUnknownIfNeeded() {
-    val now = System.currentTimeMillis()
-    if (now - lastUnknownGreetTime < greetingCooldownMs) return
-    lastUnknownGreetTime = now
+        val now = System.currentTimeMillis()
+        if (now - lastUnknownGreetTime < greetingCooldownMs) return
+        lastUnknownGreetTime = now
 
-    val tracks = unknownGreetingTrackList()
-    if (tracks.isNotEmpty()) {
-        sendPlayTrack(tracks.random())
-    } else if (ttsReady) {
-        // Fallback sa TTS kung wala pang na-set na DFPlayer tracks
-        speak(unknownGreetings.random())
+        val tracks = unknownGreetingTrackList()
+        if (tracks.isNotEmpty()) {
+            sendPlayTrack(tracks.random())
+        } else if (ttsReady) {
+            // Fallback sa TTS kung wala pang na-set na DFPlayer tracks
+            speak(unknownGreetings.random())
+        }
     }
-}
 
     private fun greetPetIfNeeded(label: String) {
         val now = System.currentTimeMillis()
@@ -1324,14 +1419,42 @@ container.addView(unknownTracksInput)
         pingHandler.post(pingRunnable)
     }
 
+    /**
+     * Ang ESP32 ay sumasagot na ng "PONG|<STATE>" (hal. "PONG|MOVING"). Ginagamit ito ng app para malaman
+     * kung kailan papasok/lalabas sa Camera Nav mode, kahit galing sa voice module / Bluetooth ang AUTO.
+     * (Ang lumang firmware na "PONG" lang ang sagot ay hindi papasok sa nav mode.)
+     */
     private fun pingEsp32() {
         val request = Request.Builder().url("$esp32BaseUrl/ping").build()
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { onEspPingResult(null) }
+            }
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                response.close()
+                val body = try { response.use { it.body?.string() } } catch (e: Exception) { null }
+                runOnUi { onEspPingResult(body) }
             }
         })
+    }
+
+    private fun onEspPingResult(body: String?) {
+        if (body == null) {
+            pingFailCount++
+            if (navActive && pingFailCount >= 3) exitNavMode("nawala ang link sa robot")
+            return
+        }
+        pingFailCount = 0
+
+        val state = if (body.startsWith("PONG|")) body.substringAfter("|").trim() else ""
+        val inNavState = state == "MOVING" || state.startsWith("AVOIDING")
+
+        if (inNavState) {
+            navNonMovingPolls = 0
+            if (!navActive) enterNavMode()
+        } else if (navActive) {
+            navNonMovingPolls++
+            if (navNonMovingPolls >= 2) exitNavMode("hindi na MOVING ang robot")
+        }
     }
 
     private fun sendTimedCommand(command: String, durationMs: Long) {
@@ -1359,12 +1482,368 @@ container.addView(unknownTracksInput)
         }
         val request = Request.Builder().url(url).build()
 
+        val isAuto = command.equals("AUTO", ignoreCase = true)
+        val isForceStop = command.equals("FORCE_STOP", ignoreCase = true)
+
         httpClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                response.close()
+                if (!isAuto && !isForceStop) {
+                    response.close()
+                    return
+                }
+                // Camera Nav: kapag tinanggap ng ESP32 ang AUTO -> pasok agad sa nav mode;
+                // kapag FORCE_STOP -> labas agad (hindi na hihintayin ang susunod na ping)
+                val body = try { response.use { it.body?.string() } } catch (e: Exception) { null }
+                if (body != null && body.startsWith("OK")) {
+                    runOnUi {
+                        if (isAuto) enterNavMode() else exitNavMode("FORCE_STOP")
+                    }
+                }
             }
         })
+    }
+
+    // ---------- CAMERA NAV: pag-analyze ng frames at pagpapadala ng hints ----------
+
+    private fun rotateBitmap(src: Bitmap, degrees: Int): Bitmap {
+        if (degrees % 360 == 0) return src
+        val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
+        return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+    }
+
+    private fun processNavFrame(imageProxy: ImageProxy) {
+        val analyzer = obstacleAnalyzer
+        val now = System.currentTimeMillis()
+        if (analyzer == null || now - lastNavAnalysisTime < navAnalysisIntervalMs || now < navServoSettleUntil) {
+            imageProxy.close()
+            return
+        }
+        lastNavAnalysisTime = now
+
+        try {
+            val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            // Sa test/calibrate, laging tilt A lang ang gamit. Sa totoong nav, sumusunod sa kasalukuyang servo pose.
+            val pose = if (navScanEnabled && navActive && !navCalibrating && !navTestMode) navPose else 0
+            val cfg = ObstacleAnalyzer.Config(blockThreshold = navBlockThreshold)
+            val result = analyzer.analyze(upright, pose, cfg, now)
+            if (result != null) runOnUi { onNavResult(result) }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            runOnUi { statusText.text = "NAV error: ${e.javaClass.simpleName}: ${e.message}" }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun onNavResult(r: ObstacleAnalyzer.Result) {
+        val now = System.currentTimeMillis()
+
+        val label = when (r.decision) {
+            ObstacleAnalyzer.Decision.CLEAR -> "TULOY"
+            ObstacleAnalyzer.Decision.LEFT -> "LIKO KALIWA"
+            ObstacleAnalyzer.Decision.RIGHT -> "LIKO KANAN"
+            ObstacleAnalyzer.Decision.BACK -> "ATRAS"
+        }
+        val prefix = when {
+            navCalibrating -> "🎯 CALIBRATE"
+            navTestMode -> "🧪 TEST"
+            else -> "🧭 NAV"
+        }
+        statusText.text = String.format(
+            Locale.US, "%s  L%.2f  C%.2f  R%.2f  (T%.2f) → %s%s",
+            prefix, r.left, r.center, r.right, navBlockThreshold, label, if (r.flat) "  [flat]" else ""
+        )
+
+        if (navCalibrating) {
+            navCalibSamples.add(r.center)
+            if (now >= navCalibEndTime) finishNavCalibration()
+            return
+        }
+
+        if (navActive && !navTestMode) {
+            navLastDecision = r.decision
+            navLastDecisionTime = now
+
+            // Servo scan: palitan ang tilt A <-> B; hintayin munang tumigil ang servo bago mag-analyze ulit
+            if (navScanEnabled && now - lastNavPoseSwitch > navPoseSwitchMs) {
+                navPose = 1 - navPose
+                lastNavPoseSwitch = now
+                navServoSettleUntil = now + 500L
+            }
+        }
+    }
+
+    private fun sendNavHint(decision: ObstacleAnalyzer.Decision) {
+        val name = when (decision) {
+            ObstacleAnalyzer.Decision.CLEAR -> "NAV_CLEAR"
+            ObstacleAnalyzer.Decision.BACK -> "NAV_BACK"
+            ObstacleAnalyzer.Decision.LEFT -> if (navInvert) "NAV_RIGHT" else "NAV_LEFT"
+            ObstacleAnalyzer.Decision.RIGHT -> if (navInvert) "NAV_LEFT" else "NAV_RIGHT"
+        }
+        val angle = if (navScanEnabled && navPose == 1) navServoB else navServoA
+        lastNavServoAngle = angle
+        sendCommandToEsp32(name, angle)
+    }
+
+    private fun enterNavMode() {
+        if (navActive || !navEnabled) return
+        val analyzer = obstacleAnalyzer ?: return
+        val now = System.currentTimeMillis()
+
+        analyzer.reset()
+        navActive = true
+        navNonMovingPolls = 0
+        navPose = 0
+        lastNavPoseSwitch = now
+        navLastDecision = ObstacleAnalyzer.Decision.CLEAR
+        navLastDecisionTime = now
+        navServoSettleUntil = now + 500L
+        roboEyesView.setMood(RoboEyesView.Mood.ALERT)
+        statusText.text = "🧭 NAV mode: camera obstacle avoidance"
+
+        navHandler.removeCallbacksAndMessages(null)
+        navHandler.post(navSendRunnable)
+    }
+
+    private fun exitNavMode(reason: String) {
+        if (!navActive) return
+        navActive = false
+        navHandler.removeCallbacksAndMessages(null)
+        smoothedServoAngle = lastNavServoAngle.toFloat()
+        showEyesUi()
+        statusText.text = "🧭 NAV off ($reason)"
+    }
+
+    private fun startNavTest() {
+        if (obstacleAnalyzer == null) {
+            statusText.text = "❌ Wala pang depth model (hintayin ang download/load)"
+            return
+        }
+        obstacleAnalyzer?.reset()
+        navTestUntil = System.currentTimeMillis() + 180_000L
+        navTestMode = true
+        sendCommandToEsp32("STOP", navServoA) // itakda ang tilt ng camera (gumagana kapag BOOT_WAIT)
+        statusText.text = "🧪 Nav TEST (3 min): tignan ang L/C/R, walang utos sa robot"
+    }
+
+    private fun stopNavTest() {
+        if (!navTestMode) return
+        navTestMode = false
+        if (!navActive) showEyesUi()
+    }
+
+    private fun startNavCalibration() {
+        if (obstacleAnalyzer == null) {
+            statusText.text = "❌ Wala pang depth model (hintayin ang download/load)"
+            return
+        }
+        navTestMode = false
+        statusText.text = "🎯 Calibrate: ilagay ang robot ~30cm sa harap ng harang. Magsisimula sa 4 segundo..."
+        sendCommandToEsp32("STOP", navServoA) // itakda ang tilt ng camera (gumagana kapag BOOT_WAIT)
+        rootLayout.postDelayed({
+            obstacleAnalyzer?.reset()
+            navCalibSamples.clear()
+            navCalibEndTime = System.currentTimeMillis() + 2500L
+            navCalibrating = true
+        }, 4000L)
+    }
+
+    private fun finishNavCalibration() {
+        navCalibrating = false
+        if (navCalibSamples.size < 3) {
+            statusText.text = "❌ Calibrate: kulang ang samples, subukan ulit"
+            return
+        }
+        val avg = navCalibSamples.average().toFloat()
+        navBlockThreshold = (avg * 0.92f).coerceIn(0.50f, 0.95f)
+        obstacleAnalyzer?.reset()
+        showEyesUi()
+        statusText.text = String.format(
+            Locale.US, "🎯 Na-calibrate: danger threshold = %.2f (center avg %.2f)", navBlockThreshold, avg
+        )
+    }
+
+    // ---------- CAMERA NAV: depth model (MiDaS small) - auto-download isang beses ----------
+
+    private fun setupDepthModel() {
+        if (depthModelBusy || obstacleAnalyzer != null) return
+        depthModelBusy = true
+        Thread {
+            try {
+                val modelFile = File(filesDir, depthModelFileName)
+                if (!modelFile.exists() || modelFile.length() < depthModelMinBytes) {
+                    // 1) kung nilagay mo sa assets/midas_small.tflite, iyon ang gagamitin
+                    // 2) kung wala, i-download mula sa GitHub (~66MB, isang beses lang)
+                    if (!tryCopyDepthModelFromAssets(modelFile)) {
+                        downloadDepthModel(modelFile)
+                    }
+                }
+                obstacleAnalyzer = ObstacleAnalyzer(modelFile)
+                runOnUi { statusText.text = "🧭 Depth model handa (camera obstacle avoidance)" }
+            } catch (e: Throwable) {
+                e.printStackTrace()
+                runOnUi { statusText.text = "❌ Depth model: ${e.javaClass.simpleName}: ${e.message}" }
+            } finally {
+                depthModelBusy = false
+            }
+        }.start()
+    }
+
+    private fun tryCopyDepthModelFromAssets(target: File): Boolean {
+        return try {
+            assets.open(depthModelFileName).use { input ->
+                FileOutputStream(target).use { output -> input.copyTo(output) }
+            }
+            target.length() >= depthModelMinBytes
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun downloadDepthModel(target: File) {
+        runOnUi { statusText.text = "⬇️ Dina-download ang depth model (~66MB, isang beses lang)..." }
+
+        val partFile = File(filesDir, "$depthModelFileName.part")
+        val request = Request.Builder().url(depthModelUrl).build()
+        httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
+            val body = response.body ?: throw java.io.IOException("Walang response body")
+
+            val totalBytes = body.contentLength()
+            var downloadedBytes = 0L
+            var lastUpdate = 0L
+
+            body.byteStream().use { input ->
+                FileOutputStream(partFile).use { output ->
+                    val buffer = ByteArray(16384)
+                    var bytesRead: Int
+                    while (input.read(buffer).also { bytesRead = it } != -1) {
+                        output.write(buffer, 0, bytesRead)
+                        downloadedBytes += bytesRead
+                        val now = System.currentTimeMillis()
+                        if (totalBytes > 0 && now - lastUpdate > 500) {
+                            lastUpdate = now
+                            val percent = (downloadedBytes * 100 / totalBytes).toInt()
+                            runOnUi { statusText.text = "⬇️ Dina-download ang depth model... $percent%" }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (partFile.length() < depthModelMinBytes) {
+            partFile.delete()
+            throw java.io.IOException("Kulang ang na-download na model file")
+        }
+        target.delete()
+        if (!partFile.renameTo(target)) throw java.io.IOException("Hindi ma-save ang depth model")
+    }
+
+    private fun showNavSettingsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+
+        val modelStatus = TextView(this).apply {
+            text = if (obstacleAnalyzer != null) {
+                "✅ Depth model: handa"
+            } else {
+                "⏳ Depth model: hindi pa handa (dina-download / nilo-load...)"
+            }
+            textSize = 12f
+            setPadding(0, 0, 0, 16)
+        }
+
+        val enabledSwitch = Switch(this).apply {
+            text = "🧭  Gamitin ang camera bilang obstacle sensor (habang AUTO)"
+            isChecked = navEnabled
+            setPadding(0, 16, 0, 16)
+        }
+        val scanSwitch = Switch(this).apply {
+            text = "↕️  Servo scan (palitan ang tilt A ↔ B)"
+            isChecked = navScanEnabled
+            setPadding(0, 16, 0, 16)
+        }
+        val invertSwitch = Switch(this).apply {
+            text = "↔️  I-invert ang kaliwa/kanan (kung mali ang liko)"
+            isChecked = navInvert
+            setPadding(0, 16, 0, 16)
+        }
+        val testSwitch = Switch(this).apply {
+            text = "🧪  Test mode (live scores, WALANG utos sa robot, 3 min)"
+            isChecked = navTestMode
+            setPadding(0, 16, 0, 16)
+        }
+
+        val servoAInput = EditText(this).apply {
+            hint = "Servo tilt A (0-110), default 30"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(navServoA.toString())
+        }
+        val servoBInput = EditText(this).apply {
+            hint = "Servo tilt B (0-110), default 55"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(navServoB.toString())
+        }
+        val thresholdInput = EditText(this).apply {
+            hint = "Danger threshold (0.50-0.95), default 0.75"
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(String.format(Locale.US, "%.2f", navBlockThreshold))
+        }
+
+        val calibrateButton = Button(this).apply {
+            text = "🎯  Calibrate danger (harang ~30cm)"
+            isAllCaps = false
+        }
+
+        container.addView(modelStatus)
+        container.addView(enabledSwitch)
+        container.addView(scanSwitch)
+        container.addView(invertSwitch)
+        container.addView(testSwitch)
+        container.addView(TextView(this).apply { text = "Tilt A (nakatingin pababa / malapit na sahig):"; setPadding(0, 24, 0, 0) })
+        container.addView(servoAInput)
+        container.addView(TextView(this).apply { text = "Tilt B (mas nakatingin sa unahan / malayo):"; setPadding(0, 24, 0, 0) })
+        container.addView(servoBInput)
+        container.addView(TextView(this).apply { text = "Danger threshold (mas mababa = mas maaga mag-iwas):"; setPadding(0, 24, 0, 0) })
+        container.addView(thresholdInput)
+        container.addView(calibrateButton)
+        container.addView(TextView(this).apply {
+            text = "Tip: sa Test mode, tignan ang L / C / R sa taas. Ilagay ang robot ~30cm sa harap ng harang - " +
+                "dapat lumampas sa threshold ang C. Sa bukas na daan, dapat mas mababa ang C. " +
+                "Kung baligtad ang liko ng robot, i-ON ang Invert. Ang score ay RELATIVE, kaya i-Calibrate kapag nagpalit ng sahig/ilaw."
+            textSize = 11f
+            setPadding(0, 16, 0, 0)
+        })
+
+        val scrollView = ScrollView(this).apply { addView(container) }
+
+        var dialogRef: android.app.AlertDialog? = null
+        calibrateButton.setOnClickListener {
+            dialogRef?.dismiss()
+            startNavCalibration()
+        }
+
+        dialogRef = android.app.AlertDialog.Builder(this)
+            .setTitle("🧭 Camera Nav (obstacle avoidance)")
+            .setView(scrollView)
+            .setPositiveButton("I-save") { _, _ ->
+                navEnabled = enabledSwitch.isChecked
+                navScanEnabled = scanSwitch.isChecked
+                navInvert = invertSwitch.isChecked
+                servoAInput.text.toString().toIntOrNull()?.let { navServoA = it }
+                servoBInput.text.toString().toIntOrNull()?.let { navServoB = it }
+                thresholdInput.text.toString().toFloatOrNull()?.let { navBlockThreshold = it }
+
+                if (testSwitch.isChecked) startNavTest() else stopNavTest()
+                if (!navEnabled && navActive) exitNavMode("naka-OFF ang Camera Nav")
+                if (!testSwitch.isChecked) statusText.text = "Na-save ang Camera Nav settings"
+            }
+            .setNegativeButton("Isara", null)
+            .show()
     }
 
     // ---------- Enroll UI ----------
@@ -1666,10 +2145,12 @@ container.addView(unknownTracksInput)
     override fun onDestroy() {
         super.onDestroy()
         pingHandler.removeCallbacksAndMessages(null)
+        navHandler.removeCallbacksAndMessages(null)
         cameraExecutor.shutdown()
         faceDetector.close()
         yoloDetector.close()
         faceEmbedder.close()
+        obstacleAnalyzer?.close()
         tts?.stop()
         tts?.shutdown()
         speechService?.stop()
