@@ -1450,7 +1450,18 @@ class MainActivity : ComponentActivity() {
 
         if (inNavState) {
             navNonMovingPolls = 0
-            if (!navActive) enterNavMode()
+            if (!navActive && navEnabled) {
+                if (obstacleAnalyzer != null) {
+                    enterNavMode()
+                } else {
+                    // MOVING na ang robot pero wala pang depth model - ipaalam para hindi mukhang "walang nangyayari"
+                    statusText.text = if (depthModelBusy) {
+                        "⏳ Camera Nav: hinihintay ang depth model..."
+                    } else {
+                        "⚠️ Camera Nav: walang depth model (tignan ang error sa taas / i-restart ang app)"
+                    }
+                }
+            }
         } else if (navActive) {
             navNonMovingPolls++
             if (navNonMovingPolls >= 2) exitNavMode("hindi na MOVING ang robot")
