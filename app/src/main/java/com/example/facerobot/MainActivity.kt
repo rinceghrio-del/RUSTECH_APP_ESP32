@@ -173,6 +173,30 @@ class MainActivity : ComponentActivity() {
 
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    // Google TTS ang preferred engine para sa Filipino (fil-PH) voice; kapag wala, default engine ng phone.
+    private val preferredTtsEngine = "com.google.android.tts"
+    private val ttsHandler = Handler(android.os.Looper.getMainLooper())
+    private val resumeMicRunnable = Runnable {
+        isSpeaking = false
+        speechService?.setPause(false)
+    }
+
+    // ---------- GEMINI (utak ni RUSTECH) ----------
+    private val geminiBrain by lazy { GeminiBrain(httpClient) }
+    private var geminiEnabled: Boolean
+        get() = prefs.getBoolean("gemini_enabled", true)
+        set(value) { prefs.edit().putBoolean("gemini_enabled", value).apply() }
+    private var geminiApiKey: String
+        get() = prefs.getString("gemini_api_key", "") ?: ""
+        set(value) { prefs.edit().putString("gemini_api_key", value.trim()).apply() }
+    private var geminiModel: String
+        get() = prefs.getString("gemini_model", GeminiBrain.DEFAULT_MODEL) ?: GeminiBrain.DEFAULT_MODEL
+        set(value) { prefs.edit().putString("gemini_model", value.trim().ifEmpty { GeminiBrain.DEFAULT_MODEL }).apply() }
+    @Volatile private var geminiBusy = false
+    private var lastGeminiRequestTime = 0L
+    private val geminiMinIntervalMs = 1500L      // iwas-spam sa free-tier quota (ingay/TV)
+    private var geminiCooldownUntil = 0L         // pag na-429, pahinga muna
+    private var lastGeminiErrorSpeakTime = 0L
     private var lastGreetedName: String? = null
     private var lastGreetedTime = 0L
     private val greetingCooldownMs = 60_000L
@@ -310,28 +334,7 @@ class MainActivity : ComponentActivity() {
         startEspHeartbeat()
         setupDepthModel()
 
-        tts = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                val engine = tts ?: return@TextToSpeech
-                val result = engine.setLanguage(Locale("fil", "PH"))
-                if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                    engine.setLanguage(Locale.US)
-                }
-                engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {}
-                    override fun onDone(utteranceId: String?) {
-                        isSpeaking = false
-                        runOnUi { speechService?.setPause(false) }
-                    }
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(utteranceId: String?) {
-                        isSpeaking = false
-                        runOnUi { speechService?.setPause(false) }
-                    }
-                })
-                ttsReady = true
-            }
-        }
+        initTts(preferredTtsEngine)
 
         val missingPermissions = mutableListOf<String>()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
@@ -670,10 +673,23 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showVoiceLogDialog() }
         }
 
+        val geminiOption = Button(this).apply {
+            text = "🧠  Gemini AI (utak ni RUSTECH)"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFF04342C.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(accentColor, accentPressed, 24f)
+            setOnClickListener { showGeminiSettingsDialog() }
+        }
+
         fun createSpacer() = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
 
+        container.addView(geminiOption)
+        container.addView(createSpacer())
         container.addView(displayToggle)
         container.addView(createSpacer())
         container.addView(ipOption)
@@ -1255,8 +1271,135 @@ class MainActivity : ComponentActivity() {
 
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
-        val resultLabel = processVoiceCommand(candidates)
-        addVoiceLogEntry(heardText, resultLabel)
+
+        val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
+            System.currentTimeMillis() >= geminiCooldownUntil
+
+        // Walang Gemini (naka-off, walang key, o cooldown): dating lokal na behavior.
+        if (!useGemini) {
+            val reason = when {
+                !geminiEnabled -> ""
+                geminiApiKey.isBlank() -> " (walang Gemini API key)"
+                else -> " (Gemini cooldown)"
+            }
+            addVoiceLogEntry(heardText, processVoiceCommand(candidates) + reason)
+            return
+        }
+
+        // 1) KALIGTASAN: STOP ay laging lokal at agad - hindi na dumadaan sa internet.
+        if (candidates.any { it.contains("hinto") || it.contains("stop") || it.contains("tigil") }) {
+            speak("Hihinto na po!")
+            sendCommandToEsp32("FORCE_STOP")
+            addVoiceLogEntry(heardText, "FORCE_STOP")
+            return
+        }
+
+        // 2) Maiikling eksaktong utos (hal. "sayaw", "abante") - lokal at instant, gaya ng dati.
+        val exact = findExactCustomCommand(candidates)
+        if (exact != null) {
+            speak(exact.randomReply())
+            if (exact.action.isNotBlank()) executeEsp32Actions(exact.action)
+            addVoiceLogEntry(heardText, "custom: \"${exact.trigger}\"")
+            return
+        }
+
+        // 3) Lahat ng iba - kay RUSTECH (Gemini) na.
+        if (geminiBusy) {
+            addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si RUSTECH)")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastGeminiRequestTime < geminiMinIntervalMs) {
+            addVoiceLogEntry(heardText, "na-ignore (masyadong mabilis)")
+            return
+        }
+        askGemini(candidates)
+    }
+
+    /** Custom command na halos eksakto ang sinabi (hindi kasama sa mahabang usapan). */
+    private fun findExactCustomCommand(candidates: List<String>): CommandStore.VoiceCommand? {
+        for (text in candidates) {
+            val cmd = commandStore.findMatch(text) ?: continue
+            val words = text.trim().split(Regex("\\s+")).size
+            val triggerWords = cmd.triggerVariants()
+                .filter { text.contains(it) }
+                .maxOfOrNull { it.trim().split(Regex("\\s+")).size } ?: continue
+            if (words <= triggerWords + 1) return cmd
+        }
+        return null
+    }
+
+    private fun askGemini(candidates: List<String>) {
+        val heardText = candidates.first()
+        geminiBusy = true
+        lastGeminiRequestTime = System.currentTimeMillis()
+        statusText.text = "🧠 Nag-iisip... ($heardText)"
+
+        geminiBrain.ask(
+            apiKey = geminiApiKey,
+            model = geminiModel,
+            heard = candidates.take(3),
+            situation = GeminiBrain.Situation(currentRecognizedName, commandStore.all())
+        ) { result ->
+            runOnUi {
+                geminiBusy = false
+                when (result) {
+                    is GeminiBrain.Result.Ok -> onGeminiReply(heardText, result.reply)
+                    is GeminiBrain.Result.Fail -> onGeminiFail(candidates, result)
+                }
+            }
+        }
+    }
+
+    private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply) {
+        val text = reply.text.trim()
+        val action = reply.action.uppercase()
+
+        if (text.isEmpty() && action == "NONE") {
+            statusText.text = "[MIC] (hindi para sa akin) $heardText"
+            addVoiceLogEntry(heardText, "gemini: hindi pinansin")
+            return
+        }
+
+        statusText.text = "🤖 RUSTECH: $text"
+        if (text.isNotEmpty()) speak(text)
+
+        val espAction = when (action) {
+            "NONE" -> null
+            "STOP" -> "FORCE_STOP"
+            else -> if (action in GeminiBrain.ALLOWED_ACTIONS) action else null
+        }
+        if (espAction != null) executeEsp32Actions(espAction)
+
+        addVoiceLogEntry(heardText, "gemini → \"${text.take(70)}\" [$action]")
+    }
+
+    private fun onGeminiFail(candidates: List<String>, fail: GeminiBrain.Result.Fail) {
+        val heardText = candidates.first()
+        if (fail.kind == GeminiBrain.FailKind.RATE_LIMIT) {
+            geminiCooldownUntil = System.currentTimeMillis() + 20_000L
+        }
+
+        // Fallback: subukan ang dating lokal na pagtutugma para gumana pa rin ang mga utos.
+        val local = processVoiceCommand(candidates)
+        val label = "gemini FAILED [${fail.kind}] ${fail.detail}"
+        addVoiceLogEntry(heardText, if (local == "walang tumugma") label else "$label → lokal: $local")
+
+        if (local == "walang tumugma") {
+            val now = System.currentTimeMillis()
+            if (now - lastGeminiErrorSpeakTime > 15_000L) {
+                lastGeminiErrorSpeakTime = now
+                speak(
+                    when (fail.kind) {
+                        GeminiBrain.FailKind.RATE_LIMIT -> "Sandali lang, napagod ang utak ko. Mamaya ulit tayo mag-usap."
+                        GeminiBrain.FailKind.NETWORK -> "Wala akong signal ngayon, hindi ako makapag-isip nang malalim."
+                        GeminiBrain.FailKind.BAD_KEY -> "Mukhang may mali sa API key ko. Pakitingnan sa menu."
+                        GeminiBrain.FailKind.BLOCKED -> "Hmm, hindi ko masagot yan. Iba na lang."
+                        else -> "May gumulo sa utak ko. Ulitin mo nga."
+                    }
+                )
+            }
+        }
     }
 
     private fun processVoiceCommand(candidates: List<String>): String {
@@ -1353,11 +1496,108 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    // ---------- TTS (Filipino voice gamit ang Android TextToSpeech / Google TTS) ----------
+
+    private fun initTts(enginePackage: String?) {
+        tts = if (enginePackage != null) {
+            TextToSpeech(this, { status -> onTtsInit(status, enginePackage) }, enginePackage)
+        } else {
+            TextToSpeech(this) { status -> onTtsInit(status, null) }
+        }
+    }
+
+    private fun onTtsInit(status: Int, enginePackage: String?) {
+        if (status != TextToSpeech.SUCCESS) {
+            // Walang Google TTS sa phone - gamitin ang default engine.
+            if (enginePackage != null) {
+                tts?.shutdown()
+                initTts(null)
+            }
+            return
+        }
+        val engine = tts ?: return
+
+        fun isOk(r: Int) = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+        var filipinoOk = true
+        if (!isOk(engine.setLanguage(Locale("fil", "PH")))) {
+            if (!isOk(engine.setLanguage(Locale("tl", "PH")))) {
+                engine.setLanguage(Locale.US)
+                filipinoOk = false
+            }
+        }
+        engine.setSpeechRate(1.0f)
+        engine.setPitch(1.0f)
+
+        engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                // Huling piraso lang ng sagot ang nag-a-unpause ng mic.
+                if (utteranceId?.endsWith("_last") == true) scheduleMicResume()
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                scheduleMicResume()
+            }
+        })
+        ttsReady = true
+
+        if (!filipinoOk) {
+            runOnUi {
+                statusText.text = "⚠️ Walang Filipino voice ang TTS. I-install ang Filipino sa Settings > Text-to-speech (Google)."
+            }
+        }
+    }
+
+    // Kaunting pagitan bago ibalik ang mic para hindi marinig ng robot ang dulo ng sarili niyang boses.
+    private fun scheduleMicResume() {
+        runOnUi {
+            ttsHandler.removeCallbacks(resumeMicRunnable)
+            ttsHandler.postDelayed(resumeMicRunnable, 300L)
+        }
+    }
+
+    private fun cleanForSpeech(raw: String): String {
+        return raw
+            .replace(Regex("[\\x{1F000}-\\x{1FFFF}\\x{2600}-\\x{27BF}\\x{FE0F}]"), "")
+            .replace(Regex("[*_#`~]"), "")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+    }
+
+    // Hinahati sa maiikling piraso (bawat pangungusap) para mabilis magsimulang magsalita at natural ang pahinga.
+    private fun splitForSpeech(text: String): List<String> {
+        val sentences = text.split(Regex("(?<=[.!?…])\\s+")).map { it.trim() }.filter { it.isNotEmpty() }
+        val out = ArrayList<String>()
+        val sb = StringBuilder()
+        for (sentence in sentences) {
+            if (sb.isNotEmpty() && sb.length + sentence.length > 180) {
+                out.add(sb.toString())
+                sb.clear()
+            }
+            if (sb.isNotEmpty()) sb.append(' ')
+            sb.append(sentence)
+        }
+        if (sb.isNotEmpty()) out.add(sb.toString())
+        return out.flatMap { if (it.length > 3500) it.chunked(3500) else listOf(it) }
+    }
+
     private fun speak(phrase: String) {
         if (!ttsReady) return
+        val clean = cleanForSpeech(phrase)
+        if (clean.isEmpty()) return
+        val chunks = splitForSpeech(clean)
+        if (chunks.isEmpty()) return
+
+        ttsHandler.removeCallbacks(resumeMicRunnable)
         isSpeaking = true
         speechService?.setPause(true)
-        tts?.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "utt_${System.currentTimeMillis()}")
+
+        val base = "utt_${System.currentTimeMillis()}"
+        chunks.forEachIndexed { i, chunk ->
+            val id = if (i == chunks.lastIndex) "${base}_last" else "${base}_$i"
+            val mode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            tts?.speak(chunk, mode, null, id)
+        }
     }
 
     private fun handleNoFace() {
@@ -1946,6 +2186,66 @@ class MainActivity : ComponentActivity() {
 
     // ---------- Enroll UI ----------
 
+    private fun showGeminiSettingsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+
+        val enabledSwitch = Switch(this).apply {
+            text = "Gamitin si Gemini (matalinong usapan)"
+            isChecked = geminiEnabled
+            setPadding(0, 8, 0, 24)
+        }
+        val keyLabel = TextView(this).apply { text = "API key (kunin sa aistudio.google.com):" }
+        val keyInput = EditText(this).apply {
+            hint = "AIza..."
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(geminiApiKey)
+            setSingleLine(true)
+        }
+        val modelLabel = TextView(this).apply {
+            text = "Model:"
+            setPadding(0, 24, 0, 0)
+        }
+        val modelInput = EditText(this).apply {
+            hint = GeminiBrain.DEFAULT_MODEL
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(geminiModel)
+            setSingleLine(true)
+        }
+        val note = TextView(this).apply {
+            text = "Ang STOP ay laging lokal at agad. Kapag walang internet o naubos ang free quota, babalik sa dating lokal na mga utos."
+            textSize = 12f
+            setPadding(0, 24, 0, 0)
+        }
+
+        container.addView(enabledSwitch)
+        container.addView(keyLabel)
+        container.addView(keyInput)
+        container.addView(modelLabel)
+        container.addView(modelInput)
+        container.addView(note)
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("🧠 Gemini AI")
+            .setView(ScrollView(this).apply { addView(container) })
+            .setPositiveButton("Save") { _, _ ->
+                geminiEnabled = enabledSwitch.isChecked
+                geminiApiKey = keyInput.text.toString()
+                geminiModel = modelInput.text.toString()
+                geminiCooldownUntil = 0L
+                statusText.text = if (geminiEnabled && geminiApiKey.isNotBlank())
+                    "🧠 Gemini naka-on (${geminiModel})" else "🧠 Gemini naka-off"
+            }
+            .setNeutralButton("I-reset ang usapan") { _, _ ->
+                geminiBrain.resetConversation()
+                statusText.text = "🧠 Nabura na ang memorya ng usapan"
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
     private fun showIpSettingDialog() {
         val input = EditText(this).apply {
             hint = "hal. 192.168.1.25 o 192.168.43.100"
@@ -2249,6 +2549,7 @@ class MainActivity : ComponentActivity() {
         yoloDetector.close()
         faceEmbedder.close()
         obstacleAnalyzer?.close()
+        ttsHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()
         speechService?.stop()
