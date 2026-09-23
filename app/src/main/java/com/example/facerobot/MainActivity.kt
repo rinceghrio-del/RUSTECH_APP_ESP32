@@ -192,9 +192,30 @@ class MainActivity : ComponentActivity() {
     private var geminiModel: String
         get() = prefs.getString("gemini_model", GeminiBrain.DEFAULT_MODEL) ?: GeminiBrain.DEFAULT_MODEL
         set(value) { prefs.edit().putString("gemini_model", value.trim().ifEmpty { GeminiBrain.DEFAULT_MODEL }).apply() }
+    private var geminiDailyLimit: Int
+        get() = prefs.getInt("gemini_daily_limit", 500)
+        set(value) { prefs.edit().putInt("gemini_daily_limit", value.coerceAtLeast(1)).apply() }
+
+    // Nagre-reset ang daily quota ng Google ng midnight Pacific time (mga 3 PM sa Pilipinas).
+    private fun geminiQuotaDay(): String {
+        val f = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        f.timeZone = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+        return f.format(Date())
+    }
+
+    private fun geminiUsedToday(): Int =
+        if (prefs.getString("gemini_count_day", "") == geminiQuotaDay()) prefs.getInt("gemini_count", 0) else 0
+
+    private fun bumpGeminiCount() {
+        prefs.edit()
+            .putString("gemini_count_day", geminiQuotaDay())
+            .putInt("gemini_count", geminiUsedToday() + 1)
+            .apply()
+    }
+
     @Volatile private var geminiBusy = false
     private var lastGeminiRequestTime = 0L
-    private val geminiMinIntervalMs = 1500L      // iwas-spam sa free-tier quota (ingay/TV)
+    private val geminiMinIntervalMs = 4000L      // 4s pagitan = max 15 requests/min, sakto sa free-tier RPM
     private var geminiCooldownUntil = 0L         // pag na-429, pahinga muna
     private var lastGeminiErrorSpeakTime = 0L
     private var lastGreetedName: String? = null
@@ -1273,13 +1294,15 @@ class MainActivity : ComponentActivity() {
         val heardText = candidates.firstOrNull() ?: return
 
         val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
-            System.currentTimeMillis() >= geminiCooldownUntil
+            System.currentTimeMillis() >= geminiCooldownUntil &&
+            geminiUsedToday() < geminiDailyLimit
 
         // Walang Gemini (naka-off, walang key, o cooldown): dating lokal na behavior.
         if (!useGemini) {
             val reason = when {
                 !geminiEnabled -> ""
                 geminiApiKey.isBlank() -> " (walang Gemini API key)"
+                geminiUsedToday() >= geminiDailyLimit -> " (naabot ang daily limit ng Gemini)"
                 else -> " (Gemini cooldown)"
             }
             addVoiceLogEntry(heardText, processVoiceCommand(candidates) + reason)
@@ -1333,6 +1356,7 @@ class MainActivity : ComponentActivity() {
         val heardText = candidates.first()
         geminiBusy = true
         lastGeminiRequestTime = System.currentTimeMillis()
+        bumpGeminiCount()
         statusText.text = "🧠 Nag-iisip... ($heardText)"
 
         geminiBrain.ask(
@@ -2197,6 +2221,20 @@ class MainActivity : ComponentActivity() {
             isChecked = geminiEnabled
             setPadding(0, 8, 0, 24)
         }
+        val usageText = TextView(this).apply {
+            text = "📊 Nagamit ngayong araw: ${geminiUsedToday()} / $geminiDailyLimit requests\n(nagre-reset ~3 PM oras sa Pilipinas)"
+            textSize = 13f
+            setPadding(0, 0, 0, 24)
+        }
+        val limitLabel = TextView(this).apply {
+            text = "Daily limit (tingnan sa AI Studio, hal. 500):"
+            setPadding(0, 24, 0, 0)
+        }
+        val limitInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(geminiDailyLimit.toString())
+            setSingleLine(true)
+        }
         val keyLabel = TextView(this).apply { text = "API key (kunin sa aistudio.google.com):" }
         val keyInput = EditText(this).apply {
             hint = "AIza..."
@@ -2221,10 +2259,13 @@ class MainActivity : ComponentActivity() {
         }
 
         container.addView(enabledSwitch)
+        container.addView(usageText)
         container.addView(keyLabel)
         container.addView(keyInput)
         container.addView(modelLabel)
         container.addView(modelInput)
+        container.addView(limitLabel)
+        container.addView(limitInput)
         container.addView(note)
 
         android.app.AlertDialog.Builder(this)
@@ -2234,6 +2275,7 @@ class MainActivity : ComponentActivity() {
                 geminiEnabled = enabledSwitch.isChecked
                 geminiApiKey = keyInput.text.toString()
                 geminiModel = modelInput.text.toString()
+                limitInput.text.toString().trim().toIntOrNull()?.let { geminiDailyLimit = it }
                 geminiCooldownUntil = 0L
                 statusText.text = if (geminiEnabled && geminiApiKey.isNotBlank())
                     "🧠 Gemini naka-on (${geminiModel})" else "🧠 Gemini naka-off"
