@@ -1676,9 +1676,18 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
     private var smoothedServoAngle: Float = 0f
-    private val servoSmoothingFactorFar = 0.2f
-    private val servoSmoothingFactorNear = 0.12f
+    private val servoSmoothingFactorFar = 0.08f
+    private val servoSmoothingFactorNear = 0.04f
     private val servoSmoothingSwitchThreshold = 20f
+
+    // DAHAN-DAHAN NA SERVO: may bilis-limit (degrees kada segundo) at deadband para hindi manginig/bumigla.
+    // Gusto mo pang mas mabagal? Ibaba ang servoMaxDegPerSec (hal. 15f). Mas mabilis? Itaas (hal. 40f).
+    private val servoMaxDegPerSec = 25f
+    private val servoStartMoveDeg = 4f        // kailangang lumayo nang ganito bago gumalaw
+    private val servoStopMoveDeg = 1f         // hihinto kapag ganito na lang ang layo sa target
+    private var outputServoAngle = -1f        // -1 = wala pang naitakda
+    private var servoMoving = false
+    private var lastServoComputeTime = 0L
 
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         val faceCenterY = box.centerY()
@@ -1697,7 +1706,22 @@ class MainActivity : ComponentActivity() {
 
         smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
 
-        return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
+        // Bilis-limit + deadband
+        val nowMs = System.currentTimeMillis()
+        val dt = if (lastServoComputeTime == 0L) 0f else ((nowMs - lastServoComputeTime) / 1000f).coerceAtMost(0.5f)
+        lastServoComputeTime = nowMs
+        if (outputServoAngle < 0f) outputServoAngle = smoothedServoAngle
+
+        val diff = smoothedServoAngle - outputServoAngle
+        val absDiff = kotlin.math.abs(diff)
+        if (!servoMoving && absDiff >= servoStartMoveDeg) servoMoving = true
+        if (servoMoving && absDiff <= servoStopMoveDeg) servoMoving = false
+        if (servoMoving) {
+            val maxStep = servoMaxDegPerSec * dt
+            outputServoAngle += diff.coerceIn(-maxStep, maxStep)
+        }
+
+        return outputServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
     }
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
@@ -1950,6 +1974,8 @@ class MainActivity : ComponentActivity() {
         navActive = false
         navHandler.removeCallbacksAndMessages(null)
         smoothedServoAngle = lastNavServoAngle.toFloat()
+        outputServoAngle = smoothedServoAngle
+        servoMoving = false
         showEyesUi()
         statusText.text = "🧭 NAV off ($reason)"
     }
