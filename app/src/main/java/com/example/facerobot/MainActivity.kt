@@ -78,13 +78,6 @@ import java.util.zip.ZipInputStream
  * obstacle sensor gamit ang MiDaS depth model (tignan ang vision/ObstacleAnalyzer.kt). Nagpapadala ang app ng
  * NAV_LEFT / NAV_RIGHT / NAV_BACK / NAV_CLEAR hints (+ servo tilt) sa ESP32. Ang ESP32 pa rin ang may huling
  * desisyon; ultrasonic/IR avoidance ang laging mauuna.
- *
- * PATCH (servo face-centering fix): Ang face.boundingBox mula sa ML Kit ay nasa ROTATED/upright
- * coordinate space (ayon sa rotationDegrees na pinasa sa InputImage.fromMediaImage), HINDI sa raw
- * sensor frame. Dati, ang computeCommand()/computeServoAngle() ay gumagamit ng RAW imageProxy.width/
- * height bilang denominator kahit rotated na ang box -- mali kapag 90/270 ang rotation (front camera +
- * portrait), dahil doon nagkakamali ang vertical ratio computation at "hindi mahuli" ng servo ang
- * gitna ng mukha. Fix: i-swap ang width/height base sa rotation bago ipasa sa mga function na iyon.
  */
 @androidx.camera.core.ExperimentalGetImage
 class MainActivity : ComponentActivity() {
@@ -995,18 +988,10 @@ class MainActivity : ComponentActivity() {
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
 
-        val box = face.boundingBox
-        val rawWidth = imageProxy.width
-        val rawHeight = imageProxy.height
 
-        // PATCH: ang face.boundingBox mula sa ML Kit ay nasa ROTATED/upright coordinate space
-        // (base sa rotation na pinasa sa InputImage.fromMediaImage), HINDI sa raw sensor frame.
-        // Kapag 90 o 270 ang rotation (karaniwan ito sa front camera + portrait app), ang totoong
-        // "width"/"height" ng upright frame ay SWAPPED kumpara sa raw imageProxy.width/height.
-        // Dati, direkta na lang ginagamit ang raw width/height dito kaya mali ang vertical ratio
-        // computation sa computeServoAngle() - kaya "hindi mahuli" ng servo ang gitna ng mukha.
-        val frameWidth = if (rotation == 90 || rotation == 270) rawHeight else rawWidth
-        val frameHeight = if (rotation == 90 || rotation == 270) rawWidth else rawHeight
+        val box = face.boundingBox
+        val frameWidth = imageProxy.width
+        val frameHeight = imageProxy.height
 
         val faceRatio = box.width().toFloat() / frameWidth.toFloat()
         if (!faceTooClose && faceRatio > closeFaceWidthRatio) faceTooClose = true
@@ -1026,9 +1011,7 @@ class MainActivity : ComponentActivity() {
             lastRecognitionTime = now
             try {
                 val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-                // NOTE: adjustBoxForRotation() ay umaasa sa RAW (unswapped) width/height nito
-                // dahil sarili niyang logic na ang gumagawa ng pag-account sa rotation.
-                val adjustedBox = adjustBoxForRotation(box, rawWidth, rawHeight, rotation)
+                val adjustedBox = adjustBoxForRotation(box, frameWidth, frameHeight, rotation)
                 val faceCrop = ImageUtils.safeCrop(bitmap, adjustedBox)
 
                 if (faceCrop != null) {
@@ -1699,7 +1682,7 @@ class MainActivity : ComponentActivity() {
 
     // DAHAN-DAHAN NA SERVO: may bilis-limit (degrees kada segundo) at deadband para hindi manginig/bumigla.
     // Gusto mo pang mas mabagal? Ibaba ang servoMaxDegPerSec (hal. 15f). Mas mabilis? Itaas (hal. 40f).
-    private val servoMaxDegPerSec = 15f
+    private val servoMaxDegPerSec = 25f
     private val servoStartMoveDeg = 4f        // kailangang lumayo nang ganito bago gumalaw
     private val servoStopMoveDeg = 1f         // hihinto kapag ganito na lang ang layo sa target
     private var outputServoAngle = -1f        // -1 = wala pang naitakda
