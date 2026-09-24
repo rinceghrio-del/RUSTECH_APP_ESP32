@@ -1682,7 +1682,7 @@ class MainActivity : ComponentActivity() {
 
     // DAHAN-DAHAN NA SERVO: may bilis-limit (degrees kada segundo) at deadband para hindi manginig/bumigla.
     // Gusto mo pang mas mabagal? Ibaba ang servoMaxDegPerSec (hal. 15f). Mas mabilis? Itaas (hal. 40f).
-    private val servoMaxDegPerSec = 25f
+    private val servoMaxDegPerSec = 35f
     private val servoStartMoveDeg = 4f        // kailangang lumayo nang ganito bago gumalaw
     private val servoStopMoveDeg = 1f         // hihinto kapag ganito na lang ang layo sa target
     private var outputServoAngle = -1f        // -1 = wala pang naitakda
