@@ -1725,37 +1725,28 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
     private var smoothedServoAngle: Float = 0f
-
-    // FACE TRACKING NG SERVO (hinto-at-hintay / step-and-settle): nasa servo ang camera, kaya ang nakikita
-    // ng camera ay laging huli sa aktwal na galaw (delay ng network + servo + frame). Kapag tuloy-tuloy ang
-    // pagtatama habang gumagalaw pa ang servo, nalalampasan ang mukha (overshoot). Kaya: isang maliit na
-    // hakbang lang bawat ~400ms, tapos HINTAY munang tumigil ang servo at mag-update ang frame bago tumingin ulit.
-    private val servoTargetRatio = 0.5f        // 0.5 = eksaktong gitna ng frame; 0.42 = medyo mataas (mata sa gitna)
-    private val servoDirection = 1f           // kapag baliktad ang galaw, gawing -1f (tama na ito sa unit mo)
-    private val servoCameraFovDeg = 45f       // tinatayang vertical FOV ng camera (para gawing degrees ang error)
-    private val servoStepGain = 0.5f          // kalahati lang ng error ang itatama bawat hakbang (iwas overshoot)
-    private val servoMaxStepDeg = 5f          // pinakamalaking hakbang bawat ~400ms
-    private val servoDeadbandRatio = 0.06f    // sakop ng "gitna" (fraction ng taas ng frame) - dito hihinto
-    private val servoStepIntervalMs = 400L    // pagitan ng bawat hakbang
-    private var outputServoAngle = -1f        // -1 = wala pang naitakda
-    private var lastServoStepTime = 0L
+    private val servoSmoothingFactorFar = 0.2f
+    private val servoSmoothingFactorNear = 0.12f
+    private val servoSmoothingSwitchThreshold = 20f
 
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
-        val verticalRatio = box.centerY().toFloat() / frameHeight.toFloat()
-        if (outputServoAngle < 0f) outputServoAngle = SERVO_MAX_ANGLE / 2f
+        val faceCenterY = box.centerY()
+        val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
 
-        val now = System.currentTimeMillis()
-        if (now - lastServoStepTime >= servoStepIntervalMs) {
-            lastServoStepTime = now
-            val error = servoTargetRatio - verticalRatio   // positibo = mukha nasa itaas ng gitna -> itaas ang servo
-            if (kotlin.math.abs(error) > servoDeadbandRatio) {
-                val errorDeg = error * servoCameraFovDeg * servoDirection
-                val step = (errorDeg * servoStepGain).coerceIn(-servoMaxStepDeg, servoMaxStepDeg)
-                outputServoAngle = (outputServoAngle + step).coerceIn(0f, SERVO_MAX_ANGLE.toFloat())
-            }
+        val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
+        val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
+        val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
+
+        val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
+        val factor = if (distance > servoSmoothingSwitchThreshold) {
+            servoSmoothingFactorFar
+        } else {
+            servoSmoothingFactorNear
         }
-        smoothedServoAngle = outputServoAngle
-        return Math.round(outputServoAngle)
+
+        smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
+
+        return smoothedServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
     }
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
@@ -2008,7 +1999,6 @@ class MainActivity : ComponentActivity() {
         navActive = false
         navHandler.removeCallbacksAndMessages(null)
         smoothedServoAngle = lastNavServoAngle.toFloat()
-        outputServoAngle = smoothedServoAngle
         showEyesUi()
         statusText.text = "🧭 NAV off ($reason)"
     }
