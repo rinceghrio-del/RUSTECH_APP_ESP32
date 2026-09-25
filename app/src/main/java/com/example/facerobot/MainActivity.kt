@@ -1363,7 +1363,7 @@ class MainActivity : ComponentActivity() {
         for (text in candidates) {
             val mentionsCamera = text.contains("camera") || text.contains("kamera")
             val mentionsEyes = text.contains("mata") || text.contains("eyes") || text.contains("roboeyes")
-            val hasSwitchIntent = text.contains("ipakita") || text.contains("switch") ||
+            val hasSwitchIntent = text.contains("ipakita") || text.contains("ilagay") || text.contains("ilipat") || text.contains("switch") ||
                 text.contains("palitan") || text.contains("lumipat") || text.contains("tignan") ||
                 text.contains("balik")
 
