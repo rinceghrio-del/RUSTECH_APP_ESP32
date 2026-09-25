@@ -196,6 +196,12 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getInt("gemini_daily_limit", 500)
         set(value) { prefs.edit().putInt("gemini_daily_limit", value.coerceAtLeast(1)).apply() }
 
+    // Kapag OFF: hindi na magsasalita ang APP (TextToSpeech) - ang ESP32/DFPlayer na ang boses,
+    // para hindi magsabay ang dalawang audio source.
+    private var appTtsEnabled: Boolean
+        get() = prefs.getBoolean("app_tts_enabled", true)
+        set(value) { prefs.edit().putBoolean("app_tts_enabled", value).apply() }
+
     // Nagre-reset ang daily quota ng Google ng midnight Pacific time (mga 3 PM sa Pilipinas).
     private fun geminiQuotaDay(): String {
         val f = SimpleDateFormat("yyyy-MM-dd", Locale.US)
@@ -1001,7 +1007,10 @@ class MainActivity : ComponentActivity() {
         }
 
         val command = computeCommand(box, frameWidth)
-        val servoAngle = computeServoAngle(box, frameHeight)
+        // Ang box ng ML Kit ay nasa UPRIGHT (naka-rotate) na coordinates, kaya para sa 90/270 ay
+        // kabaligtaran ang tunay na taas ng frame (width ng raw image). Dati raw height ang ginamit -> sablay ang "gitna".
+        val uprightFrameHeight = if (rotation == 90 || rotation == 270) frameWidth else frameHeight
+        val servoAngle = computeServoAngle(box, uprightFrameHeight)
         if (!voiceOverrideActive) {
             sendCommandThrottled(command, servoAngle)
         }
@@ -1317,6 +1326,12 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // 1b) Display switch (camera/mata) - lokal din, hindi kailangan ng Gemini.
+        tryHandleDisplayCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
         // 2) Maiikling eksaktong utos (hal. "sayaw", "abante") - lokal at instant, gaya ng dati.
         val exact = findExactCustomCommand(candidates)
         if (exact != null) {
@@ -1337,6 +1352,35 @@ class MainActivity : ComponentActivity() {
             return
         }
         askGemini(candidates)
+    }
+
+    /**
+     * "ipakita mo ang camera" / "mag-switch sa camera" -> lumipat ang DISPLAY papuntang camera preview.
+     * "balik sa mata" / "ipakita ang mata" -> bumalik sa RoboEyes. Ito ang parehong toggle na nasa
+     * Menu > Display switch - hindi ito tinanggal, dalawa lang ang paraan papuntang parehong setting.
+     */
+    private fun tryHandleDisplayCommand(candidates: List<String>): String? {
+        for (text in candidates) {
+            val mentionsCamera = text.contains("camera") || text.contains("kamera")
+            val mentionsEyes = text.contains("mata") || text.contains("eyes") || text.contains("roboeyes")
+            val hasSwitchIntent = text.contains("ipakita") || text.contains("switch") ||
+                text.contains("palitan") || text.contains("lumipat") || text.contains("tignan") ||
+                text.contains("balik")
+
+            if (mentionsCamera && hasSwitchIntent) {
+                showRoboEyes = false
+                applyDisplayMode()
+                speak("Sige, ipapakita ko na ang camera.")
+                return "display: camera"
+            }
+            if (mentionsEyes && hasSwitchIntent) {
+                showRoboEyes = true
+                applyDisplayMode()
+                speak("Sige, babalik na sa mata.")
+                return "display: eyes"
+            }
+        }
+        return null
     }
 
     /** Custom command na halos eksakto ang sinabi (hindi kasama sa mahabang usapan). */
@@ -1427,6 +1471,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processVoiceCommand(candidates: List<String>): String {
+        tryHandleDisplayCommand(candidates)?.let { return it }
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
@@ -1606,6 +1651,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun speak(phrase: String) {
+        if (!appTtsEnabled) return
         if (!ttsReady) return
         val clean = cleanForSpeech(phrase)
         if (clean.isEmpty()) return
@@ -1676,52 +1722,37 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putFloat("servo_bottom_ratio", value).apply() }
 
     private var smoothedServoAngle: Float = 0f
-    private val servoSmoothingFactorFar = 0.08f
-    private val servoSmoothingFactorNear = 0.04f
-    private val servoSmoothingSwitchThreshold = 20f
 
-    // DAHAN-DAHAN NA SERVO: may bilis-limit (degrees kada segundo) at deadband para hindi manginig/bumigla.
-    // Gusto mo pang mas mabagal? Ibaba ang servoMaxDegPerSec (hal. 15f). Mas mabilis? Itaas (hal. 40f).
-    private val servoMaxDegPerSec = 55f
-    private val servoStartMoveDeg = 4f        // kailangang lumayo nang ganito bago gumalaw
-    private val servoStopMoveDeg = 1f         // hihinto kapag ganito na lang ang layo sa target
+    // FACE TRACKING NG SERVO (hinto-at-hintay / step-and-settle): nasa servo ang camera, kaya ang nakikita
+    // ng camera ay laging huli sa aktwal na galaw (delay ng network + servo + frame). Kapag tuloy-tuloy ang
+    // pagtatama habang gumagalaw pa ang servo, nalalampasan ang mukha (overshoot). Kaya: isang maliit na
+    // hakbang lang bawat ~400ms, tapos HINTAY munang tumigil ang servo at mag-update ang frame bago tumingin ulit.
+    private val servoTargetRatio = 0.5f        // 0.5 = eksaktong gitna ng frame; 0.42 = medyo mataas (mata sa gitna)
+    private val servoDirection = 1f           // kapag baliktad ang galaw, gawing -1f (tama na ito sa unit mo)
+    private val servoCameraFovDeg = 45f       // tinatayang vertical FOV ng camera (para gawing degrees ang error)
+    private val servoStepGain = 0.5f          // kalahati lang ng error ang itatama bawat hakbang (iwas overshoot)
+    private val servoMaxStepDeg = 5f          // pinakamalaking hakbang bawat ~400ms
+    private val servoDeadbandRatio = 0.06f    // sakop ng "gitna" (fraction ng taas ng frame) - dito hihinto
+    private val servoStepIntervalMs = 400L    // pagitan ng bawat hakbang
     private var outputServoAngle = -1f        // -1 = wala pang naitakda
-    private var servoMoving = false
-    private var lastServoComputeTime = 0L
+    private var lastServoStepTime = 0L
 
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
-        val faceCenterY = box.centerY()
-        val verticalRatio = faceCenterY.toFloat() / frameHeight.toFloat()
+        val verticalRatio = box.centerY().toFloat() / frameHeight.toFloat()
+        if (outputServoAngle < 0f) outputServoAngle = SERVO_MAX_ANGLE / 2f
 
-        val clamped = verticalRatio.coerceIn(servoTopRatio, servoBottomRatio)
-        val normalized = (clamped - servoTopRatio) / (servoBottomRatio - servoTopRatio)
-        val rawAngle = (1f - normalized) * SERVO_MAX_ANGLE
-
-        val distance = kotlin.math.abs(rawAngle - smoothedServoAngle)
-        val factor = if (distance > servoSmoothingSwitchThreshold) {
-            servoSmoothingFactorFar
-        } else {
-            servoSmoothingFactorNear
+        val now = System.currentTimeMillis()
+        if (now - lastServoStepTime >= servoStepIntervalMs) {
+            lastServoStepTime = now
+            val error = servoTargetRatio - verticalRatio   // positibo = mukha nasa itaas ng gitna -> itaas ang servo
+            if (kotlin.math.abs(error) > servoDeadbandRatio) {
+                val errorDeg = error * servoCameraFovDeg * servoDirection
+                val step = (errorDeg * servoStepGain).coerceIn(-servoMaxStepDeg, servoMaxStepDeg)
+                outputServoAngle = (outputServoAngle + step).coerceIn(0f, SERVO_MAX_ANGLE.toFloat())
+            }
         }
-
-        smoothedServoAngle += (rawAngle - smoothedServoAngle) * factor
-
-        // Bilis-limit + deadband
-        val nowMs = System.currentTimeMillis()
-        val dt = if (lastServoComputeTime == 0L) 0f else ((nowMs - lastServoComputeTime) / 1000f).coerceAtMost(0.5f)
-        lastServoComputeTime = nowMs
-        if (outputServoAngle < 0f) outputServoAngle = smoothedServoAngle
-
-        val diff = smoothedServoAngle - outputServoAngle
-        val absDiff = kotlin.math.abs(diff)
-        if (!servoMoving && absDiff >= servoStartMoveDeg) servoMoving = true
-        if (servoMoving && absDiff <= servoStopMoveDeg) servoMoving = false
-        if (servoMoving) {
-            val maxStep = servoMaxDegPerSec * dt
-            outputServoAngle += diff.coerceIn(-maxStep, maxStep)
-        }
-
-        return outputServoAngle.toInt().coerceIn(0, SERVO_MAX_ANGLE)
+        smoothedServoAngle = outputServoAngle
+        return Math.round(outputServoAngle)
     }
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
@@ -1975,7 +2006,6 @@ class MainActivity : ComponentActivity() {
         navHandler.removeCallbacksAndMessages(null)
         smoothedServoAngle = lastNavServoAngle.toFloat()
         outputServoAngle = smoothedServoAngle
-        servoMoving = false
         showEyesUi()
         statusText.text = "🧭 NAV off ($reason)"
     }
@@ -2247,6 +2277,16 @@ class MainActivity : ComponentActivity() {
             isChecked = geminiEnabled
             setPadding(0, 8, 0, 24)
         }
+        val ttsSwitch = Switch(this).apply {
+            text = "🔊 Gamitin ang App TTS (Filipino voice)"
+            isChecked = appTtsEnabled
+            setPadding(0, 0, 0, 8)
+        }
+        val ttsNote = TextView(this).apply {
+            text = "OFF ito kapag ang boses ng ESP32/DFPlayer na ang gagamitin, para hindi magsabay ang dalawang audio."
+            textSize = 11f
+            setPadding(0, 0, 0, 24)
+        }
         val usageText = TextView(this).apply {
             text = "📊 Nagamit ngayong araw: ${geminiUsedToday()} / $geminiDailyLimit requests\n(nagre-reset ~3 PM oras sa Pilipinas)"
             textSize = 13f
@@ -2285,6 +2325,8 @@ class MainActivity : ComponentActivity() {
         }
 
         container.addView(enabledSwitch)
+        container.addView(ttsSwitch)
+        container.addView(ttsNote)
         container.addView(usageText)
         container.addView(keyLabel)
         container.addView(keyInput)
@@ -2299,6 +2341,7 @@ class MainActivity : ComponentActivity() {
             .setView(ScrollView(this).apply { addView(container) })
             .setPositiveButton("Save") { _, _ ->
                 geminiEnabled = enabledSwitch.isChecked
+                appTtsEnabled = ttsSwitch.isChecked
                 geminiApiKey = keyInput.text.toString()
                 geminiModel = modelInput.text.toString()
                 limitInput.text.toString().trim().toIntOrNull()?.let { geminiDailyLimit = it }
