@@ -144,7 +144,18 @@ class CommandStore(context: Context) {
      * sa sinabi ng user (hal. kung ang trigger ay "abante||forward", tutugma ito kung
      * alinman sa dalawa ang narinig). Null kung wala.
      */
+    /**
+     * Hinahanap ang command na may PINAKAMAHABANG (pinaka-espesipikong) trigger variant na
+     * "nakapaloob" sa sinabi ng user - hindi basta ang UNANG tumutugma sa listahan.
+     * Halimbawa: kung "oo" at "oo ang pangit" ay pareho niyang mga trigger, at "oo ang pangit"
+     * ang sinabi ng user, dapat ang "oo ang pangit" ang manalo kahit "oo" pa ang mauna sa
+     * listahan - kasi kung unang-tugma lang ang pagbabatayan, laging ang maikling "oo" ang
+     * mananalo dahil substring ito ng mas mahabang parirala. Null kung walang tumugma.
+     */
     fun findMatch(spokenText: String): VoiceCommand? {
-        return commands.firstOrNull { cmd -> cmd.triggerVariants().any { spokenText.contains(it) } }
+        return commands
+            .flatMap { cmd -> cmd.triggerVariants().filter { spokenText.contains(it) }.map { it to cmd } }
+            .maxByOrNull { it.first.length }
+            ?.second
     }
 }
