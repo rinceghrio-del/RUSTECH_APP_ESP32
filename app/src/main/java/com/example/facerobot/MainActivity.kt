@@ -1731,10 +1731,10 @@ class MainActivity : ComponentActivity() {
     private val servoTargetRatio = 0.5f        // 0.5 = eksaktong gitna ng frame; 0.42 = medyo mataas (mata sa gitna)
     private val servoDirection = 1f           // kapag baliktad ang galaw, gawing -1f
     private val servoCameraFovDeg = 45f       // tinatayang vertical FOV ng camera (para gawing degrees ang error)
-    private val servoStepGain = 0.5f          // kalahati lang ng error ang itatama bawat hakbang (iwas overshoot)
-    private val servoMaxStepDeg = 5f          // pinakamalaking hakbang bawat ~400ms
+    private val servoStepGain = 0.65f         // gaano karaming porsyento ng error ang itatama bawat hakbang
+    private val servoMaxStepDeg = 10f         // pinakamalaking hakbang bawat ~250ms (dating 5 bawat 400ms - ~3x mas mabilis)
     private val servoDeadbandRatio = 0.06f    // sakop ng "gitna" (fraction ng taas ng frame) - dito hihinto
-    private val servoStepIntervalMs = 400L    // pagitan ng bawat hakbang
+    private val servoStepIntervalMs = 250L    // pagitan ng bawat hakbang (dating 400ms)
     private var outputServoAngle = -1f        // -1 = wala pang naitakda
     private var lastServoStepTime = 0L
 
