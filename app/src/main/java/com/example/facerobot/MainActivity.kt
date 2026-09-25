@@ -1523,6 +1523,9 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+        // Hindi naintindihan / walang tumugma - papatugtugin ang DFPlayer track 48 sa ESP32
+        // (audio feedback na "hindi ko naintindihan" gamit ang sariling boses ng robot).
+        sendPlayTrack(48)
         return "walang tumugma"
     }
 
