@@ -122,7 +122,6 @@ class CommandStore(context: Context) {
             VoiceCommand("saan ka galing", "sa laboratoryo ni rusty"),
             VoiceCommand("saan ka nakatira", "nakatira ako sa laboratoryo ni rusty"),
             VoiceCommand("oo kanina pa", "sige, mabuti naman."),
-            VoiceCommand("oo", "OK!, OK!."),
             VoiceCommand("paano ka ginawa", "AKO AY BINUO SA LIKHANG ISIP NI RUSTY"),
             VoiceCommand("nakakain ka ba ng pagkain", "ayaw! ayaw! kuryente lang kinakain ko", "SHAKING"),
             VoiceCommand("ikaw ba kumain na", "hindi ako na kain", "SHAKING"),
