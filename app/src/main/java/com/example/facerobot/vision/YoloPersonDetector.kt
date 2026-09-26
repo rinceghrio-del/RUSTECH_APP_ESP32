@@ -122,8 +122,8 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
     fun detect(bitmap: Bitmap, classesOfInterest: Set<Int>): List<Detection> {
         val interp = interpreter ?: return emptyList()
 
-        val resized = ImageUtils.resize(bitmap, INPUT_SIZE)
-        val inputBuffer = bitmapToInputBuffer(resized)
+        val letterboxed = ImageUtils.resizeLetterboxed(bitmap, INPUT_SIZE)
+        val inputBuffer = bitmapToInputBuffer(letterboxed.bitmap)
 
         val outputShape = interp.getOutputTensor(0).shape() // e.g. [1, 84, 2100]
         val output = Array(outputShape[0]) { Array(outputShape[1]) { FloatArray(outputShape[2]) } }
@@ -137,7 +137,7 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
             return emptyList()
         }
 
-        return decodeOutput(output[0], outputShape, bitmap.width, bitmap.height, classesOfInterest)
+        return decodeOutput(output[0], outputShape, letterboxed.scale, letterboxed.padX, letterboxed.padY, classesOfInterest)
     }
 
     private fun bitmapToInputBuffer(bitmap: Bitmap): ByteBuffer {
@@ -173,8 +173,9 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
     private fun decodeOutput(
         output: Array<FloatArray>,
         shape: IntArray,
-        origWidth: Int,
-        origHeight: Int,
+        scale: Float,
+        padX: Float,
+        padY: Float,
         classesOfInterest: Set<Int>
     ): List<Detection> {
         val numAttrs = shape[1]
@@ -198,10 +199,13 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
             if (bestScore > maxScore) maxScore = bestScore
             if (bestClassId == -1 || bestScore < thresholdFor(bestClassId)) continue
 
-            val cx = output[0][i] / INPUT_SIZE * origWidth
-            val cy = output[1][i] / INPUT_SIZE * origHeight
-            val w = output[2][i] / INPUT_SIZE * origWidth
-            val h = output[3][i] / INPUT_SIZE * origHeight
+            // Ang output[0..3] ay nasa loob ng INPUT_SIZE x INPUT_SIZE LETTERBOXED space (may
+            // gray padding). Kailangan munang alisin ang padding offset, tapos i-unscale
+            // pabalik sa orihinal na dimensyon ng frame - hindi na basta i-stretch.
+            val cx = (output[0][i] - padX) / scale
+            val cy = (output[1][i] - padY) / scale
+            val w = output[2][i] / scale
+            val h = output[3][i] / scale
 
             val rect = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
             candidates.add(Detection(rect, bestScore, bestClassId, labelFor(bestClassId)))
