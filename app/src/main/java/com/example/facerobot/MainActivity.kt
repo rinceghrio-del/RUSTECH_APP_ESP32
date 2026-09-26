@@ -158,6 +158,13 @@ class MainActivity : ComponentActivity() {
     private var consecutivePersonDetections = 0
     private val requiredConsecutiveDetections = 3
 
+    // Pareho ng ginagawa sa person: kailangan ng ilang sunod-sunod na frame ng PAREHONG label
+    // (aso o pusa) bago mag-greet, para hindi biglaang magreact sa isang noisy frame lang
+    // (hal. mukha ng tao na minsan lang na-misclassify bilang "aso").
+    private var consecutivePetDetections = 0
+    private var lastPetLabelSeen: String? = null
+    private val requiredConsecutivePetDetections = 3
+
     private var lastRecognitionTime = 0L
     private val recognitionIntervalMs = 600L
 
@@ -811,9 +818,15 @@ class MainActivity : ComponentActivity() {
         })
 
         container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
+        container.addView(TextView(this).apply {
+            text = "(Pwede ring \"aso\" o \"pusa\" ilagay bilang pangalan - para sa pet greeting)"
+            textSize = 11f
+            setTextColor(0xFF888888.toInt())
+            setPadding(0, 0, 0, 12)
+        })
 
         val nameInput = EditText(this).apply {
-            hint = "Eksaktong pangalan (kagaya ng naka-enroll) - IWANAN BLANGKO kung hindi kilala"
+            hint = "Eksaktong pangalan (kagaya ng naka-enroll), o \"aso\"/\"pusa\" - IWANAN BLANGKO kung hindi kilalang tao"
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val trackInput = EditText(this).apply {
@@ -979,7 +992,19 @@ class MainActivity : ComponentActivity() {
             }
 
             if (petDetections.isNotEmpty()) {
-                runOnUi { greetPetIfNeeded(petDetections.first().label) }
+                val topPetLabel = petDetections.first().label
+                if (topPetLabel == lastPetLabelSeen) {
+                    consecutivePetDetections++
+                } else {
+                    lastPetLabelSeen = topPetLabel
+                    consecutivePetDetections = 1
+                }
+                if (consecutivePetDetections >= requiredConsecutivePetDetections) {
+                    runOnUi { greetPetIfNeeded(topPetLabel) }
+                }
+            } else {
+                consecutivePetDetections = 0
+                lastPetLabelSeen = null
             }
 
             if (consecutivePersonDetections >= requiredConsecutiveDetections) {
@@ -1154,6 +1179,17 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
         lastPetGreetTime = now
+
+        // Pareho ng greetIfNeeded(name) sa tao: gamit ang parehong "greeting_tracks" store,
+        // dahil "aso"/"pusa" mismo ang label - kaya kung nag-set ka ng tracks sa Greeting
+        // Tracks dialog gamit "aso" o "pusa" bilang pangalan, gagana na agad ito dito.
+        val tracks = greetingTracksFor(label)
+        if (tracks.isNotEmpty()) {
+            sendPlayTrack(tracks.random())
+            return
+        }
+
+        // Walang naka-set na DFPlayer track para dito - fallback sa TTS, gaya ng dati.
         if (!ttsReady) return
         val options = petGreetings[label] ?: return
         speak(options.random())
