@@ -2,6 +2,8 @@ package com.example.facerobot.vision
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -111,5 +113,38 @@ object ImageUtils {
 
     fun resize(bitmap: Bitmap, size: Int): Bitmap {
         return Bitmap.createScaledBitmap(bitmap, size, size, true)
+    }
+
+    /** Resulta ng resizeLetterboxed(): ang naka-pad na square bitmap, kasama ang scale at
+     * padding na ginamit - kailangan ito para ma-convert pabalik sa orig image space ang
+     * mga detection box coordinates. */
+    data class LetterboxResult(val bitmap: Bitmap, val scale: Float, val padX: Float, val padY: Float)
+
+    /**
+     * Katulad ng resize() pero PINANATILI ang aspect ratio ng orihinal na larawan sa halip na
+     * i-stretch papuntang eksaktong square. Nire-resize muna proportionally, tapos pinupunuan
+     * ("letterbox") ng gray bars ang natitirang espasyo para maging eksaktong size x size.
+     *
+     * Bakit importante ito: ang resize() (naive stretch) ay pumipiga/nag-uunat ng anumang
+     * bagay sa frame (hal. aso, pusa) - lalo na kapag hindi square ang camera frame (karaniwan
+     * ay 4:3 o 16:9). Ang distortion na yun ay pwedeng magbago ng aparenteng proporsyon ng
+     * hugis (hal. haba ng katawan vs ulo) sapat para malito ang model sa pagitan ng magkalapit
+     * na klase gaya ng "cat" at "dog". Ginagamit ito ng YOLO detector para dito.
+     */
+    fun resizeLetterboxed(bitmap: Bitmap, size: Int): LetterboxResult {
+        val scale = min(size.toFloat() / bitmap.width, size.toFloat() / bitmap.height)
+        val newWidth = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val newHeight = (bitmap.height * scale).toInt().coerceAtLeast(1)
+        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true)
+
+        val padX = (size - newWidth) / 2f
+        val padY = (size - newHeight) / 2f
+
+        val output = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+        canvas.drawColor(Color.rgb(114, 114, 114)) // standard na "YOLO gray" na padding color
+        canvas.drawBitmap(scaledBitmap, padX, padY, null)
+
+        return LetterboxResult(output, scale, padX, padY)
     }
 }
