@@ -36,6 +36,9 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
         const val CAT_CLASS_INDEX = 15      // "cat" ang class 15 sa COCO
         const val DOG_CLASS_INDEX = 16      // "dog" ang class 16 sa COCO
         const val CONF_THRESHOLD = 0.5f
+        const val PET_CONF_THRESHOLD = 0.65f // mas mataas na bar para sa cat/dog - mas madaling
+                                              // ma-confuse ng maliit na model ang mukha ng tao
+                                              // bilang "fur/texture" kapag malapitan lang
         const val IOU_THRESHOLD = 0.45f
 
         // Mga class na ginagamit sa app para sa "may hayop" na detection - dagdagan
@@ -94,6 +97,10 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
         DOG_CLASS_INDEX -> "aso"
         else -> "class_$classId"
     }
+
+    /** Mas mataas na bar para sa cat/dog kaysa person - tignan ang paalala sa PET_CONF_THRESHOLD. */
+    private fun thresholdFor(classId: Int): Float =
+        if (classId in PET_CLASSES) PET_CONF_THRESHOLD else CONF_THRESHOLD
 
     /** Dating behavior - "person" detections lang. Hindi ginalaw para di masira ang existing calls. */
     fun detectPersons(bitmap: Bitmap): List<Detection> {
@@ -189,7 +196,7 @@ class YoloPersonDetector(context: Context, modelAssetName: String = "yolo_person
                 }
             }
             if (bestScore > maxScore) maxScore = bestScore
-            if (bestClassId == -1 || bestScore < CONF_THRESHOLD) continue
+            if (bestClassId == -1 || bestScore < thresholdFor(bestClassId)) continue
 
             val cx = output[0][i] / INPUT_SIZE * origWidth
             val cy = output[1][i] / INPUT_SIZE * origHeight
