@@ -1,6 +1,7 @@
 package com.example.facerobot
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -17,6 +18,7 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
 import android.os.Handler
+import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.text.InputType
@@ -26,6 +28,7 @@ import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -87,9 +90,18 @@ class MainActivity : ComponentActivity() {
     private lateinit var rootLayout: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var roboEyesView: RoboEyesView
+    private lateinit var capturedPhotoView: ImageView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
     private var canEnroll = false
+
+    // ---------- TAKE A PICTURE ----------
+    @Volatile private var pendingPhotoCapture = false
+    private val photoTriggerPhrases = listOf(
+        "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato",
+        "kunan mo ako ng picture", "kuha ng picture", "magpicture",
+        "take a picture", "take picture", "picture mo ako", "kunan ng picture"
+    )
 
     private lateinit var cameraExecutor: ExecutorService
     private val httpClient = OkHttpClient.Builder()
@@ -498,6 +510,11 @@ class MainActivity : ComponentActivity() {
         rootLayout = FrameLayout(this)
         previewView = PreviewView(this)
         roboEyesView = RoboEyesView(this)
+        capturedPhotoView = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(0xFF000000.toInt())
+            visibility = View.GONE
+        }
 
         val accentColor = 0xFF00E5C7.toInt()
         val darkChip = 0xFF1E1E2E.toInt()
@@ -535,6 +552,12 @@ class MainActivity : ComponentActivity() {
         // dahil titigil ang camera frames kapag nawala ang surface niya.
         rootLayout.addView(
             roboEyesView,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        // Nasa ibabaw ng lahat (roboEyesView/previewView) - dito ipinapakita ang nakuhang
+        // litrato pagkatapos mag-"take a picture". GONE by default.
+        rootLayout.addView(
+            capturedPhotoView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         )
         rootLayout.addView(
@@ -911,6 +934,13 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processFrame(imageProxy: ImageProxy) {
+        // "Take a picture": kunin ang susunod na frame bilang litrato, kahit anong AppState/mode
+        // ang kasalukuyan, bago dumaan sa normal na nav/face processing.
+        if (pendingPhotoCapture) {
+            capturePhotoFromFrame(imageProxy)
+            return
+        }
+
         // Camera Nav: kapag naka-MOVING ang robot (o nagte-test/nagca-calibrate), ang frames ay napupunta
         // sa depth analysis at hindi sa face tracking.
         if (navTestMode && System.currentTimeMillis() > navTestUntil) navTestMode = false
@@ -1332,6 +1362,12 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // 1c) "Take a picture" - lokal din, hindi kailangan ng Gemini.
+        tryHandlePhotoCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
         // 2) Maiikling eksaktong utos (hal. "sayaw", "abante") - lokal at instant, gaya ng dati.
         val exact = findExactCustomCommand(candidates)
         if (exact != null) {
@@ -1370,13 +1406,13 @@ class MainActivity : ComponentActivity() {
             if (mentionsCamera && hasSwitchIntent) {
                 showRoboEyes = false
                 applyDisplayMode()
-                speak("Sige, ipapakita ko na ang camera.")
+                playTransitionCue("ipakita ang camera", "dfplayer play 47", "Sige, ipapakita ko na ang camera.")
                 return "display: camera"
             }
             if (mentionsEyes && hasSwitchIntent) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speak("Sige, babalik na sa mata.")
+                playTransitionCue("balik sa mata", "dfplayer play 47", "Sige, babalik na sa mata.")
                 return "display: eyes"
             }
         }
@@ -1472,6 +1508,7 @@ class MainActivity : ComponentActivity() {
 
     private fun processVoiceCommand(candidates: List<String>): String {
         tryHandleDisplayCommand(candidates)?.let { return it }
+        tryHandlePhotoCommand(candidates)?.let { return it }
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
@@ -1874,6 +1911,92 @@ class MainActivity : ComponentActivity() {
         if (degrees % 360 == 0) return src
         val matrix = Matrix().apply { postRotate(degrees.toFloat()) }
         return Bitmap.createBitmap(src, 0, 0, src.width, src.height, matrix, true)
+    }
+
+    // ---------- TAKE A PICTURE ----------
+
+    /**
+     * Nag-a-apply ng "transition cue" (DFPlayer track sa robot + TTS sa phone) tuwing may
+     * paglilipat ng display (mata <-> camera) o pagkuha ng litrato. Kung may custom command sa
+     * CommandStore na ang trigger ay "nakapaloob" sa canonicalKey (dinagdag mo via app "Mga
+     * Utos"), gagamitin ang sarili niyang action/reply sa halip na default - configurable
+     * nang walang kailangang mag-rebuild ng app.
+     */
+    private fun playTransitionCue(canonicalKey: String, defaultAction: String, defaultReply: String) {
+        val custom = commandStore.findMatch(canonicalKey)
+        val action = custom?.action?.takeIf { it.isNotBlank() } ?: defaultAction
+        val replyText = custom?.randomReply()?.takeIf { it.isNotBlank() } ?: defaultReply
+
+        executeEsp32Actions(action)
+        speak(replyText)
+    }
+
+    /**
+     * "kuha ng litrato" / "take a picture" -> lumilipat sa camera (kung nasa RoboEyes pa),
+     * nagpapatugtog ng DFPlayer track bilang audio cue habang naglilipat, tapos kukunin ang
+     * susunod na camera frame bilang litrato.
+     */
+    private fun tryHandlePhotoCommand(candidates: List<String>): String? {
+        for (text in candidates) {
+            if (photoTriggerPhrases.any { text.contains(it) }) {
+                takePictureWithTransition()
+                return "take_picture"
+            }
+        }
+        return null
+    }
+
+    private fun takePictureWithTransition() {
+        if (showRoboEyes) {
+            showRoboEyes = false
+            applyDisplayMode()
+        }
+        playTransitionCue("kuha ng litrato", "dfplayer play 47", "Kunan na kita ng litrato, ngiti ka!")
+        // bigyan ng oras ang display na maka-switch sa camera preview bago kunin ang frame
+        rootLayout.postDelayed({ pendingPhotoCapture = true }, 600)
+    }
+
+    private fun capturePhotoFromFrame(imageProxy: ImageProxy) {
+        pendingPhotoCapture = false
+        try {
+            val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            runOnUi { showCapturedPhoto(upright) }
+            savePhotoToGallery(upright)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            runOnUi { statusText.text = "Hindi nakuha ang litrato (${e.javaClass.simpleName})" }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun showCapturedPhoto(bitmap: Bitmap) {
+        capturedPhotoView.setImageBitmap(bitmap)
+        capturedPhotoView.visibility = View.VISIBLE
+        // balik sa dating display (RoboEyes/camera) pagkatapos ng ilang segundo
+        rootLayout.postDelayed({
+            capturedPhotoView.visibility = View.GONE
+        }, 4000)
+    }
+
+    private fun savePhotoToGallery(bitmap: Bitmap) {
+        try {
+            val filename = "RUSTECH_${System.currentTimeMillis()}.jpg"
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, filename)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/RUSTECH")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            uri?.let {
+                contentResolver.openOutputStream(it)?.use { out ->
+                    bitmap.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     private fun processNavFrame(imageProxy: ImageProxy) {
