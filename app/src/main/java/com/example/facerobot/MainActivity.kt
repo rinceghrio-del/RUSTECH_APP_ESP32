@@ -12,6 +12,7 @@ import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.media.MediaPlayer
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -53,7 +54,9 @@ import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
 import okhttp3.OkHttpClient
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
@@ -194,6 +197,8 @@ class MainActivity : ComponentActivity() {
     private var ttsReady = false
     // Google TTS ang preferred engine para sa Filipino (fil-PH) voice; kapag wala, default engine ng phone.
     private val preferredTtsEngine = "com.google.android.tts"
+    // "Rachel" - default/pre-made public voice ni ElevenLabs, palaging available sa bawat account.
+    private val DEFAULT_ELEVENLABS_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"
     private val ttsHandler = Handler(android.os.Looper.getMainLooper())
     private val resumeMicRunnable = Runnable {
         isSpeaking = false
@@ -220,6 +225,21 @@ class MainActivity : ComponentActivity() {
     private var appTtsEnabled: Boolean
         get() = prefs.getBoolean("app_tts_enabled", true)
         set(value) { prefs.edit().putBoolean("app_tts_enabled", value).apply() }
+
+    // ---------- ELEVENLABS TTS (opsyonal, mas magandang/natural na boses - may FREE TIER LIMIT) ----------
+    // Kapag naubos na ang free tier ni ElevenLabs (o walang internet/mali ang API key), awtomatikong
+    // babalik sa default na lokal na Android TTS - o pwede ring i-OFF na lang manually dito.
+    private var elevenLabsEnabled: Boolean
+        get() = prefs.getBoolean("elevenlabs_enabled", false)
+        set(value) { prefs.edit().putBoolean("elevenlabs_enabled", value).apply() }
+    private var elevenLabsApiKey: String
+        get() = prefs.getString("elevenlabs_api_key", "") ?: ""
+        set(value) { prefs.edit().putString("elevenlabs_api_key", value.trim()).apply() }
+    private var elevenLabsVoiceId: String
+        get() = prefs.getString("elevenlabs_voice_id", DEFAULT_ELEVENLABS_VOICE_ID) ?: DEFAULT_ELEVENLABS_VOICE_ID
+        set(value) { prefs.edit().putString("elevenlabs_voice_id", value.trim().ifEmpty { DEFAULT_ELEVENLABS_VOICE_ID }).apply() }
+    private var elevenLabsPlayer: MediaPlayer? = null
+    @Volatile private var elevenLabsBusy = false
 
     // Nagre-reset ang daily quota ng Google ng midnight Pacific time (mga 3 PM sa Pilipinas).
     private fun geminiQuotaDay(): String {
@@ -1743,9 +1763,18 @@ class MainActivity : ComponentActivity() {
 
     private fun speak(phrase: String) {
         if (!appTtsEnabled) return
-        if (!ttsReady) return
         val clean = cleanForSpeech(phrase)
         if (clean.isEmpty()) return
+
+        if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) {
+            speakWithElevenLabs(clean)
+        } else {
+            speakWithLocalTts(clean)
+        }
+    }
+
+    private fun speakWithLocalTts(clean: String) {
+        if (!ttsReady) return
         val chunks = splitForSpeech(clean)
         if (chunks.isEmpty()) return
 
@@ -1758,6 +1787,109 @@ class MainActivity : ComponentActivity() {
             val id = if (i == chunks.lastIndex) "${base}_last" else "${base}_$i"
             val mode = if (i == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
             tts?.speak(chunk, mode, null, id)
+        }
+    }
+
+    /**
+     * ElevenLabs TTS via REST API - mas natural/magandang boses kaysa sa lokal na Android TTS,
+     * pero may FREE TIER LIMIT (character quota kada buwan). Kapag OFF ang toggle, walang API
+     * key, o may nangyaring error (naubos na quota, mali ang key, walang internet), awtomatikong
+     * babalik ito sa speakWithLocalTts() - hindi tuluyang matatahimik ang robot.
+     */
+    private fun speakWithElevenLabs(clean: String) {
+        ttsHandler.removeCallbacks(resumeMicRunnable)
+        isSpeaking = true
+        speechService?.setPause(true)
+        elevenLabsBusy = true
+
+        val json = JSONObject().apply {
+            put("text", clean)
+            put("model_id", "eleven_multilingual_v2")
+            put("voice_settings", JSONObject().apply {
+                put("stability", 0.5)
+                put("similarity_boost", 0.75)
+            })
+        }
+        val body = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("https://api.elevenlabs.io/v1/text-to-speech/$elevenLabsVoiceId")
+            .addHeader("xi-api-key", elevenLabsApiKey)
+            .addHeader("Accept", "audio/mpeg")
+            .post(body)
+            .build()
+
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi {
+                    elevenLabsBusy = false
+                    addVoiceLogEntry("ElevenLabs TTS", "HTTP FAILED: ${e.message} - fallback sa lokal na TTS")
+                    speakWithLocalTts(clean)
+                }
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    // Kadalasang dahilan dito: naubos na ang free tier (401/429) o mali ang API key/voice ID.
+                    runOnUi {
+                        elevenLabsBusy = false
+                        addVoiceLogEntry("ElevenLabs TTS", "HTTP ${response.code} - fallback sa lokal na TTS")
+                        statusText.text = "⚠️ ElevenLabs error (${response.code}) - gamit muna lokal na TTS"
+                    }
+                    response.close()
+                    runOnUi { speakWithLocalTts(clean) }
+                    return
+                }
+
+                val audioBytes = try {
+                    response.body?.bytes()
+                } catch (e: Exception) {
+                    null
+                } finally {
+                    response.close()
+                }
+
+                if (audioBytes == null || audioBytes.isEmpty()) {
+                    runOnUi {
+                        elevenLabsBusy = false
+                        addVoiceLogEntry("ElevenLabs TTS", "Walang laman ang sagot - fallback sa lokal na TTS")
+                        speakWithLocalTts(clean)
+                    }
+                    return
+                }
+
+                runOnUi { playElevenLabsAudio(audioBytes, clean) }
+            }
+        })
+    }
+
+    private fun playElevenLabsAudio(audioBytes: ByteArray, fallbackText: String) {
+        try {
+            val tempFile = File(cacheDir, "elevenlabs_${System.currentTimeMillis()}.mp3")
+            FileOutputStream(tempFile).use { it.write(audioBytes) }
+
+            elevenLabsPlayer?.release()
+            elevenLabsPlayer = MediaPlayer().apply {
+                setDataSource(tempFile.absolutePath)
+                setOnPreparedListener { it.start() }
+                setOnCompletionListener {
+                    elevenLabsBusy = false
+                    it.release()
+                    tempFile.delete()
+                    scheduleMicResume()
+                }
+                setOnErrorListener { mp, _, _ ->
+                    elevenLabsBusy = false
+                    mp.release()
+                    tempFile.delete()
+                    scheduleMicResume()
+                    true
+                }
+                prepareAsync()
+            }
+        } catch (e: Exception) {
+            elevenLabsBusy = false
+            addVoiceLogEntry("ElevenLabs TTS", "Playback error: ${e.message} - fallback sa lokal na TTS")
+            speakWithLocalTts(fallbackText)
         }
     }
 
@@ -2471,6 +2603,36 @@ class MainActivity : ComponentActivity() {
             textSize = 11f
             setPadding(0, 0, 0, 24)
         }
+        val elevenLabsSwitch = Switch(this).apply {
+            text = "🎙️ Gamitin ang ElevenLabs (mas natural na boses)"
+            isChecked = elevenLabsEnabled
+            setPadding(0, 0, 0, 8)
+        }
+        val elevenLabsNote = TextView(this).apply {
+            text = "May FREE TIER LIMIT ang ElevenLabs (character quota kada buwan). Pag naubos na o may error, " +
+                "AWTOMATIKONG babalik sa lokal na Android TTS habang naka-ON pa rin ang switch na ito - " +
+                "pero pwede mo ring i-OFF dito anumang oras para talagang bumalik sa lokal na TTS."
+            textSize = 11f
+            setPadding(0, 0, 0, 16)
+        }
+        val elevenLabsKeyLabel = TextView(this).apply { text = "ElevenLabs API key (kunin sa elevenlabs.io):" }
+        val elevenLabsKeyInput = EditText(this).apply {
+            hint = "sk_..."
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(elevenLabsApiKey)
+            setSingleLine(true)
+        }
+        val elevenLabsVoiceLabel = TextView(this).apply {
+            text = "Voice ID (default: Rachel):"
+            setPadding(0, 16, 0, 0)
+        }
+        val elevenLabsVoiceInput = EditText(this).apply {
+            hint = DEFAULT_ELEVENLABS_VOICE_ID
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(elevenLabsVoiceId)
+            setSingleLine(true)
+            setPadding(0, 0, 0, 24)
+        }
         val usageText = TextView(this).apply {
             text = "📊 Nagamit ngayong araw: ${geminiUsedToday()} / $geminiDailyLimit requests\n(nagre-reset ~3 PM oras sa Pilipinas)"
             textSize = 13f
@@ -2511,6 +2673,12 @@ class MainActivity : ComponentActivity() {
         container.addView(enabledSwitch)
         container.addView(ttsSwitch)
         container.addView(ttsNote)
+        container.addView(elevenLabsSwitch)
+        container.addView(elevenLabsNote)
+        container.addView(elevenLabsKeyLabel)
+        container.addView(elevenLabsKeyInput)
+        container.addView(elevenLabsVoiceLabel)
+        container.addView(elevenLabsVoiceInput)
         container.addView(usageText)
         container.addView(keyLabel)
         container.addView(keyInput)
@@ -2526,6 +2694,9 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Save") { _, _ ->
                 geminiEnabled = enabledSwitch.isChecked
                 appTtsEnabled = ttsSwitch.isChecked
+                elevenLabsEnabled = elevenLabsSwitch.isChecked
+                elevenLabsApiKey = elevenLabsKeyInput.text.toString()
+                elevenLabsVoiceId = elevenLabsVoiceInput.text.toString()
                 geminiApiKey = keyInput.text.toString()
                 geminiModel = modelInput.text.toString()
                 limitInput.text.toString().trim().toIntOrNull()?.let { geminiDailyLimit = it }
@@ -2847,6 +3018,7 @@ class MainActivity : ComponentActivity() {
         ttsHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()
+        elevenLabsPlayer?.release()
         speechService?.stop()
         speechService?.shutdown()
     }
