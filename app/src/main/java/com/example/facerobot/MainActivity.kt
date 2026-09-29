@@ -2010,10 +2010,16 @@ class MainActivity : ComponentActivity() {
     private fun showCapturedPhoto(bitmap: Bitmap) {
         capturedPhotoView.setImageBitmap(bitmap)
         capturedPhotoView.visibility = View.VISIBLE
-        // balik sa dating display (RoboEyes/camera) pagkatapos ng ilang segundo
+        // ipakita ng 5 segundo, tapos itago at bumalik sa mata (RoboEyes) - hindi lang basta
+        // ibabalik sa live camera preview.
         rootLayout.postDelayed({
             capturedPhotoView.visibility = View.GONE
-        }, 4000)
+            if (!showRoboEyes) {
+                showRoboEyes = true
+                applyDisplayMode()
+                playTransitionCue("balik sa mata", "dfplayer play 47", "Sige, babalik na sa mata.")
+            }
+        }, 5000)
     }
 
     private fun savePhotoToGallery(bitmap: Bitmap) {
