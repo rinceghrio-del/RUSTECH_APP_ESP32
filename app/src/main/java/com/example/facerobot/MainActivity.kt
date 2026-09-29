@@ -450,6 +450,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendPlayTrack(track: Int) {
+        // Kapag naka-ON ang Gemini AI mode, app TTS na lang ang tanging boses - hindi na
+        // pinapatugtog ang DFPlayer/ESP32 voice dito para hindi magsabay/magkagulo ang dalawang
+        // audio habang nakikipag-usap kay Gemini.
+        if (geminiEnabled) return
+
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
             .build()
@@ -474,6 +479,14 @@ class MainActivity : ComponentActivity() {
      * DFPlayer serial).
      */
     private fun sendPlayTrackThen(track: Int, onDone: () -> Unit) {
+        // Pareho ng sendPlayTrack(): naka-mute ang DFPlayer voice habang naka-ON ang Gemini AI
+        // mode. Tuloy pa rin agad ang onDone() para gumana pa rin ang kasunod na movement sa
+        // isang "||"-combo action kahit naka-skip ang bahaging dfplayer.
+        if (geminiEnabled) {
+            onDone()
+            return
+        }
+
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
             .build()
@@ -1156,8 +1169,11 @@ class MainActivity : ComponentActivity() {
         lastGreetedTime = now
 
         val tracks = greetingTracksFor(name)
-        if (tracks.isNotEmpty()) {
+        if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
+        } else if (geminiEnabled) {
+            // Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - app TTS na lang.
+            speak("Kumusta, $name!")
         }
     }
 
@@ -1167,10 +1183,11 @@ class MainActivity : ComponentActivity() {
         lastUnknownGreetTime = now
 
         val tracks = unknownGreetingTrackList()
-        if (tracks.isNotEmpty()) {
+        if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
         } else if (ttsReady) {
-            // Fallback sa TTS kung wala pang na-set na DFPlayer tracks
+            // Fallback sa TTS kung wala pang na-set na DFPlayer tracks, o naka-mute ito
+            // dahil naka-ON ang Gemini AI mode.
             speak(unknownGreetings.random())
         }
     }
@@ -1183,8 +1200,9 @@ class MainActivity : ComponentActivity() {
         // Pareho ng greetIfNeeded(name) sa tao: gamit ang parehong "greeting_tracks" store,
         // dahil "aso"/"pusa" mismo ang label - kaya kung nag-set ka ng tracks sa Greeting
         // Tracks dialog gamit "aso" o "pusa" bilang pangalan, gagana na agad ito dito.
+        // (Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - tuloy sa TTS fallback.)
         val tracks = greetingTracksFor(label)
-        if (tracks.isNotEmpty()) {
+        if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
             return
         }
