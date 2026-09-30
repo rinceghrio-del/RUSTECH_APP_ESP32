@@ -1527,7 +1527,7 @@ class MainActivity : ComponentActivity() {
             if (mentionsEyes && hasSwitchIntent) {
                 showRoboEyes = true
                 applyDisplayMode()
-                playTransitionCue("balik sa mata", "dfplayer play 47", "Sige, babalik na sa mata.")
+                speakTransitionCue("balik sa mata", "")
                 return "display: eyes"
             }
         }
@@ -1616,9 +1616,21 @@ class MainActivity : ComponentActivity() {
                         is GeminiBrain.Result.Ok -> onGeminiReply(question, result.reply)
                         is GeminiBrain.Result.Fail -> onGeminiFail(listOf(question), result)
                     }
+                    // Pagkatapos "makita" at masagot, bumalik ng tahimik sa mata (RoboEyes) -
+                    // walang dagdag na cue/tunog dito, dahil nasabi na ang sagot mismo kanina.
+                    returnToEyesAfterVision()
                 }
             }
         }
+    }
+
+    private fun returnToEyesAfterVision() {
+        rootLayout.postDelayed({
+            if (!showRoboEyes) {
+                showRoboEyes = true
+                applyDisplayMode()
+            }
+        }, 6000)
     }
 
     private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply) {
@@ -2248,6 +2260,18 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * Kagaya ng playTransitionCue() pero WALANG DFPlayer/ESP32 track - TTS na lang. Ginagamit
+     * ito SPESIPIKO sa paglipat PABALIK sa mata (RoboEyes): ang DFPlayer track 47 ay naka-laan
+     * na lang sa paglipat PAPUNTANG camera, para may malinaw na pagkakaiba ang dalawang
+     * direksyon ng transition.
+     */
+    private fun speakTransitionCue(canonicalKey: String, defaultReply: String) {
+        val custom = commandStore.findMatch(canonicalKey)
+        val replyText = custom?.randomReply()?.takeIf { it.isNotBlank() } ?: defaultReply
+        speak(replyText)
+    }
+
+    /**
      * "kuha ng litrato" / "take a picture" -> lumilipat sa camera (kung nasa RoboEyes pa),
      * nagpapatugtog ng DFPlayer track bilang audio cue habang naglilipat, tapos kukunin ang
      * susunod na camera frame bilang litrato.
@@ -2297,7 +2321,7 @@ class MainActivity : ComponentActivity() {
             if (!showRoboEyes) {
                 showRoboEyes = true
                 applyDisplayMode()
-                playTransitionCue("balik sa mata", "dfplayer play 47", "Sige, babalik na sa mata.")
+                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
             }
         }, 5000)
     }
