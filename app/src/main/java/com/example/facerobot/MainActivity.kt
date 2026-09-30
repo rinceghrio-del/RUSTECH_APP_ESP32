@@ -1613,7 +1613,7 @@ class MainActivity : ComponentActivity() {
                 runOnUi {
                     geminiBusy = false
                     when (result) {
-                        is GeminiBrain.Result.Ok -> onGeminiReply(question, result.reply)
+                        is GeminiBrain.Result.Ok -> onGeminiReply(question, result.reply, allowAction = false)
                         is GeminiBrain.Result.Fail -> onGeminiFail(listOf(question), result)
                     }
                     // Pagkatapos "makita" at masagot, bumalik ng tahimik sa mata (RoboEyes) -
@@ -1633,9 +1633,12 @@ class MainActivity : ComponentActivity() {
         }, 6000)
     }
 
-    private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply) {
+    private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply, allowAction: Boolean = true) {
         val text = reply.text.trim()
-        val action = reply.action.uppercase()
+        // Sa vision Q&A (allowAction = false), pinipilit nating "NONE" kahit ano pa ang ibalik
+        // ni Gemini - puro impormasyon lang dapat ang sagot dito, hindi galaw/STOP papunta sa
+        // ESP32 (na may sariling voice announcement ang ESP32 firmware kapag natanggap ang STOP).
+        val action = if (allowAction) reply.action.uppercase() else "NONE"
 
         if (text.isEmpty() && action == "NONE") {
             statusText.text = "[MIC] (hindi para sa akin) $heardText"
