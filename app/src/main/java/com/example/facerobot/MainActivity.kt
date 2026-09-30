@@ -2324,7 +2324,7 @@ class MainActivity : ComponentActivity() {
             if (!showRoboEyes) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
+                speakTransitionCue("balik sa mata", "")
             }
         }, 5000)
     }
