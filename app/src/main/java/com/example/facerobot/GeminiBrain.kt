@@ -225,6 +225,105 @@ class GeminiBrain(baseClient: OkHttpClient) {
         return Result.Ok(Reply(replyText, action))
     }
 
+    // ---------------------------------------------------------------------------------------
+    // PANINGIN (vision): ipinapadala ang isang larawan mula sa camera kasama ang tanong,
+    // para masagot ni Gemini base sa AKTWAL na nakikita niya (hal. "ano ginagawa ko",
+    // "ano ang mga bagay na nasa harap mo"). Hindi ito idinadagdag sa conversation history -
+    // hiwalay na uri ito ng interaction, hindi bahagi ng regular na usapan.
+
+    fun see(
+        apiKey: String,
+        model: String,
+        imageBase64: String,
+        question: String,
+        situation: Situation,
+        onResult: (Result) -> Unit
+    ) {
+        if (apiKey.isBlank()) {
+            onResult(Result.Fail(FailKind.NO_KEY, "walang API key"))
+            return
+        }
+        if (imageBase64.isBlank()) {
+            onResult(Result.Fail(FailKind.OTHER, "walang larawan"))
+            return
+        }
+
+        val body = JSONObject().apply {
+            put(
+                "systemInstruction",
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", buildVisionSystemPrompt(situation))))
+            )
+            put("contents", JSONArray().put(
+                JSONObject().put("role", "user").put("parts", JSONArray().apply {
+                    put(JSONObject().put(
+                        "inlineData",
+                        JSONObject().put("mimeType", "image/jpeg").put("data", imageBase64)
+                    ))
+                    put(JSONObject().put("text", question))
+                })
+            ))
+            put("generationConfig", JSONObject().apply {
+                put("temperature", 0.6)
+                put("maxOutputTokens", 512)
+                put("responseMimeType", "application/json")
+                put("responseSchema", JSONObject().apply {
+                    put("type", "OBJECT")
+                    put("properties", JSONObject().apply {
+                        put("reply", JSONObject().put("type", "STRING"))
+                        put("action", JSONObject().put("type", "STRING"))
+                    })
+                    put("required", JSONArray().put("reply").put("action"))
+                })
+            })
+        }
+
+        val cleanModel = model.trim().removePrefix("models/").ifEmpty { DEFAULT_MODEL }
+        val request = Request.Builder()
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$cleanModel:generateContent")
+            .header("x-goog-api-key", apiKey.trim())
+            .post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                onResult(Result.Fail(FailKind.NETWORK, e.message ?: "network error"))
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                val result = response.use { r ->
+                    val text = try { r.body?.string() ?: "" } catch (e: IOException) { "" }
+                    parseResponse(r.code, text)
+                }
+                onResult(result)
+            }
+        })
+    }
+
+    private fun buildVisionSystemPrompt(s: Situation): String {
+        val who = s.recognizedName?.takeIf { it.isNotBlank() }?.let { "Kilala mo ang kausap mo: si $it." }
+            ?: "Hindi mo pa kilala ang kausap mo (o walang mukhang nakikita ngayon)."
+
+        return """
+Ikaw si RUSTECH - isang maliit na robot na may camera. Tinitignan mo ngayon ang larawang nakuha mismo ng camera mo, at tatanungin ka base dito.
+
+$who
+
+PAANO SASAGOT:
+- Sagutin ang tanong base sa AKTWAL na nakikita mo sa larawan - wag mag-imbento ng detalye na wala doon.
+- Kung tungkol sa taong nasa harap mo ang tanong (ano ginagawa niya, ano suot niya, atbp.), ilarawan base sa aktwal na makikita - postura, galaw, ekspresyon, suot.
+- Kung tungkol sa mga bagay/gamit ang tanong, tukuyin nang tama ang mga nakikita mo, maikli lang.
+- Wika: natural na Tagalog/Taglish na gamit ng ordinaryong Pilipino. Kung English ang tanong, sumagot ng English.
+- Maikli: 1-2 pangungusap lang, dahil boses ang labas. Walang markdown, walang emoji, walang bullet, walang asterisk.
+- May personalidad kang masayahin at medyo pilyo, pero diretso sa sagot base sa larawan.
+- Kung malabo o hindi malinaw ang makikita (madilim, malayo, blurred, walang laman ang frame), sabihin nang tapat na hindi malinaw makita, wag magsapantaha.
+- Wag banggitin na "larawan" o "image" o "photo" - parang totoong nakikita mo mismo ito sa harap mo ngayon gamit ang mata/camera mo.
+
+MGA KILOS (action): NONE lang palagi dito, MALIBAN kung malinaw na hiniling sa tanong na kumilos ka rin habang sumasagot (hal. "sayaw nga habang sinasabi mo kung ano nakikita mo") - kung ganon, isa sa: FORWARD, BACKWARD, LEFT, RIGHT, STOP, DANCE, SHAKING, LASER_ON, LASER_OFF.
+
+Laging JSON ang sagot: {"reply": "...", "action": "..."}
+        """.trimIndent()
+    }
+
     private fun buildSystemPrompt(s: Situation): String {
         val now = SimpleDateFormat("EEEE, MMMM d, yyyy 'ng' h:mm a", Locale.US).format(Date())
         val who = s.recognizedName?.takeIf { it.isNotBlank() }?.let { "Kilala mo ang kausap mo: si $it." }
