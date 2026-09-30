@@ -12,7 +12,9 @@ import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
+import android.media.AudioManager
 import android.media.MediaPlayer
+import android.media.audiofx.LoudnessEnhancer
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -104,6 +106,21 @@ class MainActivity : ComponentActivity() {
         "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato",
         "kunan mo ako ng picture", "kuha ng picture", "magpicture",
         "take a picture", "take picture", "picture mo ako", "kunan ng picture"
+    )
+
+    // ---------- PANINGIN NI GEMINI (vision) ----------
+    // Continuation callback na tatawagin sa susunod na na-process na camera frame - dito ipinapasa
+    // ang nakuhang Bitmap papunta sa askGeminiVision() flow.
+    @Volatile private var pendingVisionCapture: ((Bitmap) -> Unit)? = null
+    private val visionTriggerPhrases = listOf(
+        "ano ang nakikita mo", "ano nakikita mo", "ano makikita mo",
+        "ano ang meron sa harap", "anong meron sa harap", "ano meron sa harap mo",
+        "ano ginagawa ko", "ano ang ginagawa ko", "ano ba ginagawa ko", "ano ang ginagawa niya",
+        "ano yan", "ano 'yan", "ano ito", "ano 'to", "anong iyan", "anong ito",
+        "kilalanin mo", "kilala mo ba ito", "kilala mo ba yan",
+        "ano suot ko", "ano ang suot ko",
+        "ano hawak ko", "ano ang hawak ko",
+        "tignan mo ako", "tingnan mo ako", "tignan mo ito", "tingnan mo ito"
     )
 
     private lateinit var cameraExecutor: ExecutorService
@@ -238,7 +255,15 @@ class MainActivity : ComponentActivity() {
     private var elevenLabsVoiceId: String
         get() = prefs.getString("elevenlabs_voice_id", DEFAULT_ELEVENLABS_VOICE_ID) ?: DEFAULT_ELEVENLABS_VOICE_ID
         set(value) { prefs.edit().putString("elevenlabs_voice_id", value.trim().ifEmpty { DEFAULT_ELEVENLABS_VOICE_ID }).apply() }
+    // Dagdag na "loudness" LAGPAS sa 100% system volume, gamit ang Android LoudnessEnhancer -
+    // dito lang gumagana (ElevenLabs playback), dahil dito lang tayo may tunay na MediaPlayer.
+    // 0 = walang extra boost, 10-15 = katamtaman, 20+ = medyo malakas na (posibleng may distortion
+    // depende sa speaker ng phone).
+    private var elevenLabsVolumeBoostDb: Int
+        get() = prefs.getInt("elevenlabs_volume_boost_db", 10)
+        set(value) { prefs.edit().putInt("elevenlabs_volume_boost_db", value.coerceIn(0, 40)).apply() }
     private var elevenLabsPlayer: MediaPlayer? = null
+    private var elevenLabsLoudnessEnhancer: LoudnessEnhancer? = null
     @Volatile private var elevenLabsBusy = false
 
     // Nagre-reset ang daily quota ng Google ng midnight Pacific time (mga 3 PM sa Pilipinas).
@@ -987,6 +1012,15 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // "Paningin" ni Gemini: kunin ang susunod na frame para ipadala kasama ng tanong
+        // (hal. "ano ginagawa ko", "ano ang nakikita mo") - gaya rin ng take-a-picture, kahit
+        // anong AppState/mode ang kasalukuyan.
+        pendingVisionCapture?.let { callback ->
+            pendingVisionCapture = null
+            captureFrameForVision(imageProxy, callback)
+            return
+        }
+
         // Camera Nav: kapag naka-MOVING ang robot (o nagte-test/nagca-calibrate), ang frames ay napupunta
         // sa depth analysis at hindi sa face tracking.
         if (navTestMode && System.currentTimeMillis() > navTestUntil) navTestMode = false
@@ -1451,6 +1485,13 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // 2b) Vision question (hal. "ano nakikita mo", "ano ginagawa ko") - hiwalay na Gemini
+        // call na may kasamang larawan mula sa camera.
+        tryHandleVisionCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
         // 3) Lahat ng iba - kay RUSTECH (Gemini) na.
         if (geminiBusy) {
             addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si RUSTECH)")
@@ -1524,6 +1565,57 @@ class MainActivity : ComponentActivity() {
                 when (result) {
                     is GeminiBrain.Result.Ok -> onGeminiReply(heardText, result.reply)
                     is GeminiBrain.Result.Fail -> onGeminiFail(candidates, result)
+                }
+            }
+        }
+    }
+
+    /**
+     * "ano nakikita mo", "ano ginagawa ko", atbp -> hiwalay na Gemini call (geminiBrain.see())
+     * na may kasamang aktwal na larawan mula sa camera - hindi ito bahagi ng regular na
+     * usapan/history, kaya hiwalay ito sa normal na askGemini().
+     */
+    private fun tryHandleVisionCommand(candidates: List<String>): String? {
+        val question = candidates.firstOrNull { text -> visionTriggerPhrases.any { text.contains(it) } }
+            ?: return null
+
+        if (geminiBusy) return "na-ignore (nag-iisip pa si RUSTECH)"
+        val now = System.currentTimeMillis()
+        if (now - lastGeminiRequestTime < geminiMinIntervalMs) return "na-ignore (masyadong mabilis)"
+
+        askGeminiVision(question)
+        return "gemini_vision: \"$question\""
+    }
+
+    private fun askGeminiVision(question: String) {
+        geminiBusy = true
+        lastGeminiRequestTime = System.currentTimeMillis()
+        bumpGeminiCount()
+        statusText.text = "👁️ Tumitingin... ($question)"
+
+        // Kailangan ng live camera view para may makuhang larawan - lumipat muna papuntang
+        // camera kung nasa mata (RoboEyes) pa, gamit ang parehong transition cue.
+        if (showRoboEyes) {
+            showRoboEyes = false
+            applyDisplayMode()
+            playTransitionCue("ipakita ang camera", "dfplayer play 47", "Sandali lang, tumitingin ako...")
+        }
+
+        pendingVisionCapture = { bitmap ->
+            val imageBase64 = bitmapToBase64Jpeg(bitmap)
+            geminiBrain.see(
+                apiKey = geminiApiKey,
+                model = geminiModel,
+                imageBase64 = imageBase64,
+                question = question,
+                situation = GeminiBrain.Situation(currentRecognizedName, commandStore.all())
+            ) { result ->
+                runOnUi {
+                    geminiBusy = false
+                    when (result) {
+                        is GeminiBrain.Result.Ok -> onGeminiReply(question, result.reply)
+                        is GeminiBrain.Result.Fail -> onGeminiFail(listOf(question), result)
+                    }
                 }
             }
         }
@@ -1766,10 +1858,26 @@ class MainActivity : ComponentActivity() {
         val clean = cleanForSpeech(phrase)
         if (clean.isEmpty()) return
 
+        ensureMaxMediaVolume()
+
         if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) {
             speakWithElevenLabs(clean)
         } else {
             speakWithLocalTts(clean)
+        }
+    }
+
+    /** Siguraduhing naka-max ang STREAM_MUSIC volume ng phone bago magsalita, kahit may ibang
+     * app o proseso na nagpaliit dito - para gamit ang buong lakas ng volume slider. */
+    private fun ensureMaxMediaVolume() {
+        try {
+            val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+            val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+            if (am.getStreamVolume(AudioManager.STREAM_MUSIC) < max) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0)
+            }
+        } catch (e: Exception) {
+            // hindi kritikal - basta hindi mag-crash
         }
     }
 
@@ -1867,18 +1975,40 @@ class MainActivity : ComponentActivity() {
             val tempFile = File(cacheDir, "elevenlabs_${System.currentTimeMillis()}.mp3")
             FileOutputStream(tempFile).use { it.write(audioBytes) }
 
+            elevenLabsLoudnessEnhancer?.release()
+            elevenLabsLoudnessEnhancer = null
             elevenLabsPlayer?.release()
             elevenLabsPlayer = MediaPlayer().apply {
                 setDataSource(tempFile.absolutePath)
-                setOnPreparedListener { it.start() }
+                setOnPreparedListener { mp ->
+                    // Dagdag na "loudness" LAGPAS sa 100% system volume - kailangan ng aktwal
+                    // na audioSessionId ng MediaPlayer na ito, kaya dito lang natin ito ikakabit,
+                    // pagkatapos ma-prepare, bago tumugtog.
+                    if (elevenLabsVolumeBoostDb > 0) {
+                        try {
+                            val enhancer = LoudnessEnhancer(mp.audioSessionId)
+                            enhancer.setTargetGain(elevenLabsVolumeBoostDb * 100) // dB -> millibel
+                            enhancer.enabled = true
+                            elevenLabsLoudnessEnhancer = enhancer
+                        } catch (e: Exception) {
+                            // ilang phone/OEM audio chip ay hindi sumusuporta sa effect na ito -
+                            // hindi kritikal, tutuloy lang nang walang extra boost.
+                        }
+                    }
+                    mp.start()
+                }
                 setOnCompletionListener {
                     elevenLabsBusy = false
+                    elevenLabsLoudnessEnhancer?.release()
+                    elevenLabsLoudnessEnhancer = null
                     it.release()
                     tempFile.delete()
                     scheduleMicResume()
                 }
                 setOnErrorListener { mp, _, _ ->
                     elevenLabsBusy = false
+                    elevenLabsLoudnessEnhancer?.release()
+                    elevenLabsLoudnessEnhancer = null
                     mp.release()
                     tempFile.delete()
                     scheduleMicResume()
@@ -2189,6 +2319,30 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             e.printStackTrace()
         }
+    }
+
+    /** Kagaya ng capturePhotoFromFrame() pero para sa "paningin" ni Gemini - hindi ise-save sa
+     * gallery o ipapakita sa screen, dadaan lang sa onCaptured() callback papunta kay Gemini. */
+    private fun captureFrameForVision(imageProxy: ImageProxy, onCaptured: (Bitmap) -> Unit) {
+        try {
+            val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
+            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            runOnUi { onCaptured(upright) }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            runOnUi {
+                geminiBusy = false
+                statusText.text = "Hindi nakuha ang larawan para kay Gemini (${e.javaClass.simpleName})"
+            }
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun bitmapToBase64Jpeg(bitmap: Bitmap): String {
+        val stream = java.io.ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, 80, stream)
+        return android.util.Base64.encodeToString(stream.toByteArray(), android.util.Base64.NO_WRAP)
     }
 
     private fun processNavFrame(imageProxy: ImageProxy) {
@@ -2633,6 +2787,21 @@ class MainActivity : ComponentActivity() {
             setSingleLine(true)
             setPadding(0, 0, 0, 24)
         }
+        val elevenLabsBoostLabel = TextView(this).apply {
+            text = "🔊 Extra Volume Boost (dB, 0-40 - lagpas sa system volume):"
+        }
+        val elevenLabsBoostInput = EditText(this).apply {
+            hint = "10"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(elevenLabsVolumeBoostDb.toString())
+            setSingleLine(true)
+        }
+        val elevenLabsBoostNote = TextView(this).apply {
+            text = "0 = walang dagdag na boost. Mas mataas = mas malakas, pero posibleng magka-distortion/" +
+                "crackle depende sa speaker ng phone mo - subukan lang at hanapin ang sweet spot."
+            textSize = 11f
+            setPadding(0, 0, 0, 24)
+        }
         val usageText = TextView(this).apply {
             text = "📊 Nagamit ngayong araw: ${geminiUsedToday()} / $geminiDailyLimit requests\n(nagre-reset ~3 PM oras sa Pilipinas)"
             textSize = 13f
@@ -2679,6 +2848,9 @@ class MainActivity : ComponentActivity() {
         container.addView(elevenLabsKeyInput)
         container.addView(elevenLabsVoiceLabel)
         container.addView(elevenLabsVoiceInput)
+        container.addView(elevenLabsBoostLabel)
+        container.addView(elevenLabsBoostInput)
+        container.addView(elevenLabsBoostNote)
         container.addView(usageText)
         container.addView(keyLabel)
         container.addView(keyInput)
@@ -2697,6 +2869,7 @@ class MainActivity : ComponentActivity() {
                 elevenLabsEnabled = elevenLabsSwitch.isChecked
                 elevenLabsApiKey = elevenLabsKeyInput.text.toString()
                 elevenLabsVoiceId = elevenLabsVoiceInput.text.toString()
+                elevenLabsBoostInput.text.toString().trim().toIntOrNull()?.let { elevenLabsVolumeBoostDb = it }
                 geminiApiKey = keyInput.text.toString()
                 geminiModel = modelInput.text.toString()
                 limitInput.text.toString().trim().toIntOrNull()?.let { geminiDailyLimit = it }
@@ -3018,6 +3191,7 @@ class MainActivity : ComponentActivity() {
         ttsHandler.removeCallbacksAndMessages(null)
         tts?.stop()
         tts?.shutdown()
+        elevenLabsLoudnessEnhancer?.release()
         elevenLabsPlayer?.release()
         speechService?.stop()
         speechService?.shutdown()
