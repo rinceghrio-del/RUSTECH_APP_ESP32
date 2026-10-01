@@ -222,7 +222,7 @@ class MainActivity : ComponentActivity() {
         speechService?.setPause(false)
     }
 
-    // ---------- GEMINI (utak ni RUSTECH) ----------
+    // ---------- GEMINI (utak ni Rustech) ----------
     private val geminiBrain by lazy { GeminiBrain(httpClient) }
     private var geminiEnabled: Boolean
         get() = prefs.getBoolean("gemini_enabled", true)
@@ -789,7 +789,7 @@ class MainActivity : ComponentActivity() {
         }
 
         val geminiOption = Button(this).apply {
-            text = "🧠  Gemini AI (utak ni RUSTECH)"
+            text = "🧠  Gemini AI (utak ni Rustech)"
             textSize = 14f
             isAllCaps = false
             setTextColor(0xFF04342C.toInt())
@@ -1226,8 +1226,13 @@ class MainActivity : ComponentActivity() {
         if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
         } else if (geminiEnabled) {
-            // Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - app TTS na lang.
-            speak("Kumusta, $name!")
+            // Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - subukang gawing
+            // bago/iba-iba ang bati sa pamamagitan ni Gemini, may fallback pa rin kung mabigo.
+            sayDynamicOrFallback(
+                "May nakita kang kilalang kaibigan/kasama na si $name sa harap mo ngayon - " +
+                    "batiin mo siya nang maikli at natural, parang kakakita mo lang talaga sa kanya.",
+                "Kumusta, $name!"
+            )
         }
     }
 
@@ -1239,9 +1244,14 @@ class MainActivity : ComponentActivity() {
         val tracks = unknownGreetingTrackList()
         if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
+        } else if (geminiEnabled) {
+            sayDynamicOrFallback(
+                "May nakita kang BAGONG tao sa harap mo na hindi mo pa kilala - batiin mo siya " +
+                    "nang friendly, maikli, at natural.",
+                unknownGreetings.random()
+            )
         } else if (ttsReady) {
-            // Fallback sa TTS kung wala pang na-set na DFPlayer tracks, o naka-mute ito
-            // dahil naka-ON ang Gemini AI mode.
+            // Fallback sa TTS kung wala pang na-set na DFPlayer tracks (at OFF ang Gemini).
             speak(unknownGreetings.random())
         }
     }
@@ -1261,10 +1271,19 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // Walang naka-set na DFPlayer track para dito - fallback sa TTS, gaya ng dati.
+        val options = petGreetings[label]
+        if (geminiEnabled && options != null) {
+            sayDynamicOrFallback(
+                "May nakita kang $label sa harap ng camera mo ngayon - magreact ka nang maikli " +
+                    "at masaya, parang kakakita mo lang talaga.",
+                options.random()
+            )
+            return
+        }
+
+        // Walang naka-set na DFPlayer track, at OFF ang Gemini - fallback sa TTS, gaya ng dati.
         if (!ttsReady) return
-        val options = petGreetings[label] ?: return
-        speak(options.random())
+        if (options != null) speak(options.random())
     }
 
     // ---------- Vosk offline voice recognition ----------
@@ -1492,9 +1511,9 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // 3) Lahat ng iba - kay RUSTECH (Gemini) na.
+        // 3) Lahat ng iba - kay Rustech (Gemini) na.
         if (geminiBusy) {
-            addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si RUSTECH)")
+            addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si Rustech)")
             return
         }
         val now = System.currentTimeMillis()
@@ -1527,7 +1546,7 @@ class MainActivity : ComponentActivity() {
             if (mentionsEyes && hasSwitchIntent) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speakTransitionCue("balik sa mata", "")
+                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
                 return "display: eyes"
             }
         }
@@ -1579,7 +1598,7 @@ class MainActivity : ComponentActivity() {
         val question = candidates.firstOrNull { text -> visionTriggerPhrases.any { text.contains(it) } }
             ?: return null
 
-        if (geminiBusy) return "na-ignore (nag-iisip pa si RUSTECH)"
+        if (geminiBusy) return "na-ignore (nag-iisip pa si Rustech)"
         val now = System.currentTimeMillis()
         if (now - lastGeminiRequestTime < geminiMinIntervalMs) return "na-ignore (masyadong mabilis)"
 
@@ -1633,6 +1652,41 @@ class MainActivity : ComponentActivity() {
         }, 6000)
     }
 
+    /**
+     * Sinusubukang gumawa ng BAGO at IBA-IBA na linya kay Gemini (geminiBrain.sayLine())
+     * base sa isinalaysay na sitwasyon - para sa mga pagkakataon na dating parehong salita lang
+     * palagi (greeting, transition cue). Kung naka-OFF ang Gemini, walang API key, busy pa sa
+     * ibang request, naabot na ang daily limit, o nabigo ang request - gagamitin ang "fallback"
+     * (yung orihinal na naka-hardcode na linya) sa halip, kaya laging may boses pa rin.
+     */
+    private fun sayDynamicOrFallback(situationCue: String, fallback: String) {
+        val now = System.currentTimeMillis()
+        val canCallGemini = geminiEnabled && geminiApiKey.isNotBlank() && !geminiBusy &&
+            now - lastGeminiRequestTime >= geminiMinIntervalMs &&
+            now >= geminiCooldownUntil && geminiUsedToday() < geminiDailyLimit
+
+        if (!canCallGemini) {
+            speak(fallback)
+            return
+        }
+
+        geminiBusy = true
+        lastGeminiRequestTime = now
+        bumpGeminiCount()
+        geminiBrain.sayLine(geminiApiKey, geminiModel, situationCue) { result ->
+            runOnUi {
+                geminiBusy = false
+                when (result) {
+                    is GeminiBrain.Result.Ok -> {
+                        val text = result.reply.text.trim()
+                        speak(if (text.isNotEmpty()) text else fallback)
+                    }
+                    is GeminiBrain.Result.Fail -> speak(fallback)
+                }
+            }
+        }
+    }
+
     private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply, allowAction: Boolean = true) {
         val text = reply.text.trim()
         // Sa vision Q&A (allowAction = false), pinipilit nating "NONE" kahit ano pa ang ibalik
@@ -1646,7 +1700,7 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        statusText.text = "🤖 RUSTECH: $text"
+        statusText.text = "🤖 Rustech: $text"
         if (text.isNotEmpty()) speak(text)
 
         val espAction = when (action) {
@@ -1729,14 +1783,14 @@ class MainActivity : ComponentActivity() {
                 text.contains("sino ka") || text.contains("ano pangalan mo") ||
                 text.contains("ano ngalan mo") || text.contains("ano name mo") ||
                 text.contains("sino ka ba") || text.contains("pangalan mo") || text.contains("name mo") -> {
-                    val rustechReplies = listOf(
+                    val RustechReplies = listOf(
                         "Ako ay si Rustech.. Ang laruan mo na ROBOT!",
                         "Ako ay si Rustech, ang kaibigan mo!",
                         "Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo.",
                         "Rustech ang pangalan ko, ang paborito mong robot companion!",
                         "Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!"
                     )
-                    speak(rustechReplies.random())
+                    speak(RustechReplies.random())
                     return "sino ka"
                 }
             }
@@ -2256,10 +2310,17 @@ class MainActivity : ComponentActivity() {
     private fun playTransitionCue(canonicalKey: String, defaultAction: String, defaultReply: String) {
         val custom = commandStore.findMatch(canonicalKey)
         val action = custom?.action?.takeIf { it.isNotBlank() } ?: defaultAction
-        val replyText = custom?.randomReply()?.takeIf { it.isNotBlank() } ?: defaultReply
+        val customReply = custom?.randomReply()?.takeIf { it.isNotBlank() }
 
         executeEsp32Actions(action)
-        speak(replyText)
+
+        when {
+            // Sarili mong na-configure na linya (hindi naka-hardcode ng app) - laging ito muna.
+            customReply != null -> speak(customReply)
+            // Walang custom override at naka-ON ang Gemini - subukang gawing bago/iba-iba.
+            geminiEnabled -> sayDynamicOrFallback(situationCueFor(canonicalKey), defaultReply)
+            else -> speak(defaultReply)
+        }
     }
 
     /**
@@ -2270,8 +2331,30 @@ class MainActivity : ComponentActivity() {
      */
     private fun speakTransitionCue(canonicalKey: String, defaultReply: String) {
         val custom = commandStore.findMatch(canonicalKey)
-        val replyText = custom?.randomReply()?.takeIf { it.isNotBlank() } ?: defaultReply
-        speak(replyText)
+        val customReply = custom?.randomReply()?.takeIf { it.isNotBlank() }
+
+        when {
+            customReply != null -> speak(customReply)
+            geminiEnabled -> sayDynamicOrFallback(situationCueFor(canonicalKey), defaultReply)
+            else -> speak(defaultReply)
+        }
+    }
+
+    /** Maikling paglalarawan ng sitwasyon, ipinapasa kay Gemini (sayLine) para bumuo ng bagong
+     * linya tungkol sa kasalukuyang ginagawang transition. */
+    private fun situationCueFor(canonicalKey: String): String = when (canonicalKey) {
+        "ipakita ang camera" ->
+            "Lilipat ka ngayon mula sa mata/idle screen mo papuntang live camera view, dahil " +
+                "inutusan kang ipakita ang camera - sabihin mo ito nang maikli at masaya, parang " +
+                "totoong inaanunsyo mo habang ginagawa mo."
+        "balik sa mata" ->
+            "Babalik ka ngayon mula sa camera view papuntang mata/idle screen mo - sabihin mo " +
+                "ito nang maikli at natural."
+        "kuha ng litrato" ->
+            "Kukuha ka ngayon ng litrato gamit ang camera mo - sabihin mo ito nang masaya bago " +
+                "ka kumuha, parang totoong inaanunsyo mo."
+        else ->
+            "Sabihin mo ang isang maikli at masayang linya tungkol sa ginagawa mong aksyon ngayon."
     }
 
     /**
@@ -2324,18 +2407,18 @@ class MainActivity : ComponentActivity() {
             if (!showRoboEyes) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speakTransitionCue("balik sa mata", "")
+                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
             }
         }, 5000)
     }
 
     private fun savePhotoToGallery(bitmap: Bitmap) {
         try {
-            val filename = "RUSTECH_${System.currentTimeMillis()}.jpg"
+            val filename = "Rustech_${System.currentTimeMillis()}.jpg"
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/RUSTECH")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/Rustech")
             }
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
             uri?.let {
