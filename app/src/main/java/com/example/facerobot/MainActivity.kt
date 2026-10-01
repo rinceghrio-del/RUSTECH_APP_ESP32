@@ -24,6 +24,7 @@ import android.os.Handler
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import android.speech.tts.Voice
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -242,6 +243,12 @@ class MainActivity : ComponentActivity() {
     private var appTtsEnabled: Boolean
         get() = prefs.getBoolean("app_tts_enabled", true)
         set(value) { prefs.edit().putBoolean("app_tts_enabled", value).apply() }
+
+    // Pangalan ng partikular na boses na pinili sa lokal na Android/Google TTS - kung blangko,
+    // gagamitin ang default na boses ng engine para sa napiling wika.
+    private var selectedTtsVoiceName: String
+        get() = prefs.getString("tts_voice_name", "") ?: ""
+        set(value) { prefs.edit().putString("tts_voice_name", value.trim()).apply() }
 
     // ---------- ELEVENLABS TTS (opsyonal, mas magandang/natural na boses - may FREE TIER LIMIT) ----------
     // Kapag naubos na ang free tier ni ElevenLabs (o walang internet/mali ang API key), awtomatikong
@@ -799,11 +806,24 @@ class MainActivity : ComponentActivity() {
             setOnClickListener { showGeminiSettingsDialog() }
         }
 
+        val localVoiceOption = Button(this).apply {
+            text = "🗣️  Boses (Lokal na TTS)"
+            textSize = 14f
+            isAllCaps = false
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            setPadding(40, 36, 40, 36)
+            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
+            setOnClickListener { showLocalVoiceDialog() }
+        }
+
         fun createSpacer() = View(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, 24)
         }
 
         container.addView(geminiOption)
+        container.addView(createSpacer())
+        container.addView(localVoiceOption)
         container.addView(createSpacer())
         container.addView(displayToggle)
         container.addView(createSpacer())
@@ -1837,6 +1857,129 @@ class MainActivity : ComponentActivity() {
             .show()
     }
 
+    /**
+     * Nililista ang mga available na boses ng lokal na Android/Google TTS engine, para masubukan
+     * at mapili ng user kung alin ang gusto - wala talagang direktang paraan ang Android para
+     * malaman kung babae o lalaki ang isang boses bago ito i-preview (walang "gender" field ang
+     * Voice class), kaya pakinggan muna bawat isa.
+     */
+    private fun showLocalVoiceDialog() {
+        val engine = tts
+        if (engine == null) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("🗣️ Boses (Lokal na TTS)")
+                .setMessage("Hindi pa handa ang lokal na TTS engine. Subukan ulit mamaya.")
+                .setPositiveButton("Sige", null)
+                .show()
+            return
+        }
+
+        val allVoices = try { engine.voices?.toList() ?: emptyList() } catch (e: Exception) { emptyList() }
+        if (allVoices.isEmpty()) {
+            android.app.AlertDialog.Builder(this)
+                .setTitle("🗣️ Boses (Lokal na TTS)")
+                .setMessage("Walang nakitang listahan ng boses sa TTS engine ng phone mo.")
+                .setPositiveButton("Sige", null)
+                .show()
+            return
+        }
+
+        fun isFilipino(v: Voice) = v.locale.language in listOf("fil", "tl")
+        val filipinoVoices = allVoices.filter { isFilipino(it) && !it.isNetworkConnectionRequired }
+        val filipinoNetworkVoices = allVoices.filter { isFilipino(it) && it.isNetworkConnectionRequired }
+        val otherVoices = allVoices.filter { !isFilipino(it) }.sortedBy { it.locale.toString() }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 24, 32, 16)
+        }
+
+        container.addView(TextView(this).apply {
+            text = "I-tap ang ▶️ para pakinggan ang bawat boses. Kapag nahanap mo yung gusto mo, " +
+                "i-tap ang ✅ Piliin. (Walang paraan ang Android para malaman kung babae o lalaki " +
+                "ang boses nang hindi pinapakinggan muna.)"
+            textSize = 12f
+            setPadding(0, 0, 0, 20)
+        })
+
+        fun addVoiceRow(voice: Voice, label: String) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 8, 0, 8)
+            }
+            row.addView(TextView(this@MainActivity).apply {
+                text = label
+                textSize = 13f
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                gravity = Gravity.CENTER_VERTICAL
+            })
+            row.addView(Button(this@MainActivity).apply {
+                text = "▶️"
+                textSize = 12f
+                isAllCaps = false
+                setOnClickListener {
+                    val previous = engine.voice
+                    engine.voice = voice
+                    engine.speak("Kumusta, ako si Rustech!", TextToSpeech.QUEUE_FLUSH, null, "voice_preview")
+                    // Ibalik ang dating gamit na boses pagkatapos ng ilang segundo - preview lang ito.
+                    if (previous != null) {
+                        rootLayout.postDelayed({ engine.voice = previous }, 3000)
+                    }
+                }
+            })
+            row.addView(Button(this@MainActivity).apply {
+                text = "✅ Piliin"
+                textSize = 12f
+                isAllCaps = false
+                setOnClickListener {
+                    selectedTtsVoiceName = voice.name
+                    engine.voice = voice
+                    statusText.text = "🗣️ Napiling boses: ${voice.name}"
+                }
+            })
+            container.addView(row)
+        }
+
+        if (filipinoVoices.isNotEmpty()) {
+            container.addView(TextView(this).apply {
+                text = "🇵🇭 Filipino/Tagalog (offline):"
+                textSize = 13f
+                setPadding(0, 8, 0, 4)
+            })
+            filipinoVoices.forEach { addVoiceRow(it, it.name) }
+        }
+        if (filipinoNetworkVoices.isNotEmpty()) {
+            container.addView(TextView(this).apply {
+                text = "🇵🇭 Filipino/Tagalog (kailangan ng internet):"
+                textSize = 13f
+                setPadding(0, 16, 0, 4)
+            })
+            filipinoNetworkVoices.forEach { addVoiceRow(it, it.name) }
+        }
+        if (otherVoices.isNotEmpty()) {
+            container.addView(TextView(this).apply {
+                text = "🌐 Iba pang wika/boses (kung sakaling wala kang Filipino options):"
+                textSize = 13f
+                setPadding(0, 16, 0, 4)
+            })
+            otherVoices.take(30).forEach { addVoiceRow(it, "${it.locale} - ${it.name}") }
+        }
+
+        val scrollView = ScrollView(this).apply { addView(container) }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("🗣️ Boses (Lokal na TTS)")
+            .setView(scrollView)
+            .setNegativeButton("Isara") { _, _ ->
+                // Siguraduhing naka-apply ang napiling boses (hindi yung ginamit lang sa preview).
+                if (selectedTtsVoiceName.isNotBlank()) {
+                    val match = allVoices.firstOrNull { it.name == selectedTtsVoiceName }
+                    if (match != null) engine.voice = match
+                }
+            }
+            .show()
+    }
+
     // ---------- TTS (Filipino voice gamit ang Android TextToSpeech / Google TTS) ----------
 
     private fun initTts(enginePackage: String?) {
@@ -1868,6 +2011,12 @@ class MainActivity : ComponentActivity() {
         }
         engine.setSpeechRate(1.0f)
         engine.setPitch(1.0f)
+
+        // Gamitin ang sariling napiling boses (kung meron at available pa sa phone na ito).
+        if (selectedTtsVoiceName.isNotBlank()) {
+            val match = try { engine.voices?.firstOrNull { it.name == selectedTtsVoiceName } } catch (e: Exception) { null }
+            if (match != null) engine.voice = match
+        }
 
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
