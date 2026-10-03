@@ -205,7 +205,7 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getString("unknown_greeting_tracks", "") ?: ""
         set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
-    private var lastPersonSeenTime = 0L
+    private var lastPersonSeenTime = System.currentTimeMillis()
     private var faceTooClose = false
     private val personTimeoutMs = 4000L
 
@@ -431,6 +431,7 @@ class MainActivity : ComponentActivity() {
         showEyesUi()
         startEspHeartbeat()
         setupDepthModel()
+        headScanHandler.post(headScanWatcherRunnable)
 
         initTts(preferredTtsEngine)
 
@@ -2284,6 +2285,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private val SERVO_MAX_ANGLE = 110
+
+    // ---------- IDLE HEAD SCAN (taas-baba ng ulo kapag 1 minutong walang nakitang tao) ----------
+    // Dahan-dahang pag-taas/baba ng ulo gamit ang parehong navServoA/navServoB na naka-calibrate
+    // na sa Nav settings mo (kaya awtomatikong magkatugma ang itaas/ibaba na galaw sa totoong
+    // limitasyon ng servo rig mo - hindi tayo gagamit ng bagong hulaan na anggulo).
+    private val personMissingScanThresholdMs = 60_000L  // 1 minuto bago magsimula ang pag-scan
+    private val headScanMoveDurationMs = 2000L           // 2 segundo bawat taas o baba - dahan-dahan
+    private val headScanStepIntervalMs = 50L             // laki ng bawat hakbang (para smooth, hindi biglaan)
+    private val headScanPauseMs = 600L                   // saglit na tigil sa dulo ng bawat galaw
+    @Volatile private var headScanActive = false
+    private val headScanHandler = Handler(android.os.Looper.getMainLooper())
     private var servoTopRatio: Float
         get() = prefs.getFloat("servo_top_ratio", 0.15f)
         set(value) { prefs.edit().putFloat("servo_top_ratio", value).apply() }
@@ -2332,6 +2344,70 @@ class MainActivity : ComponentActivity() {
         if (now - lastSendTime < sendIntervalMs) return
         lastSendTime = now
         sendCommandToEsp32(command, servoAngle)
+    }
+
+    /**
+     * Tinitignan bawat 1 segundo kung karapat-dapat nang mag-"idle head scan" ang robot -
+     * 1 minutong walang nakitang tao, nasa RoboEyes/idle talaga (hindi habang may camera
+     * tracking, nav mode, kumukuha ng litrato, o tumitingin kay Gemini). Kapag may natuklasan
+     * na tao ulit o may ibang nangyayaring aktibidad, tumitigil agad ang scan.
+     */
+    private val headScanWatcherRunnable = object : Runnable {
+        override fun run() {
+            val idleTooLong = System.currentTimeMillis() - lastPersonSeenTime > personMissingScanThresholdMs
+            val eligible = idleTooLong && appState == AppState.EYES && showRoboEyes &&
+                !navActive && !navCalibrating && !navTestMode &&
+                !pendingPhotoCapture && pendingVisionCapture == null
+
+            if (eligible && !headScanActive) {
+                headScanActive = true
+                runHeadScanCycle()
+            } else if (!eligible) {
+                headScanActive = false
+            }
+            headScanHandler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun runHeadScanCycle() {
+        if (!headScanActive) return
+        animateServoTo(navServoB, headScanMoveDurationMs) {
+            if (!headScanActive) return@animateServoTo
+            headScanHandler.postDelayed({
+                if (!headScanActive) return@postDelayed
+                animateServoTo(navServoA, headScanMoveDurationMs) {
+                    if (!headScanActive) return@animateServoTo
+                    headScanHandler.postDelayed({ runHeadScanCycle() }, headScanPauseMs)
+                }
+            }, headScanPauseMs)
+        }
+    }
+
+    /** Dahan-dahang ililipat ang servo mula sa kasalukuyang anggulo papunta sa targetAngle sa
+     * loob ng durationMs, sa pamamagitan ng maliliit na hakbang - para "dahan-dahan" talaga ang
+     * galaw, hindi biglaang tumalon. */
+    private fun animateServoTo(targetAngle: Int, durationMs: Long, onDone: () -> Unit) {
+        val startAngle = if (outputServoAngle >= 0f) outputServoAngle else SERVO_MAX_ANGLE / 2f
+        val steps = (durationMs / headScanStepIntervalMs).toInt().coerceAtLeast(1)
+        var stepCount = 0
+
+        val stepRunnable = object : Runnable {
+            override fun run() {
+                if (!headScanActive) return
+                stepCount++
+                val t = stepCount.toFloat() / steps.toFloat()
+                val angle = (startAngle + (targetAngle - startAngle) * t).coerceIn(0f, SERVO_MAX_ANGLE.toFloat())
+                outputServoAngle = angle
+                smoothedServoAngle = angle
+                sendCommandToEsp32("STOP", Math.round(angle))
+                if (stepCount < steps) {
+                    headScanHandler.postDelayed(this, headScanStepIntervalMs)
+                } else {
+                    onDone()
+                }
+            }
+        }
+        headScanHandler.post(stepRunnable)
     }
 
     private fun startEspHeartbeat() {
@@ -3442,6 +3518,8 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         pingHandler.removeCallbacksAndMessages(null)
         navHandler.removeCallbacksAndMessages(null)
+        headScanActive = false
+        headScanHandler.removeCallbacksAndMessages(null)
         cameraExecutor.shutdown()
         faceDetector.close()
         yoloDetector.close()
