@@ -2293,7 +2293,6 @@ class MainActivity : ComponentActivity() {
     private val personMissingScanThresholdMs = 60_000L  // 1 minuto bago magsimula ang pag-scan
     private val headScanMoveDurationMs = 2000L           // 2 segundo bawat taas o baba - dahan-dahan
     private val headScanStepIntervalMs = 50L             // laki ng bawat hakbang (para smooth, hindi biglaan)
-    private val headScanPauseMs = 600L                   // saglit na tigil sa dulo ng bawat galaw
     @Volatile private var headScanActive = false
     private val headScanHandler = Handler(android.os.Looper.getMainLooper())
     private var servoTopRatio: Float
@@ -2352,34 +2351,49 @@ class MainActivity : ComponentActivity() {
      * tracking, nav mode, kumukuha ng litrato, o tumitingin kay Gemini). Kapag may natuklasan
      * na tao ulit o may ibang nangyayaring aktibidad, tumitigil agad ang scan.
      */
+    // Kailan natapos (o huling na-abort) ang pinakahuling scan cycle - ginagamit para hintayin
+    // muna ang isa pang buong minuto bago pumayag ng panibagong scan (hindi dapat paulit-ulit
+    // agad-agad).
+    private var lastHeadScanEndTime = 0L
+
     private val headScanWatcherRunnable = object : Runnable {
         override fun run() {
-            val idleTooLong = System.currentTimeMillis() - lastPersonSeenTime > personMissingScanThresholdMs
-            val eligible = idleTooLong && appState == AppState.EYES && showRoboEyes &&
+            val now = System.currentTimeMillis()
+            val idleTooLong = now - lastPersonSeenTime > personMissingScanThresholdMs
+
+            // May nakita na palang tao habang kasalukuyang nag-i-scan pa - itigil agad, huwag
+            // na tapusin ang buong 4 segundong galaw.
+            if (headScanActive && !idleTooLong) {
+                headScanActive = false
+                lastHeadScanEndTime = now
+            }
+
+            val cooldownPassed = now - lastHeadScanEndTime > personMissingScanThresholdMs
+            val eligible = idleTooLong && cooldownPassed && appState == AppState.EYES && showRoboEyes &&
                 !navActive && !navCalibrating && !navTestMode &&
                 !pendingPhotoCapture && pendingVisionCapture == null
 
             if (eligible && !headScanActive) {
                 headScanActive = true
                 runHeadScanCycle()
-            } else if (!eligible) {
-                headScanActive = false
             }
             headScanHandler.postDelayed(this, 1000)
         }
     }
 
+    /** Isang beses lang na taas (navServoB) saka baba (navServoA), mga 4 segundo lahat-lahat
+     * (2 segundo bawat direksyon) - pagkatapos, titigil at maghihintay ng isa pang minuto
+     * (sa headScanWatcherRunnable) bago pumayag ulit ng bagong scan. */
     private fun runHeadScanCycle() {
         if (!headScanActive) return
         animateServoTo(navServoB, headScanMoveDurationMs) {
             if (!headScanActive) return@animateServoTo
-            headScanHandler.postDelayed({
-                if (!headScanActive) return@postDelayed
-                animateServoTo(navServoA, headScanMoveDurationMs) {
-                    if (!headScanActive) return@animateServoTo
-                    headScanHandler.postDelayed({ runHeadScanCycle() }, headScanPauseMs)
-                }
-            }, headScanPauseMs)
+            animateServoTo(navServoA, headScanMoveDurationMs) {
+                // Tapos na ang isang buong cycle (~4 segundo) - itigil at i-mark kung kailan ito
+                // natapos, para masimulan ang paghihintay ng isa pang minuto.
+                headScanActive = false
+                lastHeadScanEndTime = System.currentTimeMillis()
+            }
         }
     }
 
