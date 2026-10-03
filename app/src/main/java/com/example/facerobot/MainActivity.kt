@@ -2291,8 +2291,14 @@ class MainActivity : ComponentActivity() {
     // na sa Nav settings mo (kaya awtomatikong magkatugma ang itaas/ibaba na galaw sa totoong
     // limitasyon ng servo rig mo - hindi tayo gagamit ng bagong hulaan na anggulo).
     private val personMissingScanThresholdMs = 60_000L  // 1 minuto bago magsimula ang pag-scan
-    private val headScanMoveDurationMs = 2000L           // 2 segundo bawat taas o baba - dahan-dahan
+    private val headScanMoveDurationMs = 3000L           // 3 segundo bawat taas o baba = 6 segundo lahat-lahat
     private val headScanStepIntervalMs = 50L             // laki ng bawat hakbang (para smooth, hindi biglaan)
+    // Hiwalay na mga anggulo para sa head-scan (hindi na gamit ang navServoA/B), para malaya
+    // nating ma-adjust ito nang hindi naaapektuhan ang calibration ng Nav settings mo. Base sa
+    // computeServoAngle() mo: mas MATAAS na numero = mas PATAAS ang tingin. I-adjust lang itong
+    // dalawang numero (0-110) kung kailangan pang i-tweak ang dating ng galaw.
+    private val headScanUpAngle = 95     // mas malapit sa SERVO_MAX_ANGLE (110) = mas pataas
+    private val headScanDownAngle = 15   // mas malapit sa 0 = mas pababa
     @Volatile private var headScanActive = false
     private val headScanHandler = Handler(android.os.Looper.getMainLooper())
     private var servoTopRatio: Float
@@ -2386,9 +2392,9 @@ class MainActivity : ComponentActivity() {
      * (sa headScanWatcherRunnable) bago pumayag ulit ng bagong scan. */
     private fun runHeadScanCycle() {
         if (!headScanActive) return
-        animateServoTo(navServoB, headScanMoveDurationMs) {
+        animateServoTo(headScanUpAngle, headScanMoveDurationMs) {
             if (!headScanActive) return@animateServoTo
-            animateServoTo(navServoA, headScanMoveDurationMs) {
+            animateServoTo(headScanDownAngle, headScanMoveDurationMs) {
                 // Tapos na ang isang buong cycle (~4 segundo) - itigil at i-mark kung kailan ito
                 // natapos, para masimulan ang paghihintay ng isa pang minuto.
                 headScanActive = false
