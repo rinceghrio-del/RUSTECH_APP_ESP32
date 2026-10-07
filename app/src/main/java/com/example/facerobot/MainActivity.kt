@@ -1137,7 +1137,7 @@ class MainActivity : ComponentActivity() {
         val onAccent = 0xFF04342C.toInt()
 
         // true = magsasara ang menu kapag may pinili (laging fresh ang IP / mic % kapag binuksan ulit)
-        val closeMenuOnPick = true
+        val closeMenuOnPick = false
 
         val dialog = android.app.Dialog(ctx)
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
