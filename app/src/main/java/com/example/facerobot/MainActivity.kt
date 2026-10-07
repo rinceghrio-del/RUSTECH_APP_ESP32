@@ -3454,7 +3454,11 @@ class MainActivity : ComponentActivity() {
         }
         val actionInput = EditText(this).apply {
             hint = "ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N - hiwalayin ng || kung gusto ng sabay)"
-            inputType = InputType.TYPE_CLASS_TEXT
+            // Walang autocapitalize/autocorrect - ang mga ESP32 param na gaya ng "track=" ay
+            // case-sensitive, kaya delikado kung baguhin ng keyboard ang unang letra.
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
         }
         container.addView(replyInput)
         container.addView(
@@ -3502,7 +3506,10 @@ class MainActivity : ComponentActivity() {
         }
         val actionInput = EditText(this).apply {
             hint = "ESP32 action (opsyonal)"
-            inputType = InputType.TYPE_CLASS_TEXT
+            // Walang autocapitalize/autocorrect - case-sensitive ang mga ESP32 param.
+            inputType = InputType.TYPE_CLASS_TEXT or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
+                InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
             setText(cmd.action)
         }
         container.addView(TextView(this).apply { text = "Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi):" })
