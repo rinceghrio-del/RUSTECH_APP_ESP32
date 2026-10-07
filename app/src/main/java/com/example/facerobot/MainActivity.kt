@@ -10,6 +10,7 @@ import android.graphics.Matrix
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.media.AudioManager
@@ -20,6 +21,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Bundle
+import android.os.Build
 import android.os.Handler
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
@@ -27,8 +29,11 @@ import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
 import android.text.InputType
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.animation.DecelerateInterpolator
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -46,6 +51,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.example.facerobot.ui.RoboEyesView
 import com.example.facerobot.vision.FaceEmbedder
 import com.example.facerobot.vision.FaceStore
@@ -428,6 +436,7 @@ class MainActivity : ComponentActivity() {
         commandStore.seedDefaultsIfNeeded()
 
         buildUi()
+        applyImmersive(window)
         showEyesUi()
         startEspHeartbeat()
         setupDepthModel()
@@ -611,10 +620,21 @@ class MainActivity : ComponentActivity() {
             textSize = 20f
             setTextColor(accentColor)
             setPadding(0, 0, 0, 0)
+            minWidth = 0
+            minHeight = 0
             stateListAnimator = null
             elevation = 10f
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 200f)
+            background = RippleDrawable(
+                ColorStateList.valueOf(0x40FFFFFF),
+                GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(0xCC12141C.toInt())
+                    setStroke(dpPx(2), accentColor)
+                },
+                GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE) }
+            )
             setOnClickListener { showMainMenuDialog() }
+            pressScale()
         }
 
         rootLayout.addView(
@@ -636,12 +656,12 @@ class MainActivity : ComponentActivity() {
         rootLayout.addView(
             statusText,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
-                .apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; topMargin = 40 }
+                .apply { gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL; topMargin = dpPx(14) }
         )
         rootLayout.addView(
             menuButton,
-            FrameLayout.LayoutParams(150, 150)
-                .apply { gravity = Gravity.BOTTOM or Gravity.END; bottomMargin = 32; rightMargin = 24 }
+            FrameLayout.LayoutParams(dpPx(54), dpPx(54))
+                .apply { gravity = Gravity.BOTTOM or Gravity.END; bottomMargin = dpPx(16); rightMargin = dpPx(16) }
         )
 
         setContentView(rootLayout)
@@ -664,192 +684,388 @@ class MainActivity : ComponentActivity() {
         return RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), shape, mask)
     }
 
+    // ---------- Modern UI helpers (fullscreen + styling) ----------
+
+    private fun dpPx(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    /** Rounded na background na may ripple at optional na stroke. */
+    private fun modernBg(fill: Int, strokeColor: Int, radiusDp: Int, rippleColor: Int = 0x30FFFFFF): Drawable {
+        val r = dpPx(radiusDp).toFloat()
+        val shape = GradientDrawable().apply {
+            setColor(fill)
+            cornerRadius = r
+            if (strokeColor != 0) setStroke(dpPx(1), strokeColor)
+        }
+        val mask = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = r
+        }
+        return RippleDrawable(ColorStateList.valueOf(rippleColor), shape, mask)
+    }
+
+    /** Konting "pindot" animation (lumiliit nang kaunti kapag hinawakan). Hindi nito hinaharang ang click. */
+    private fun View.pressScale() {
+        setOnTouchListener { v, ev ->
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN ->
+                    v.animate().scaleX(0.96f).scaleY(0.96f).setDuration(90).start()
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
+                    v.animate().scaleX(1f).scaleY(1f).setDuration(140).start()
+            }
+            false
+        }
+    }
+
+    /**
+     * FULLSCREEN / IMMERSIVE: tinatanggal ang puting status bar sa taas (oras, wifi, notifications)
+     * at ang navigation bar. Kapag nag-swipe ang user mula sa gilid, lalabas lang sandali ang bars.
+     * Ginagamit din ito sa mga dialog para hindi bumalik ang bars kapag may nag-pop up.
+     */
+    private fun applyImmersive(w: android.view.Window?) {
+        if (w == null) return
+        WindowCompat.setDecorFitsSystemWindows(w, false)
+        w.statusBarColor = Color.TRANSPARENT
+        w.navigationBarColor = Color.TRANSPARENT
+
+        // Kung may notch / camera cutout, gamitin pa rin ang buong screen
+        val lp = w.attributes
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        w.attributes = lp
+
+        val controller = WindowInsetsControllerCompat(w, w.decorView)
+        controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // Ibalik ang fullscreen pagkatapos ng dialog / keyboard / pag-balik mula sa ibang app
+        if (hasFocus) applyImmersive(window)
+    }
+
+    /** Pareho ng .show() pero fullscreen pa rin ang dialog (hindi lumalabas ang status bar). */
+    private fun android.app.AlertDialog.Builder.showImmersive(): android.app.AlertDialog {
+        val dialog = create()
+        dialog.window?.setFlags(
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+        )
+        dialog.show()
+        applyImmersive(dialog.window)
+        dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+        return dialog
+    }
+
     private fun showMainMenuDialog() {
-        val accentColor = 0xFF00E5C7.toInt()
-        val accentPressed = 0xFF00A896.toInt()
-        val darkChip = 0xFF1E1E2E.toInt()
-        val darkChipPressed = 0xFF2A2A3E.toInt()
-        val disabledChip = 0xFF3A3A3A.toInt()
+        val ctx = this
+        val accent = 0xFF00E5C7.toInt()
+        val accent2 = 0xFF00B4FF.toInt()
+        val cardBg = 0xFF171A23.toInt()
+        val cardStroke = 0x14FFFFFF
+        val textMain = 0xFFFFFFFF.toInt()
+        val textDim = 0xFF8B90A3.toInt()
+        val onAccent = 0xFF04342C.toInt()
 
-        val container = LinearLayout(this).apply {
+        // true = magsasara ang menu kapag may pinili (laging fresh ang IP / mic % kapag binuksan ulit)
+        val closeMenuOnPick = true
+
+        val dialog = android.app.Dialog(ctx)
+        dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+
+        fun pick(action: () -> Unit) {
+            if (closeMenuOnPick) dialog.dismiss()
+            action()
+        }
+
+        fun label(text: String, sp: Float, color: Int, bold: Boolean = false): TextView = TextView(ctx).apply {
+            this.text = text
+            textSize = sp
+            setTextColor(color)
+            if (bold) typeface = Typeface.DEFAULT_BOLD
+        }
+
+        fun gap(hDp: Int): View = View(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(1, dpPx(hDp))
+        }
+
+        // Mga view na may entrance animation (staggered)
+        val animViews = mutableListOf<View>()
+
+        // ---------- Header ----------
+        val header = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val titleCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        titleCol.addView(label("Rustech", 20f, accent, bold = true).apply { letterSpacing = 0.14f })
+        titleCol.addView(label("Control Center  •  FaceRobot", 12f, textDim))
+        header.addView(titleCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+
+        val ipPill = label("●  ${esp32BaseUrl.removePrefix("http://")}", 12f, accent, bold = true).apply {
+            setPadding(dpPx(12), dpPx(7), dpPx(12), dpPx(7))
+            background = GradientDrawable().apply {
+                setColor(0x1A00E5C7)
+                cornerRadius = dpPx(20).toFloat()
+            }
+        }
+        header.addView(ipPill)
+
+        val closeBtn = label("✕", 15f, textMain, bold = true).apply {
+            gravity = Gravity.CENTER
+            background = modernBg(0xFF1E212C.toInt(), 0, 18)
+            setOnClickListener { dialog.dismiss() }
+            pressScale()
+        }
+        header.addView(
+            closeBtn,
+            LinearLayout.LayoutParams(dpPx(36), dpPx(36)).apply { leftMargin = dpPx(10) }
+        )
+
+        // ---------- Gemini (featured card) ----------
+        val geminiShape = GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, intArrayOf(accent, accent2)).apply {
+            cornerRadius = dpPx(20).toFloat()
+        }
+        val geminiMask = GradientDrawable().apply {
+            setColor(Color.WHITE)
+            cornerRadius = dpPx(20).toFloat()
+        }
+        val geminiCard = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpPx(16), dpPx(14), dpPx(16), dpPx(14))
+            background = RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), geminiShape, geminiMask)
+            elevation = dpPx(4).toFloat()
+            setOnClickListener { pick { showGeminiSettingsDialog() } }
+            pressScale()
+        }
+        geminiCard.addView(label("🧠", 28f, onAccent))
+        val geminiTexts = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        geminiTexts.addView(label("Gemini AI", 16f, onAccent, bold = true))
+        geminiTexts.addView(label("Utak ni Rustech", 12f, 0xCC04342C.toInt()))
+        geminiCard.addView(
+            geminiTexts,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dpPx(12) }
+        )
+        geminiCard.addView(label("›", 28f, onAccent, bold = true))
+
+        // ---------- Display toggle (RoboEyes / Camera) ----------
+        val displayCard = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(40, 40, 40, 32)
-            setBackgroundColor(0xFF121212.toInt())
-        }
-
-        val displayToggle = Switch(this).apply {
-            fun refreshText() {
-                text = if (showRoboEyes) "👀  Display: RoboEyes" else "📷  Display: Camera"
+            setPadding(dpPx(12), dpPx(10), dpPx(12), dpPx(10))
+            background = GradientDrawable().apply {
+                setColor(cardBg)
+                cornerRadius = dpPx(20).toFloat()
+                setStroke(dpPx(1), cardStroke)
             }
-            refreshText()
-            textSize = 14f
-            isChecked = showRoboEyes
-            setTextColor(0xFFFFFFFF.toInt())
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            thumbTintList = ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(accentColor, 0xFF888888.toInt())
+        }
+        displayCard.addView(label("DISPLAY", 10f, textDim, bold = true).apply { letterSpacing = 0.12f })
+        displayCard.addView(gap(6))
+
+        val segWrap = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dpPx(3), dpPx(3), dpPx(3), dpPx(3))
+            background = GradientDrawable().apply {
+                setColor(0xFF0E1016.toInt())
+                cornerRadius = dpPx(14).toFloat()
+            }
+        }
+        val segEyes = label("👀  RoboEyes", 13f, textDim, bold = true)
+        val segCam = label("📷  Camera", 13f, textDim, bold = true)
+
+        fun styleSegments() {
+            fun style(tv: TextView, selected: Boolean) {
+                tv.setTextColor(if (selected) onAccent else textDim)
+                tv.background = GradientDrawable().apply {
+                    cornerRadius = dpPx(11).toFloat()
+                    setColor(if (selected) accent else Color.TRANSPARENT)
+                }
+            }
+            style(segEyes, showRoboEyes)
+            style(segCam, !showRoboEyes)
+        }
+        for (tv in listOf(segEyes, segCam)) {
+            tv.gravity = Gravity.CENTER
+            tv.setPadding(dpPx(8), dpPx(9), dpPx(8), dpPx(9))
+            segWrap.addView(tv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        segEyes.setOnClickListener { showRoboEyes = true; applyDisplayMode(); styleSegments() }
+        segCam.setOnClickListener { showRoboEyes = false; applyDisplayMode(); styleSegments() }
+        styleSegments()
+        displayCard.addView(segWrap)
+
+        val topRow = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+        topRow.addView(
+            geminiCard,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
+        )
+        topRow.addView(
+            displayCard,
+            LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f).apply { leftMargin = dpPx(10) }
+        )
+        animViews.add(geminiCard)
+        animViews.add(displayCard)
+
+        // ---------- Settings cards (grid, 3 columns) ----------
+        fun makeCard(icon: String, title: String, subtitle: String, enabled: Boolean = true, onClick: () -> Unit): View {
+            val card = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dpPx(12), dpPx(12), dpPx(12), dpPx(12))
+                background = modernBg(cardBg, cardStroke, 18)
+                isEnabled = enabled
+                isClickable = enabled
+                alpha = if (enabled) 1f else 0.4f
+            }
+            val iconView = label(icon, 20f, textMain).apply {
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(0x2200E5C7)
+                }
+            }
+            card.addView(iconView, LinearLayout.LayoutParams(dpPx(42), dpPx(42)))
+
+            val texts = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+            texts.addView(label(title, 14f, textMain, bold = true).apply {
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            texts.addView(label(subtitle, 11f, textDim).apply {
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            card.addView(
+                texts,
+                LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dpPx(10) }
             )
-            trackTintList = ColorStateList(
-                arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
-                intArrayOf(accentPressed, 0xFF444444.toInt())
+
+            if (enabled) {
+                card.setOnClickListener { pick(onClick) }
+                card.pressScale()
+            }
+            return card
+        }
+
+        val cards = listOf(
+            makeCard("🗣️", "Boses", "Lokal na TTS") { showLocalVoiceDialog() },
+            makeCard("📶", "IP ng Robot", esp32BaseUrl.removePrefix("http://")) { showIpSettingDialog() },
+            makeCard(
+                "✨", "Mag-enroll ng mukha",
+                if (canEnroll) "Bagong mukha" else "Kailangan ng mukha",
+                enabled = canEnroll
+            ) { showEnrollDialog() },
+            makeCard("🎙️", "Greeting Tracks", "Bati sa bawat tao") { showGreetingTracksDialog() },
+            makeCard("📏", "Distance", "Layo ng tao") { showDistanceSettingsDialog() },
+            makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
+            makeCard("💬", "Mga Utos", "Voice commands") { showManageCommandsDialog() },
+            makeCard("🧭", "Camera Nav", "Obstacle avoidance") { showNavSettingsDialog() },
+            makeCard("🗒️", "Voice Log", "Kasaysayan") { showVoiceLogDialog() }
+        )
+
+        val grid = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        cards.chunked(3).forEachIndexed { rowIndex, rowCards ->
+            val row = LinearLayout(ctx).apply { orientation = LinearLayout.HORIZONTAL }
+            rowCards.forEachIndexed { i, c ->
+                row.addView(
+                    c,
+                    LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                        .apply { if (i > 0) leftMargin = dpPx(10) }
+                )
+                animViews.add(c)
+            }
+            grid.addView(
+                row,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { if (rowIndex > 0) topMargin = dpPx(10) }
             )
-            setOnCheckedChangeListener { _, checked ->
-                showRoboEyes = checked
-                applyDisplayMode()
-                refreshText()
+        }
+
+        // ---------- Buuin ang panel ----------
+        val content = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dpPx(20), dpPx(18), dpPx(20), dpPx(20))
+        }
+        content.addView(header)
+        content.addView(gap(14))
+        content.addView(topRow)
+        content.addView(gap(12))
+        content.addView(grid)
+
+        val scroll = ScrollView(ctx).apply {
+            isVerticalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
+            addView(content)
+        }
+
+        val panel = FrameLayout(ctx).apply {
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TOP_BOTTOM,
+                intArrayOf(0xFF151926.toInt(), 0xFF0B0D13.toInt())
+            ).apply {
+                cornerRadius = dpPx(28).toFloat()
+                setStroke(dpPx(1), 0x1FFFFFFF)
             }
+            elevation = dpPx(16).toFloat()
+            isClickable = true // para hindi magsara kapag pinindot ang loob ng panel
+            clipToOutline = true
+            addView(scroll)
         }
 
-        val ipOption = Button(this).apply {
-            text = "📶  IP ng Robot (${esp32BaseUrl.removePrefix("http://")})"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showIpSettingDialog() }
+        val screenW = resources.displayMetrics.widthPixels
+        val panelW = minOf((screenW * 0.92f).toInt(), dpPx(900))
+
+        val root = FrameLayout(ctx).apply {
+            setBackgroundColor(0xB3000000.toInt())
+            setOnClickListener { dialog.dismiss() }
+            addView(
+                panel,
+                FrameLayout.LayoutParams(panelW, FrameLayout.LayoutParams.WRAP_CONTENT).apply {
+                    gravity = Gravity.CENTER
+                    topMargin = dpPx(16)
+                    bottomMargin = dpPx(16)
+                }
+            )
         }
 
-        val enrollOption = Button(this).apply {
-            text = "✨  Mag-enroll ng bagong mukha"
-            textSize = 14f
-            isAllCaps = false
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            isEnabled = canEnroll
-            if (canEnroll) {
-                setTextColor(0xFF04342C.toInt())
-                background = makeRippleRoundedDrawable(accentColor, accentPressed, 24f)
-            } else {
-                setTextColor(0xFF888888.toInt())
-                background = GradientDrawable().apply { setColor(disabledChip); cornerRadius = 24f }
-            }
-            setOnClickListener { showEnrollDialog() }
+        dialog.setContentView(root)
+        dialog.window?.apply {
+            setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            setDimAmount(0f)
+            setFlags(
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+            )
         }
+        dialog.show()
+        applyImmersive(dialog.window)
+        dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
 
-        val greetingTracksOption = Button(this).apply {
-            text = "🎙️  Greeting Tracks"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showGreetingTracksDialog() }
+        // ---------- Animations ----------
+        root.alpha = 0f
+        root.animate().alpha(1f).setDuration(160).start()
+        panel.scaleX = 0.94f
+        panel.scaleY = 0.94f
+        panel.animate().scaleX(1f).scaleY(1f).setDuration(220)
+            .setInterpolator(DecelerateInterpolator()).start()
+        animViews.forEachIndexed { i, v ->
+            val targetAlpha = if (v.isEnabled) 1f else 0.4f
+            v.alpha = 0f
+            v.translationY = dpPx(14).toFloat()
+            v.animate()
+                .alpha(targetAlpha)
+                .translationY(0f)
+                .setStartDelay(60L + i * 35L)
+                .setDuration(240)
+                .setInterpolator(DecelerateInterpolator())
+                .start()
         }
-
-        val distanceOption = Button(this).apply {
-            text = "📏  Distance Settings"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showDistanceSettingsDialog() }
-        }
-
-        val micSensitivityOption = Button(this).apply {
-            text = "🎤  Mic Sensitivity (${(micConfidenceThreshold * 100).toInt()}%)"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showMicSensitivityDialog() }
-        }
-
-        val commandsOption = Button(this).apply {
-            text = "🎤  Mga Utos"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showManageCommandsDialog() }
-        }
-
-        val navOption = Button(this).apply {
-            text = "🧭  Camera Nav (obstacle avoidance)"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showNavSettingsDialog() }
-        }
-
-        val voiceLogOption = Button(this).apply {
-            text = "🗒️  Voice Log"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showVoiceLogDialog() }
-        }
-
-        val geminiOption = Button(this).apply {
-            text = "🧠  Gemini AI (utak ni Rustech)"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFF04342C.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(accentColor, accentPressed, 24f)
-            setOnClickListener { showGeminiSettingsDialog() }
-        }
-
-        val localVoiceOption = Button(this).apply {
-            text = "🗣️  Boses (Lokal na TTS)"
-            textSize = 14f
-            isAllCaps = false
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            setPadding(40, 36, 40, 36)
-            background = makeRippleRoundedDrawable(darkChip, darkChipPressed, 24f)
-            setOnClickListener { showLocalVoiceDialog() }
-        }
-
-        fun createSpacer() = View(this).apply {
-            layoutParams = LinearLayout.LayoutParams(0, 24)
-        }
-
-        container.addView(geminiOption)
-        container.addView(createSpacer())
-        container.addView(localVoiceOption)
-        container.addView(createSpacer())
-        container.addView(displayToggle)
-        container.addView(createSpacer())
-        container.addView(ipOption)
-        container.addView(createSpacer())
-        container.addView(enrollOption)
-        container.addView(createSpacer())
-        container.addView(greetingTracksOption)
-        container.addView(createSpacer())
-        container.addView(distanceOption)
-        container.addView(createSpacer())
-        container.addView(micSensitivityOption)
-        container.addView(createSpacer())
-        container.addView(commandsOption)
-        container.addView(createSpacer())
-        container.addView(navOption)
-        container.addView(createSpacer())
-        container.addView(voiceLogOption)
-
-        val scrollView = ScrollView(this).apply { addView(container) }
-
-        android.app.AlertDialog.Builder(this)
-            .setView(scrollView)
-            .setNegativeButton("Isara", null)
-            .show()
     }
 
     private fun showGreetingTracksDialog() {
@@ -945,7 +1161,7 @@ class MainActivity : ComponentActivity() {
                 statusText.text = "Na-save ang greeting tracks"
             }
             .setNegativeButton("Isara", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showEyesUi() {
@@ -1855,7 +2071,7 @@ class MainActivity : ComponentActivity() {
             .setView(scrollView)
             .setPositiveButton("I-clear") { _, _ -> voiceLog.clear() }
             .setNegativeButton("Isara", null)
-            .show()
+            .showImmersive()
     }
 
     /**
@@ -1871,7 +2087,7 @@ class MainActivity : ComponentActivity() {
                 .setTitle("🗣️ Boses (Lokal na TTS)")
                 .setMessage("Hindi pa handa ang lokal na TTS engine. Subukan ulit mamaya.")
                 .setPositiveButton("Sige", null)
-                .show()
+                .showImmersive()
             return
         }
 
@@ -1881,7 +2097,7 @@ class MainActivity : ComponentActivity() {
                 .setTitle("🗣️ Boses (Lokal na TTS)")
                 .setMessage("Walang nakitang listahan ng boses sa TTS engine ng phone mo.")
                 .setPositiveButton("Sige", null)
-                .show()
+                .showImmersive()
             return
         }
 
@@ -1978,7 +2194,7 @@ class MainActivity : ComponentActivity() {
                     if (match != null) engine.voice = match
                 }
             }
-            .show()
+            .showImmersive()
     }
 
     // ---------- TTS (Filipino voice gamit ang Android TextToSpeech / Google TTS) ----------
@@ -3086,7 +3302,7 @@ class MainActivity : ComponentActivity() {
                 if (!testSwitch.isChecked) statusText.text = "Na-save ang Camera Nav settings"
             }
             .setNegativeButton("Isara", null)
-            .show()
+            .showImmersive()
     }
 
     // ---------- Enroll UI ----------
@@ -3237,7 +3453,7 @@ class MainActivity : ComponentActivity() {
                 statusText.text = "🧠 Nabura na ang memorya ng usapan"
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showIpSettingDialog() {
@@ -3259,7 +3475,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showDistanceSettingsDialog() {
@@ -3324,7 +3540,7 @@ class MainActivity : ComponentActivity() {
                 statusText.text = "Na-reset sa default ang distance settings"
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showMicSensitivityDialog() {
@@ -3352,7 +3568,7 @@ class MainActivity : ComponentActivity() {
                 statusText.text = "Na-reset sa default ang mic sensitivity"
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showEnrollDialog() {
@@ -3380,7 +3596,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             .setNegativeButton("Cancel", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showManageCommandsDialog() {
@@ -3485,7 +3701,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
             .setNegativeButton("Isara", null)
-            .show()
+            .showImmersive()
     }
 
     private fun showEditCommandDialog(cmd: CommandStore.VoiceCommand) {
@@ -3538,7 +3754,7 @@ class MainActivity : ComponentActivity() {
                 showManageCommandsDialog()
             }
             .setNegativeButton("Cancel") { _, _ -> showManageCommandsDialog() }
-            .show()
+            .showImmersive()
     }
 
     override fun onDestroy() {
