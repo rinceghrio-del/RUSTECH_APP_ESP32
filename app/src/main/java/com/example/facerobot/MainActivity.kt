@@ -51,6 +51,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -747,17 +748,382 @@ class MainActivity : ComponentActivity() {
         if (hasFocus) applyImmersive(window)
     }
 
-    /** Pareho ng .show() pero fullscreen pa rin ang dialog (hindi lumalabas ang status bar). */
-    private fun android.app.AlertDialog.Builder.showImmersive(): android.app.AlertDialog {
-        val dialog = create()
-        dialog.window?.setFlags(
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-        )
-        dialog.show()
-        applyImmersive(dialog.window)
-        dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
-        return dialog
+    // ---------- Modern dialog (kapalit ng AlertDialog.Builder para sa lahat ng sub-dialog) ----------
+
+    // Isa lang ang bukas na sub-dialog sa isang oras: kapag may bagong binuksan, isasara ang luma
+    // (para hindi nagpapatong-patong, hal. Mga Utos -> I-edit -> balik sa Mga Utos).
+    private var activeModernDialog: android.app.Dialog? = null
+
+    private fun setMarginsDp(v: View, leftDp: Int, topDp: Int, rightDp: Int, bottomDp: Int) {
+        val lp = v.layoutParams as? ViewGroup.MarginLayoutParams ?: return
+        lp.setMargins(dpPx(leftDp), dpPx(topDp), dpPx(rightDp), dpPx(bottomDp))
+        v.layoutParams = lp
+    }
+
+    /**
+     * Nire-restyle ang laman ng dialog (mga TextView, EditText, Switch, Button, divider, rows)
+     * para umayon sa dark/modern na tema - hindi na kailangang baguhin ang bawat dialog nang isa-isa.
+     */
+    private fun restyleDialogContent(v: View) {
+        val accent = 0xFF00E5C7.toInt()
+        val onAccent = 0xFF04342C.toInt()
+        val cardBg = 0xFF171A23.toInt()
+        val cardStroke = 0x14FFFFFF
+        val textMain = 0xFFE9EBF2.toInt()
+        val textDim = 0xFF8B90A3.toInt()
+
+        when (v) {
+            is Switch -> {
+                v.setTextColor(textMain)
+                v.textSize = 14f
+                v.setPadding(dpPx(14), dpPx(12), dpPx(14), dpPx(12))
+                v.background = modernBg(cardBg, cardStroke, 14)
+                v.thumbTintList = ColorStateList(
+                    arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                    intArrayOf(accent, 0xFF9AA0B4.toInt())
+                )
+                v.trackTintList = ColorStateList(
+                    arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()),
+                    intArrayOf(0xFF00A896.toInt(), 0xFF3A3F52.toInt())
+                )
+                setMarginsDp(v, 0, 4, 0, 4)
+            }
+            is EditText -> {
+                v.setTextColor(0xFFFFFFFF.toInt())
+                v.setHintTextColor(0xFF6B7084.toInt())
+                v.textSize = 14f
+                v.setPadding(dpPx(14), dpPx(11), dpPx(14), dpPx(11))
+                v.background = GradientDrawable().apply {
+                    setColor(0xFF0E1016.toInt())
+                    cornerRadius = dpPx(12).toFloat()
+                    setStroke(dpPx(1), 0x26FFFFFF)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    v.textCursorDrawable = GradientDrawable().apply {
+                        setColor(accent)
+                        setSize(dpPx(2), -1)
+                    }
+                }
+                setMarginsDp(v, 0, 4, 0, 6)
+            }
+            is Button -> {
+                val t = v.text.toString()
+                v.isAllCaps = false
+                v.minWidth = 0
+                v.minHeight = 0
+                v.stateListAnimator = null
+                v.typeface = Typeface.DEFAULT_BOLD
+                v.textSize = 12f
+                v.setPadding(dpPx(12), dpPx(8), dpPx(12), dpPx(8))
+                when {
+                    t.contains("Tanggalin") -> {
+                        v.setTextColor(0xFFFF7B7B.toInt())
+                        v.background = modernBg(0x26FF5C5C, 0, 12)
+                    }
+                    t.contains("Calibrate") -> {
+                        v.textSize = 13f
+                        v.setTextColor(accent)
+                        v.background = modernBg(0x1A00E5C7, accent, 14)
+                        v.setPadding(dpPx(14), dpPx(12), dpPx(14), dpPx(12))
+                        setMarginsDp(v, 0, 12, 0, 4)
+                    }
+                    t.contains("Piliin") -> {
+                        v.setTextColor(onAccent)
+                        v.background = modernBg(accent, 0, 12)
+                    }
+                    else -> {
+                        v.setTextColor(0xFFFFFFFF.toInt())
+                        v.background = modernBg(0xFF262A3B.toInt(), 0, 12)
+                    }
+                }
+                if (v.parent is LinearLayout && (v.parent as LinearLayout).orientation == LinearLayout.HORIZONTAL) {
+                    setMarginsDp(v, 6, 0, 0, 0)
+                }
+            }
+            is TextView -> {
+                val sp = v.textSize / resources.configuration.fontScale / resources.displayMetrics.density
+                val t = v.text.toString().trimEnd()
+                when {
+                    sp <= 11.5f -> v.setTextColor(textDim)
+                    t.endsWith(":") -> {
+                        v.setTextColor(0xFFC4C9DB.toInt())
+                        v.typeface = Typeface.DEFAULT_BOLD
+                    }
+                    else -> v.setTextColor(textMain)
+                }
+            }
+            else -> {
+                // Divider (plain View na 2px ang taas)
+                val lp = v.layoutParams
+                if (v.javaClass == View::class.java && lp != null && lp.height in 1..3) {
+                    v.setBackgroundColor(0x14FFFFFF)
+                    lp.height = dpPx(1)
+                    v.layoutParams = lp
+                    setMarginsDp(v, 0, 12, 0, 12)
+                }
+            }
+        }
+
+        // Mga row na may button (hal. "pangalan -> tracks  [Tanggalin]") = card
+        if (v is LinearLayout && v.orientation == LinearLayout.HORIZONTAL) {
+            var hasButton = false
+            for (i in 0 until v.childCount) if (v.getChildAt(i) is Button) hasButton = true
+            if (hasButton) {
+                v.setPadding(dpPx(14), dpPx(8), dpPx(8), dpPx(8))
+                v.background = GradientDrawable().apply {
+                    setColor(cardBg)
+                    cornerRadius = dpPx(14).toFloat()
+                    setStroke(dpPx(1), cardStroke)
+                }
+                setMarginsDp(v, 0, 0, 0, 8)
+            }
+        }
+
+        if (v is ViewGroup) {
+            for (i in 0 until v.childCount) restyleDialogContent(v.getChildAt(i))
+        }
+    }
+
+    /**
+     * Kapalit ng android.app.AlertDialog.Builder - pareho ang mga method (setTitle, setMessage, setView,
+     * set*Button, showImmersive) kaya hindi na kailangang baguhin ang logic ng bawat dialog.
+     */
+    private inner class ModernDialog {
+        private var title: CharSequence? = null
+        private var message: CharSequence? = null
+        private var contentView: View? = null
+        private var posText: CharSequence? = null
+        private var posListener: ((android.content.DialogInterface, Int) -> Unit)? = null
+        private var negText: CharSequence? = null
+        private var negListener: ((android.content.DialogInterface, Int) -> Unit)? = null
+        private var neuText: CharSequence? = null
+        private var neuListener: ((android.content.DialogInterface, Int) -> Unit)? = null
+
+        fun setTitle(t: CharSequence): ModernDialog { title = t; return this }
+        fun setMessage(m: CharSequence): ModernDialog { message = m; return this }
+        fun setView(v: View): ModernDialog { contentView = v; return this }
+        fun setPositiveButton(t: CharSequence, l: ((android.content.DialogInterface, Int) -> Unit)?): ModernDialog {
+            posText = t; posListener = l; return this
+        }
+        fun setNegativeButton(t: CharSequence, l: ((android.content.DialogInterface, Int) -> Unit)?): ModernDialog {
+            negText = t; negListener = l; return this
+        }
+        fun setNeutralButton(t: CharSequence, l: ((android.content.DialogInterface, Int) -> Unit)?): ModernDialog {
+            neuText = t; neuListener = l; return this
+        }
+
+        fun showImmersive(): android.app.Dialog {
+            val ctx = this@MainActivity
+            val accent = 0xFF00E5C7.toInt()
+            val accent2 = 0xFF00B4FF.toInt()
+            val onAccent = 0xFF04342C.toInt()
+            val textDim = 0xFF8B90A3.toInt()
+
+            activeModernDialog?.let { if (it.isShowing) it.dismiss() }
+
+            val dialog = android.app.Dialog(ctx)
+            dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+
+            val panel = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                background = GradientDrawable(
+                    GradientDrawable.Orientation.TOP_BOTTOM,
+                    intArrayOf(0xFF151926.toInt(), 0xFF0B0D13.toInt())
+                ).apply {
+                    cornerRadius = dpPx(24).toFloat()
+                    setStroke(dpPx(1), 0x1FFFFFFF)
+                }
+                elevation = dpPx(16).toFloat()
+                isClickable = true // para hindi magsara kapag pinindot ang loob
+                clipToOutline = true
+            }
+
+            // ----- Title + message -----
+            if (title != null || message != null) {
+                val header = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setPadding(dpPx(22), dpPx(18), dpPx(22), dpPx(6))
+                }
+                title?.let { t ->
+                    header.addView(TextView(ctx).apply {
+                        text = t
+                        textSize = 18f
+                        setTextColor(0xFFFFFFFF.toInt())
+                        typeface = Typeface.DEFAULT_BOLD
+                    })
+                    // maliit na accent line sa ilalim ng title
+                    header.addView(View(ctx).apply {
+                        background = GradientDrawable(
+                            GradientDrawable.Orientation.LEFT_RIGHT,
+                            intArrayOf(accent, accent2)
+                        ).apply { cornerRadius = dpPx(2).toFloat() }
+                        layoutParams = LinearLayout.LayoutParams(dpPx(36), dpPx(3))
+                            .apply { topMargin = dpPx(8) }
+                    })
+                }
+                message?.let { m ->
+                    header.addView(TextView(ctx).apply {
+                        text = m
+                        textSize = 13f
+                        setTextColor(textDim)
+                        setPadding(0, dpPx(10), 0, dpPx(4))
+                    })
+                }
+                panel.addView(header)
+            }
+
+            // ----- Content (scrollable) -----
+            val cv = contentView
+            if (cv != null) {
+                val scroll: ScrollView
+                if (cv is ScrollView) {
+                    scroll = cv
+                    val inner = cv.getChildAt(0)
+                    inner?.setPadding(dpPx(22), dpPx(8), dpPx(22), dpPx(12))
+                } else {
+                    val wrapper = LinearLayout(ctx).apply {
+                        orientation = LinearLayout.VERTICAL
+                        setPadding(dpPx(22), dpPx(8), dpPx(22), dpPx(12))
+                        addView(cv)
+                    }
+                    scroll = ScrollView(ctx).apply { addView(wrapper) }
+                }
+                scroll.isVerticalScrollBarEnabled = false
+                scroll.overScrollMode = View.OVER_SCROLL_NEVER
+                restyleDialogContent(cv)
+                panel.addView(scroll, LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f
+                ))
+            }
+
+            // ----- Footer buttons -----
+            fun footerButton(text: CharSequence, kind: Int, onTap: (() -> Unit)): TextView {
+                // kind: 0 = neutral, 1 = negative (ghost), 2 = positive (accent)
+                return TextView(ctx).apply {
+                    this.text = text
+                    textSize = 14f
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    setPadding(dpPx(18), dpPx(10), dpPx(18), dpPx(10))
+                    when (kind) {
+                        2 -> {
+                            setTextColor(onAccent)
+                            background = RippleDrawable(
+                                ColorStateList.valueOf(0x40FFFFFF),
+                                GradientDrawable(
+                                    GradientDrawable.Orientation.LEFT_RIGHT,
+                                    intArrayOf(accent, accent2)
+                                ).apply { cornerRadius = dpPx(14).toFloat() },
+                                GradientDrawable().apply {
+                                    setColor(Color.WHITE)
+                                    cornerRadius = dpPx(14).toFloat()
+                                }
+                            )
+                        }
+                        1 -> {
+                            setTextColor(0xFFE9EBF2.toInt())
+                            background = modernBg(0xFF1E212C.toInt(), 0x1FFFFFFF, 14)
+                        }
+                        else -> {
+                            setTextColor(textDim)
+                            background = modernBg(0x00000000, 0, 14)
+                        }
+                    }
+                    setOnClickListener { onTap() }
+                    pressScale()
+                }
+            }
+
+            if (posText != null || negText != null || neuText != null) {
+                val footer = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(dpPx(16), dpPx(8), dpPx(16), dpPx(14))
+                }
+                neuText?.let { t ->
+                    footer.addView(footerButton(t, 0) {
+                        dialog.dismiss()
+                        neuListener?.invoke(dialog, android.content.DialogInterface.BUTTON_NEUTRAL)
+                    })
+                }
+                footer.addView(View(ctx), LinearLayout.LayoutParams(0, 1, 1f))
+                negText?.let { t ->
+                    footer.addView(footerButton(t, 1) {
+                        dialog.dismiss()
+                        negListener?.invoke(dialog, android.content.DialogInterface.BUTTON_NEGATIVE)
+                    })
+                }
+                posText?.let { t ->
+                    footer.addView(
+                        footerButton(t, 2) {
+                            dialog.dismiss()
+                            posListener?.invoke(dialog, android.content.DialogInterface.BUTTON_POSITIVE)
+                        },
+                        LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            LinearLayout.LayoutParams.WRAP_CONTENT
+                        ).apply { leftMargin = dpPx(8) }
+                    )
+                }
+                panel.addView(footer)
+            }
+
+            // ----- Root (scrim) -----
+            val basePad = dpPx(16)
+            val screenW = resources.displayMetrics.widthPixels
+            val panelW = minOf((screenW * 0.92f).toInt(), dpPx(620))
+
+            val root = FrameLayout(ctx).apply {
+                setBackgroundColor(0xB3000000.toInt())
+                setPadding(basePad, basePad, basePad, basePad)
+                setOnClickListener { dialog.dismiss() }
+                addView(
+                    panel,
+                    FrameLayout.LayoutParams(panelW, FrameLayout.LayoutParams.WRAP_CONTENT)
+                        .apply { gravity = Gravity.CENTER }
+                )
+            }
+
+            // Keyboard: iangat ang panel para hindi matakpan ang mga input
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                ViewCompat.setOnApplyWindowInsetsListener(root) { v, insets ->
+                    val ime = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+                    v.setPadding(basePad, basePad, basePad, basePad + ime)
+                    insets
+                }
+            } else {
+                dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+            }
+
+            dialog.setContentView(root)
+            dialog.window?.apply {
+                setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+                setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                setDimAmount(0f)
+                setFlags(
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                )
+            }
+            dialog.setOnDismissListener {
+                if (activeModernDialog === dialog) activeModernDialog = null
+            }
+            activeModernDialog = dialog
+            dialog.show()
+            applyImmersive(dialog.window)
+            dialog.window?.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+            ViewCompat.requestApplyInsets(root)
+
+            // ----- Animation -----
+            root.alpha = 0f
+            root.animate().alpha(1f).setDuration(150).start()
+            panel.scaleX = 0.94f
+            panel.scaleY = 0.94f
+            panel.animate().scaleX(1f).scaleY(1f).setDuration(210)
+                .setInterpolator(DecelerateInterpolator()).start()
+
+            return dialog
+        }
     }
 
     private fun showMainMenuDialog() {
@@ -1148,7 +1514,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("🎙️ Greeting Tracks (per pangalan)")
             .setView(scrollView)
             .setPositiveButton("Idagdag/I-save") { _, _ ->
@@ -2066,7 +2432,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("🗒️ Voice Log")
             .setView(scrollView)
             .setPositiveButton("I-clear") { _, _ -> voiceLog.clear() }
@@ -2083,7 +2449,7 @@ class MainActivity : ComponentActivity() {
     private fun showLocalVoiceDialog() {
         val engine = tts
         if (engine == null) {
-            android.app.AlertDialog.Builder(this)
+            ModernDialog()
                 .setTitle("🗣️ Boses (Lokal na TTS)")
                 .setMessage("Hindi pa handa ang lokal na TTS engine. Subukan ulit mamaya.")
                 .setPositiveButton("Sige", null)
@@ -2093,7 +2459,7 @@ class MainActivity : ComponentActivity() {
 
         val allVoices = try { engine.voices?.toList() ?: emptyList() } catch (e: Exception) { emptyList() }
         if (allVoices.isEmpty()) {
-            android.app.AlertDialog.Builder(this)
+            ModernDialog()
                 .setTitle("🗣️ Boses (Lokal na TTS)")
                 .setMessage("Walang nakitang listahan ng boses sa TTS engine ng phone mo.")
                 .setPositiveButton("Sige", null)
@@ -2184,7 +2550,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("🗣️ Boses (Lokal na TTS)")
             .setView(scrollView)
             .setNegativeButton("Isara") { _, _ ->
@@ -3274,13 +3640,13 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        var dialogRef: android.app.AlertDialog? = null
+        var dialogRef: android.app.Dialog? = null
         calibrateButton.setOnClickListener {
             dialogRef?.dismiss()
             startNavCalibration()
         }
 
-        dialogRef = android.app.AlertDialog.Builder(this)
+        dialogRef = ModernDialog()
             .setTitle("🧭 Camera Nav (obstacle avoidance)")
             .setView(scrollView)
             .setPositiveButton("I-save") { _, _ ->
@@ -3431,7 +3797,7 @@ class MainActivity : ComponentActivity() {
         container.addView(limitInput)
         container.addView(note)
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("🧠 Gemini AI")
             .setView(ScrollView(this).apply { addView(container) })
             .setPositiveButton("Save") { _, _ ->
@@ -3463,7 +3829,7 @@ class MainActivity : ComponentActivity() {
             setText(esp32BaseUrl.removePrefix("http://"))
         }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("I-set ang IP Address ng Robot")
             .setMessage("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save.")
             .setView(input)
@@ -3514,7 +3880,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("📏 Distance Settings")
             .setView(scrollView)
             .setPositiveButton("I-save") { _, _ ->
@@ -3550,7 +3916,7 @@ class MainActivity : ComponentActivity() {
             setText((micConfidenceThreshold * 100).toInt().toString())
         }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("🎤 Mic Sensitivity")
             .setMessage("Minimum confidence (%) bago ituring na valid ang narinig. Mas mataas = mas mahigpit/malinaw kailangan sabihin.")
             .setView(input)
@@ -3583,7 +3949,7 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_TEXT
         }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("Mag-enroll ng mukha")
             .setView(input)
             .setPositiveButton("Save") { _, _ ->
@@ -3688,7 +4054,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("Mga Voice Command")
             .setView(scrollView)
             .setPositiveButton("Idagdag") { _, _ ->
@@ -3737,7 +4103,7 @@ class MainActivity : ComponentActivity() {
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
-        android.app.AlertDialog.Builder(this)
+        ModernDialog()
             .setTitle("I-edit ang Command")
             .setView(scrollView)
             .setPositiveButton("I-save") { _, _ ->
