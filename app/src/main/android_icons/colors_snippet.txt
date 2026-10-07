@@ -1,0 +1,2 @@
+<!-- Add this line inside app/src/main/res/values/colors.xml -->
+<color name="ic_launcher_background">#00CEEA</color>
