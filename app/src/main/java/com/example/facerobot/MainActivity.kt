@@ -815,6 +815,7 @@ class MainActivity : ComponentActivity() {
      * para umayon sa dark/modern na tema - hindi na kailangang baguhin ang bawat dialog nang isa-isa.
      */
     private fun restyleDialogContent(v: View) {
+        if (v.tag == "keepstyle") return // sariling styling (hal. expression picker)
         val accent = 0xFF00E5C7.toInt()
         val onAccent = 0xFF04342C.toInt()
         val cardBg = 0xFF171A23.toInt()
@@ -1605,9 +1606,83 @@ class MainActivity : ComponentActivity() {
 
     private fun runOnUi(block: () -> Unit) = runOnUiThread(block)
 
-    /** Galit na mata (pula, nanginginig) sandali kapag may natanggap na utos - kusang bumabalik sa dating mood. */
-    private fun flashCommandEyes() {
-        roboEyesView.flashMood(RoboEyesView.Mood.ANGRY, 2000L)
+    /**
+     * Expression ng mata kapag may natanggap na utos - kusang bumabalik sa dating mood.
+     * Kung may napiling expression ang command (sa Mga Utos), iyon ang gagamitin; "NONE" = walang gagalaw;
+     * walang napili = default na galit (pula, nanginginig).
+     */
+    private fun flashCommandEyes(cmd: CommandStore.VoiceCommand? = null) {
+        val key = cmd?.expression.orEmpty()
+        if (key == "NONE") return
+        val mood = if (key.isEmpty()) RoboEyesView.Mood.ANGRY
+            else RoboEyesView.Mood.fromKey(key) ?: RoboEyesView.Mood.ANGRY
+        roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
+    }
+
+    // Mga pagpipilian sa Mga Utos: (key na naka-save, pangalan sa app)
+    private val expressionOptions: List<Pair<String, String>> = listOf(
+        "" to "⭐ Default",
+        "NONE" to "🚫 Wala",
+        "ANGRY" to "😠 Galit",
+        "HAPPY" to "😊 Masaya",
+        "SLEEPY" to "😴 Inaantok",
+        "SURPRISED" to "😲 Gulat",
+        "LOVE" to "😍 In love",
+        "SAD" to "😢 Malungkot",
+        "THINKING" to "🤔 Nag-iisip",
+        "LISTENING" to "🎧 Nakikinig"
+    )
+
+    private fun expressionLabel(key: String): String =
+        expressionOptions.firstOrNull { it.first == key }?.second ?: expressionOptions[0].second
+
+    /**
+     * "Kahon" na pipiliin ng expression ng mata para sa isang command: mga chip na pinipindot.
+     * Ibinabalik ang view at isang function na nagbibigay ng napiling key.
+     */
+    private fun buildExpressionPicker(initialKey: String): Pair<View, () -> String> {
+        val accent = 0xFF00E5C7.toInt()
+        val onAccent = 0xFF04342C.toInt()
+        var selected = if (expressionOptions.any { it.first == initialKey }) initialKey else ""
+        val chips = mutableListOf<Pair<String, TextView>>()
+
+        fun refresh() {
+            for ((key, tv) in chips) {
+                val on = key == selected
+                tv.setTextColor(if (on) onAccent else 0xFFFFFFFF.toInt())
+                tv.background = modernBg(if (on) accent else 0xFF262A3B.toInt(), 0, 12)
+            }
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            tag = "keepstyle"
+        }
+        expressionOptions.chunked(4).forEachIndexed { rowIndex, rowOptions ->
+            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for ((key, label) in rowOptions) {
+                val chip = TextView(this).apply {
+                    text = label
+                    textSize = 12f
+                    typeface = Typeface.DEFAULT_BOLD
+                    gravity = Gravity.CENTER
+                    maxLines = 1
+                    setPadding(dpPx(6), dpPx(10), dpPx(6), dpPx(10))
+                    setOnClickListener { selected = key; refresh() }
+                }
+                chips.add(key to chip)
+                row.addView(chip, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { setMargins(dpPx(3), dpPx(3), dpPx(3), dpPx(3)) })
+            }
+            // pantay na lapad ng mga chip kahit kulang ang huling hanay
+            repeat(4 - rowOptions.size) {
+                row.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f)
+                    .apply { setMargins(dpPx(3), 0, dpPx(3), 0) })
+            }
+            box.addView(row)
+        }
+        refresh()
+        return box to { selected }
     }
 
     // ---------- Camera setup ----------
@@ -2157,7 +2232,7 @@ class MainActivity : ComponentActivity() {
         // 2) Maiikling eksaktong utos (hal. "sayaw", "abante") - lokal at instant, gaya ng dati.
         val exact = findExactCustomCommand(candidates)
         if (exact != null) {
-            flashCommandEyes()
+            flashCommandEyes(exact)
             speak(exact.randomReply())
             if (exact.action.isNotBlank()) executeEsp32Actions(exact.action)
             addVoiceLogEntry(heardText, "custom: \"${exact.trigger}\"")
@@ -2232,6 +2307,7 @@ class MainActivity : ComponentActivity() {
         lastGeminiRequestTime = System.currentTimeMillis()
         bumpGeminiCount()
         statusText.text = "🧠 Nag-iisip... ($heardText)"
+        roboEyesView.flashMood(RoboEyesView.Mood.THINKING, 20_000L)
 
         geminiBrain.ask(
             apiKey = geminiApiKey,
@@ -2271,6 +2347,7 @@ class MainActivity : ComponentActivity() {
         lastGeminiRequestTime = System.currentTimeMillis()
         bumpGeminiCount()
         statusText.text = "👁️ Tumitingin... ($question)"
+        roboEyesView.flashMood(RoboEyesView.Mood.THINKING, 20_000L)
 
         // Kailangan ng live camera view para may makuhang larawan - lumipat muna papuntang
         // camera kung nasa mata (RoboEyes) pa, gamit ang parehong transition cue.
@@ -2348,6 +2425,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onGeminiReply(heardText: String, reply: GeminiBrain.Reply, allowAction: Boolean = true) {
+        roboEyesView.clearFlash() // tapos na mag-isip
         val text = reply.text.trim()
         // Sa vision Q&A (allowAction = false), pinipilit nating "NONE" kahit ano pa ang ibalik
         // ni Gemini - puro impormasyon lang dapat ang sagot dito, hindi galaw/STOP papunta sa
@@ -2377,6 +2455,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onGeminiFail(candidates: List<String>, fail: GeminiBrain.Result.Fail) {
+        roboEyesView.clearFlash()
+        roboEyesView.flashMood(RoboEyesView.Mood.SAD, 2500L) // malungkot kapag nabigo si Gemini
         val heardText = candidates.first()
         if (fail.kind == GeminiBrain.FailKind.RATE_LIMIT) {
             geminiCooldownUntil = System.currentTimeMillis() + 20_000L
@@ -2410,7 +2490,7 @@ class MainActivity : ComponentActivity() {
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
-                flashCommandEyes()
+                flashCommandEyes(custom)
                 speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
                     executeEsp32Actions(custom.action)
@@ -4051,7 +4131,8 @@ class MainActivity : ComponentActivity() {
                     val actionPart = if (cmd.action.isNotBlank()) " [ESP32: ${cmd.action}]" else ""
                     val replyDisplay = cmd.reply.replace("||", " / ")
                     val triggerDisplay = cmd.trigger.replace("||", " / ")
-                    text = "\"$triggerDisplay\" -> \"$replyDisplay\"$actionPart"
+                    val exprPart = if (cmd.expression.isNotEmpty()) " [mata: ${expressionLabel(cmd.expression)}]" else ""
+                    text = "\"$triggerDisplay\" -> \"$replyDisplay\"$actionPart$exprPart"
                     textSize = 13f
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 })
@@ -4115,6 +4196,16 @@ class MainActivity : ComponentActivity() {
             }
         )
         container.addView(actionInput)
+        container.addView(TextView(this).apply { text = "Expression ng mata kapag natanggap ang command:"; setPadding(0, 24, 0, 8) })
+        val (expressionPicker, getExpression) = buildExpressionPicker("")
+        container.addView(expressionPicker)
+        container.addView(
+            TextView(this).apply {
+                text = "Default = galit na mata sandali. Wala = hindi gagalaw ang mata."
+                textSize = 11f
+                setPadding(0, 4, 0, 0)
+            }
+        )
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
@@ -4126,7 +4217,7 @@ class MainActivity : ComponentActivity() {
                 val reply = replyInput.text.toString().trim()
                 val action = actionInput.text.toString().trim()
                 if (trigger.isNotEmpty() && reply.isNotEmpty()) {
-                    commandStore.add(trigger, reply, action)
+                    commandStore.add(trigger, reply, action, getExpression())
                     statusText.text = "Idinagdag na command: \"$trigger\""
                 }
             }
@@ -4164,6 +4255,16 @@ class MainActivity : ComponentActivity() {
         container.addView(replyInput)
         container.addView(TextView(this).apply { text = "ESP32 action:"; setPadding(0, 24, 0, 0) })
         container.addView(actionInput)
+        container.addView(TextView(this).apply { text = "Expression ng mata kapag natanggap ang command:"; setPadding(0, 24, 0, 8) })
+        val (expressionPicker, getExpression) = buildExpressionPicker(cmd.expression)
+        container.addView(expressionPicker)
+        container.addView(
+            TextView(this).apply {
+                text = "Default = galit na mata sandali. Wala = hindi gagalaw ang mata."
+                textSize = 11f
+                setPadding(0, 4, 0, 0)
+            }
+        )
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
@@ -4178,7 +4279,7 @@ class MainActivity : ComponentActivity() {
                     if (newTrigger != cmd.trigger) {
                         commandStore.remove(cmd.trigger)
                     }
-                    commandStore.add(newTrigger, newReply, newAction)
+                    commandStore.add(newTrigger, newReply, newAction, getExpression())
                     statusText.text = "Na-update: \"$newTrigger\""
                 }
                 showManageCommandsDialog()
