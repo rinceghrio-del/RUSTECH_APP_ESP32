@@ -1375,7 +1375,7 @@ class MainActivity : ComponentActivity() {
                 if (canEnroll) "Bagong mukha" else "Kailangan ng mukha",
                 enabled = canEnroll
             ) { showEnrollDialog() },
-            makeCard("🎙️", "Greeting Tracks", "Bati sa bawat tao") { showGreetingTracksDialog() },
+            makeCard("🎙️", "Mga Greeting", "I-edit ang bati") { showGreetingTracksDialog() },
             makeCard("📏", "Distance", "Layo ng tao") { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("💬", "Mga Utos", "Voice commands") { showManageCommandsDialog() },
@@ -1490,95 +1490,196 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 24)
         }
+        container.addView(TextView(this).apply {
+            text = "Pindutin ang I-edit para baguhin ang bati, DFPlayer tracks, at expression ng mata ng bawat isa."
+            textSize = 11f
+            setPadding(0, 0, 0, 16)
+        })
 
-        val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
-        val obj = JSONObject(json)
-        val keys = obj.keys().asSequence().toList()
+        val builtins = listOf(greetUnknownKey, "aso", "pusa")
+        val named = (greetMap("greeting_tracks").keys().asSequence().toList() +
+            greetMap("greeting_lines").keys().asSequence().toList() +
+            greetMap("greeting_expr").keys().asSequence().toList())
+            .filter { it !in builtins }
+            .distinct()
 
-        if (keys.isEmpty()) {
-            container.addView(TextView(this).apply {
-                text = "Wala pang naka-set na greeting track."
-                setPadding(0, 0, 0, 24)
+        fun subjectTitle(sub: String): String = when (sub) {
+            greetUnknownKey -> "👤 Hindi kilalang tao"
+            "aso" -> "🐶 Aso"
+            "pusa" -> "🐱 Pusa"
+            else -> "🙂 $sub"
+        }
+
+        fun subjectSummary(sub: String): String {
+            val tracks = if (sub == greetUnknownKey) unknownGreetingTracksRaw else greetMapGet("greeting_tracks", sub)
+            val parts = mutableListOf<String>()
+            if (tracks.isNotBlank()) parts.add("Tracks $tracks")
+            val custom = greetingLinesFor(sub)
+            if (custom.isNotEmpty()) parts.add("💬 ${custom.size} bati")
+            val expr = greetMapGet("greeting_expr", sub)
+            if (expr.isNotEmpty()) parts.add("mata: ${expressionLabel(expr)}")
+            return if (parts.isEmpty()) "default" else parts.joinToString(" • ")
+        }
+
+        for (subject in builtins + named) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val texts = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            texts.addView(TextView(this).apply { text = subjectTitle(subject); textSize = 14f })
+            texts.addView(TextView(this).apply { text = subjectSummary(subject); textSize = 11f })
+            row.addView(texts)
+            row.addView(Button(this).apply {
+                text = "I-edit"
+                textSize = 10f
+                setOnClickListener { showEditGreetingDialog(subject) }
             })
-        } else {
-            for (name in keys) {
-                val row = LinearLayout(this).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                }
-                row.addView(TextView(this@MainActivity).apply {
-                    text = "$name -> Tracks ${obj.getString(name)}"
-                    textSize = 13f
-                    layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-                })
-                row.addView(Button(this@MainActivity).apply {
+            if (subject !in builtins) {
+                row.addView(Button(this).apply {
                     text = "Tanggalin"
                     textSize = 10f
                     setOnClickListener {
-                        removeGreetingTrack(name)
+                        greetMapSet("greeting_tracks", subject, "")
+                        greetMapSet("greeting_lines", subject, "")
+                        greetMapSet("greeting_expr", subject, "")
                         showGreetingTracksDialog()
                     }
                 })
-                container.addView(row)
             }
+            container.addView(row)
         }
-
-        container.addView(View(this).apply {
-            setBackgroundColor(0xFFCCCCCC.toInt())
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
-                .apply { topMargin = 32; bottomMargin = 32 }
-        })
-
-        container.addView(TextView(this).apply { text = "Magdagdag ng greeting track:" })
-        container.addView(TextView(this).apply {
-            text = "(Pwede ring \"aso\" o \"pusa\" ilagay bilang pangalan - para sa pet greeting)"
-            textSize = 11f
-            setTextColor(0xFF888888.toInt())
-            setPadding(0, 0, 0, 12)
-        })
-
-        val nameInput = EditText(this).apply {
-            hint = "Eksaktong pangalan (kagaya ng naka-enroll), o \"aso\"/\"pusa\" - IWANAN BLANGKO kung hindi kilalang tao"
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-        val trackInput = EditText(this).apply {
-            hint = "Track numbers, comma-separated (hal. 25,26,27)"
-            inputType = InputType.TYPE_CLASS_TEXT
-        }
-        container.addView(nameInput)
-        container.addView(trackInput)
-
-        container.addView(View(this).apply {
-            setBackgroundColor(0xFFCCCCCC.toInt())
-            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 2)
-                .apply { topMargin = 32; bottomMargin = 32 }
-        })
-        container.addView(TextView(this).apply {
-            text = "🎲 Random tracks para sa HINDI kilalang tao (comma-separated):"
-        })
-        val unknownTracksInput = EditText(this).apply {
-            hint = "hal. 32,33,34,35,36,37"
-            inputType = InputType.TYPE_CLASS_TEXT
-            setText(unknownGreetingTracksRaw)
-        }
-        container.addView(unknownTracksInput)
 
         val scrollView = ScrollView(this).apply { addView(container) }
 
         ModernDialog()
-            .setTitle("🎙️ Greeting Tracks (per pangalan)")
+            .setTitle("🎙️ Mga Greeting")
             .setView(scrollView)
-            .setPositiveButton("Idagdag/I-save") { _, _ ->
-                val name = nameInput.text.toString().trim()
-                val tracksCsv = trackInput.text.toString().trim()
-                if (name.isNotEmpty() && tracksCsv.isNotEmpty()) {
-                    setGreetingTracks(name, tracksCsv)
-                }
-                unknownGreetingTracksRaw = unknownTracksInput.text.toString().trim()
-                statusText.text = "Na-save ang greeting tracks"
-            }
-            .setNegativeButton("Isara", null)
+            .setNeutralButton("➕ Bagong greeting") { _, _ -> showEditGreetingDialog(null) }
+            .setPositiveButton("Tapos", null)
             .showImmersive()
+    }
+
+    /** subject = null para sa bagong greeting. */
+    private fun showEditGreetingDialog(subject: String?) {
+        val builtins = listOf(greetUnknownKey, "aso", "pusa")
+        val isBuiltin = subject != null && subject in builtins
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+
+        val dialogTitle = when (subject) {
+            null -> "➕ Bagong Greeting"
+            greetUnknownKey -> "👤 Hindi kilalang tao"
+            "aso" -> "🐶 Aso"
+            "pusa" -> "🐱 Pusa"
+            else -> "✏️ $subject"
+        }
+
+        val nameInput = EditText(this).apply {
+            hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(if (subject != null && !isBuiltin) subject else "")
+        }
+        if (!isBuiltin) {
+            container.addView(TextView(this).apply { text = "Pangalan ng tao:" })
+            container.addView(nameInput)
+            container.addView(TextView(this).apply {
+                text = "Pwede ring \"aso\" o \"pusa\" para sa pet greeting."
+                textSize = 11f
+                setPadding(0, 0, 0, 8)
+            })
+        }
+
+        // Mga bati: isang linya = isang bati. Para sa hindi kilalang tao at pets, ipinapakita ang mga default.
+        val savedLines = subject?.let { greetingLinesFor(it) }.orEmpty()
+        val shownLines = if (savedLines.isNotEmpty()) savedLines
+            else if (subject != null) defaultGreetingLines(subject) else emptyList()
+        val linesInput = EditText(this).apply {
+            hint = "hal. Kumusta, {name}!"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            maxLines = 8
+            gravity = Gravity.TOP or Gravity.START
+            setText(shownLines.joinToString("\n"))
+        }
+        container.addView(TextView(this).apply { text = "Mga bati (isang linya = isang bati):"; setPadding(0, 16, 0, 0) })
+        container.addView(linesInput)
+        container.addView(TextView(this).apply {
+            text = "Random ang pipiliin. Pwedeng ilagay ang {name} para sa pangalan ng tao. Kapag may sarili kang bati, ito ang gagamitin kaysa kay Gemini at sa DFPlayer track. Blangko o hindi binago ang default = dating behavior."
+            textSize = 11f
+            setPadding(0, 0, 0, 8)
+        })
+
+        fun tracksOf(sub: String): String =
+            if (sub == greetUnknownKey) unknownGreetingTracksRaw else greetMapGet("greeting_tracks", sub)
+        val tracksInput = EditText(this).apply {
+            hint = "hal. 25,26,27 (blangko = walang track)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(subject?.let { tracksOf(it) }.orEmpty())
+        }
+        container.addView(TextView(this).apply { text = "DFPlayer tracks (comma-separated):"; setPadding(0, 16, 0, 0) })
+        container.addView(tracksInput)
+
+        container.addView(TextView(this).apply { text = "Expression ng mata kapag binati:"; setPadding(0, 24, 0, 8) })
+        val (expressionPicker, getExpression) = buildExpressionPicker(
+            subject?.let { greetMapGet("greeting_expr", it) }.orEmpty(),
+            forGreeting = true
+        )
+        container.addView(expressionPicker)
+        container.addView(TextView(this).apply {
+            text = "Default = walang pagbabago sa mata."
+            textSize = 11f
+            setPadding(0, 4, 0, 0)
+        })
+
+        val scrollView = ScrollView(this).apply { addView(container) }
+
+        val dlg = ModernDialog()
+            .setTitle(dialogTitle)
+            .setView(scrollView)
+            .setPositiveButton("I-save") { _, _ ->
+                val name = if (isBuiltin && subject != null) subject else nameInput.text.toString().trim()
+                if (name.isEmpty()) {
+                    statusText.text = "Kailangan ng pangalan para sa greeting"
+                } else {
+                    // Kung pinalitan ang pangalan, tanggalin muna ang luma
+                    if (!isBuiltin && subject != null && name != subject) {
+                        greetMapSet("greeting_tracks", subject, "")
+                        greetMapSet("greeting_lines", subject, "")
+                        greetMapSet("greeting_expr", subject, "")
+                    }
+                    val lines = linesInput.text.toString().split("\n").map { it.trim() }.filter { it.isNotEmpty() }
+                    // Kung blangko o kapareho pa rin ng default, huwag i-save bilang "sarili" - para tuloy ang Gemini/track
+                    val isDefault = lines == defaultGreetingLines(name)
+                    greetMapSet("greeting_lines", name, if (lines.isEmpty() || isDefault) "" else lines.joinToString("||"))
+
+                    val tracks = tracksInput.text.toString().trim()
+                    if (name == greetUnknownKey) unknownGreetingTracksRaw = tracks
+                    else greetMapSet("greeting_tracks", name, tracks)
+
+                    greetMapSet("greeting_expr", name, getExpression())
+                    statusText.text = "Na-save ang greeting: ${if (name == greetUnknownKey) "hindi kilalang tao" else name}"
+                }
+                showGreetingTracksDialog()
+            }
+            .setNegativeButton("Cancel") { _, _ -> showGreetingTracksDialog() }
+
+        if (isBuiltin && subject != null) {
+            dlg.setNeutralButton("I-reset") { _, _ ->
+                greetMapSet("greeting_lines", subject, "")
+                greetMapSet("greeting_expr", subject, "")
+                if (subject == greetUnknownKey) unknownGreetingTracksRaw = "" else greetMapSet("greeting_tracks", subject, "")
+                statusText.text = "Na-reset sa default ang greeting"
+                showGreetingTracksDialog()
+            }
+        }
+        dlg.showImmersive()
     }
 
     private fun showEyesUi() {
@@ -1640,10 +1741,11 @@ class MainActivity : ComponentActivity() {
      * "Kahon" na pipiliin ng expression ng mata para sa isang command: mga chip na pinipindot.
      * Ibinabalik ang view at isang function na nagbibigay ng napiling key.
      */
-    private fun buildExpressionPicker(initialKey: String): Pair<View, () -> String> {
+    private fun buildExpressionPicker(initialKey: String, forGreeting: Boolean = false): Pair<View, () -> String> {
+        val options = if (forGreeting) expressionOptions.filter { it.first != "NONE" } else expressionOptions
         val accent = 0xFF00E5C7.toInt()
         val onAccent = 0xFF04342C.toInt()
-        var selected = if (expressionOptions.any { it.first == initialKey }) initialKey else ""
+        var selected = if (options.any { it.first == initialKey }) initialKey else ""
         val chips = mutableListOf<Pair<String, TextView>>()
 
         fun refresh() {
@@ -1658,7 +1760,7 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.VERTICAL
             tag = "keepstyle"
         }
-        expressionOptions.chunked(4).forEachIndexed { rowIndex, rowOptions ->
+        options.chunked(4).forEachIndexed { rowIndex, rowOptions ->
             val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
             for ((key, label) in rowOptions) {
                 val chip = TextView(this).apply {
@@ -1947,6 +2049,47 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putString("greeting_tracks", obj.toString()).apply()
     }
 
+    // ---------- Naeedit na Greetings: bati (text), DFPlayer tracks, at expression ng mata ----------
+    // Naka-save sa prefs bilang JSON na {subject -> value}. Ang subject ay ang pangalan ng tao,
+    // "aso"/"pusa", o greetUnknownKey para sa hindi kilalang tao.
+    private val greetUnknownKey = "__unknown__"
+
+    private fun greetMap(prefKey: String): JSONObject =
+        try { JSONObject(prefs.getString(prefKey, "{}") ?: "{}") } catch (e: Exception) { JSONObject() }
+
+    private fun greetMapGet(prefKey: String, subject: String): String = greetMap(prefKey).optString(subject, "")
+
+    /** Blangko ang value = tanggalin ang entry. */
+    private fun greetMapSet(prefKey: String, subject: String, value: String) {
+        val obj = greetMap(prefKey)
+        if (value.isBlank()) obj.remove(subject) else obj.put(subject, value)
+        prefs.edit().putString(prefKey, obj.toString()).apply()
+    }
+
+    /** Sariling mga bati ni idol (naka-save na "||"-separated). Walang laman = gamitin ang default. */
+    private fun greetingLinesFor(subject: String): List<String> =
+        greetMapGet("greeting_lines", subject).split("||").map { it.trim() }.filter { it.isNotEmpty() }
+
+    /** Ang mga naka-built-in na bati (para may mai-edit na panimula sa dialog). */
+    private fun defaultGreetingLines(subject: String): List<String> =
+        if (subject == greetUnknownKey) unknownGreetings else (petGreetings[subject] ?: emptyList())
+
+    /** Expression ng mata kapag binabati ang subject (kung may napili). */
+    private fun flashGreetingEyes(subject: String) {
+        val key = greetMapGet("greeting_expr", subject)
+        if (key.isEmpty() || key == "NONE") return
+        val mood = RoboEyesView.Mood.fromKey(key) ?: return
+        roboEyesView.flashMood(mood, 3000L)
+    }
+
+    /** Kung may sariling bati si idol para sa subject, iyon ang sasabihin. Ibinabalik kung may nasabi. */
+    private fun speakCustomGreeting(subject: String, name: String): Boolean {
+        val lines = greetingLinesFor(subject)
+        if (lines.isEmpty()) return false
+        speak(lines.random().replace("{name}", name))
+        return true
+    }
+
     private fun greetIfNeeded(name: String) {
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
@@ -1954,6 +2097,9 @@ class MainActivity : ComponentActivity() {
 
         lastGreetedName = name
         lastGreetedTime = now
+
+        flashGreetingEyes(name)
+        if (speakCustomGreeting(name, name)) return
 
         val tracks = greetingTracksFor(name)
         if (tracks.isNotEmpty() && !geminiEnabled) {
@@ -1974,6 +2120,9 @@ class MainActivity : ComponentActivity() {
         if (now - lastUnknownGreetTime < greetingCooldownMs) return
         lastUnknownGreetTime = now
 
+        flashGreetingEyes(greetUnknownKey)
+        if (speakCustomGreeting(greetUnknownKey, "")) return
+
         val tracks = unknownGreetingTrackList()
         if (tracks.isNotEmpty() && !geminiEnabled) {
             sendPlayTrack(tracks.random())
@@ -1993,6 +2142,9 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
         lastPetGreetTime = now
+
+        flashGreetingEyes(label)
+        if (speakCustomGreeting(label, label)) return
 
         // Pareho ng greetIfNeeded(name) sa tao: gamit ang parehong "greeting_tracks" store,
         // dahil "aso"/"pusa" mismo ang label - kaya kung nag-set ka ng tracks sa Greeting
