@@ -311,9 +311,9 @@ class MainActivity : ComponentActivity() {
 
     private var lastPetGreetTime = 0L
     private val petGreetingCooldownMs = 45_000L
-    private val petGreetings = mapOf(
-        "pusa" to listOf("Meow! Kumusta pusa!", "Ay, may pusa! Ang cute!", "Hi pusa, gusto mo bang makipaglaro?"),
-        "aso" to listOf("Woof woof! Kumusta aso!", "Ay, may aso! Kaibigan ko yan.", "Hi doggi!")
+    private val petGreetings: Map<String, List<String>> get() = mapOf(
+        "pusa" to listOf(tr("Meow! Kumusta pusa!"), tr("Ay, may pusa! Ang cute!"), tr("Hi pusa, gusto mo bang makipaglaro?")),
+        "aso" to listOf(tr("Woof woof! Kumusta aso!"), tr("Ay, may aso! Kaibigan ko yan."), tr("Hi doggi!"))
     )
 
     private var voskModel: Model? = null
@@ -425,6 +425,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        GeminiBrain.language = appLanguage
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         forceWifiForEsp32()
@@ -457,7 +458,7 @@ class MainActivity : ComponentActivity() {
             startCamera()
             setupVosk()
         } else {
-            statusText.text = "Naghahanap ng tao... (hinihintay permissions...)"
+            statusText.text = tr("Naghahanap ng tao... (hinihintay permissions...)")
             ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
         }
     }
@@ -735,6 +736,50 @@ class MainActivity : ComponentActivity() {
         return RippleDrawable(ColorStateList.valueOf(0x40FFFFFF), shape, mask)
     }
 
+    // ---------- Wika / Language ("fil" = Filipino, "en" = English) ----------
+    @Volatile private var appLanguageCache: String? = null
+
+    private var appLanguage: String
+        get() = appLanguageCache ?: (prefs.getString("app_language", "fil") ?: "fil").also { appLanguageCache = it }
+        set(value) {
+            appLanguageCache = value
+            prefs.edit().putString("app_language", value).apply()
+            GeminiBrain.language = value
+        }
+
+    private val isEnglish: Boolean get() = appLanguage == "en"
+
+    /**
+     * Isinasalin ang Filipino na teksto sa English kapag English ang napiling wika (Translations.kt).
+     * Ang {0}, {1}... ay napapalitan ng mga args. Kapag walang salin, ang orihinal na teksto ang lalabas.
+     */
+    private fun tr(fil: String, vararg args: Any?): String {
+        var s = if (isEnglish) (Translations.en[fil] ?: fil) else fil
+        for (i in args.indices) s = s.replace("{$i}", args[i].toString())
+        return s
+    }
+
+    /** Itinatakda ang wika ng lokal na TTS ayon sa wika ng app. Ibinabalik kung okay ang boses (Filipino o English mode). */
+    private fun applyTtsLanguage(): Boolean {
+        val engine = tts ?: return true
+        fun isOk(r: Int) = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+        var langOk = true
+        if (isEnglish) {
+            engine.setLanguage(Locale.US)
+        } else if (!isOk(engine.setLanguage(Locale("fil", "PH")))) {
+            if (!isOk(engine.setLanguage(Locale("tl", "PH")))) {
+                engine.setLanguage(Locale.US)
+                langOk = false
+            }
+        }
+        // Sariling napiling boses (kung meron). Sa English mode, English na boses lang ang gagamitin.
+        if (selectedTtsVoiceName.isNotBlank()) {
+            val match = try { engine.voices?.firstOrNull { it.name == selectedTtsVoiceName } } catch (e: Exception) { null }
+            if (match != null && (!isEnglish || match.locale.language == "en")) engine.voice = match
+        }
+        return langOk
+    }
+
     // ---------- Modern UI helpers (fullscreen + styling) ----------
 
     private fun dpPx(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
@@ -867,7 +912,7 @@ class MainActivity : ComponentActivity() {
                 v.textSize = 12f
                 v.setPadding(dpPx(12), dpPx(8), dpPx(12), dpPx(8))
                 when {
-                    t.contains("Tanggalin") -> {
+                    t.contains("Tanggalin") || t.contains("Delete") -> {
                         v.setTextColor(0xFFFF7B7B.toInt())
                         v.background = modernBg(0x26FF5C5C, 0, 12)
                     }
@@ -878,7 +923,7 @@ class MainActivity : ComponentActivity() {
                         v.setPadding(dpPx(14), dpPx(12), dpPx(14), dpPx(12))
                         setMarginsDp(v, 0, 12, 0, 4)
                     }
-                    t.contains("Piliin") -> {
+                    t.contains("Piliin") || t.contains("Choose") -> {
                         v.setTextColor(onAccent)
                         v.background = modernBg(accent, 0, 12)
                     }
@@ -1231,6 +1276,44 @@ class MainActivity : ComponentActivity() {
         }
         header.addView(ipPill)
 
+        // Wika / Language: Filipino o English (nagre-refresh agad ang menu)
+        val langWrap = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dpPx(3), dpPx(3), dpPx(3), dpPx(3))
+            background = GradientDrawable().apply {
+                setColor(0xFF0E1016.toInt())
+                cornerRadius = dpPx(16).toFloat()
+                setStroke(dpPx(1), cardStroke)
+            }
+        }
+        fun langChip(text: String, code: String): TextView {
+            val on = appLanguage == code
+            return label(text, 11f, if (on) onAccent else textDim, bold = true).apply {
+                gravity = Gravity.CENTER
+                setPadding(dpPx(10), dpPx(6), dpPx(10), dpPx(6))
+                background = GradientDrawable().apply {
+                    cornerRadius = dpPx(13).toFloat()
+                    setColor(if (on) accent else Color.TRANSPARENT)
+                }
+                setOnClickListener {
+                    if (appLanguage != code) {
+                        appLanguage = code
+                        applyTtsLanguage()
+                        statusText.text = if (code == "en") "🌐 Language: English" else "🌐 Wika: Filipino"
+                        dialog.dismiss()
+                        showMainMenuDialog()
+                    }
+                }
+            }
+        }
+        langWrap.addView(langChip("🇵🇭 FIL", "fil"))
+        langWrap.addView(langChip("🇺🇸 EN", "en"))
+        header.addView(
+            langWrap,
+            LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+                .apply { leftMargin = dpPx(10) }
+        )
+
         val closeBtn = label("✕", 15f, textMain, bold = true).apply {
             gravity = Gravity.CENTER
             background = modernBg(0xFF1E212C.toInt(), 0, 18)
@@ -1262,7 +1345,7 @@ class MainActivity : ComponentActivity() {
         geminiCard.addView(label("🧠", 28f, onAccent))
         val geminiTexts = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
         geminiTexts.addView(label("Gemini AI", 16f, onAccent, bold = true))
-        geminiTexts.addView(label("Utak ni Rustech", 12f, 0xCC04342C.toInt()))
+        geminiTexts.addView(label(tr("Utak ni Rustech"), 12f, 0xCC04342C.toInt()))
         geminiCard.addView(
             geminiTexts,
             LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dpPx(12) }
@@ -1368,19 +1451,19 @@ class MainActivity : ComponentActivity() {
         }
 
         val cards = listOf(
-            makeCard("🗣️", "Boses", "Lokal na TTS") { showLocalVoiceDialog() },
-            makeCard("📶", "IP ng Robot", esp32BaseUrl.removePrefix("http://")) { showIpSettingDialog() },
+            makeCard("🗣️", tr("Boses"), tr("Lokal na TTS")) { showLocalVoiceDialog() },
+            makeCard("📶", tr("IP ng Robot"), esp32BaseUrl.removePrefix("http://")) { showIpSettingDialog() },
             makeCard(
-                "✨", "Mag-enroll ng mukha",
-                if (canEnroll) "Bagong mukha" else "Kailangan ng mukha",
+                "✨", tr("Mag-enroll ng mukha"),
+                if (canEnroll) tr("Bagong mukha") else tr("Kailangan ng mukha"),
                 enabled = canEnroll
             ) { showEnrollDialog() },
-            makeCard("🎙️", "Mga Greeting", "I-edit ang bati") { showGreetingTracksDialog() },
-            makeCard("📏", "Distance", "Layo ng tao") { showDistanceSettingsDialog() },
+            makeCard("🎙️", tr("Mga Greeting"), tr("I-edit ang bati")) { showGreetingTracksDialog() },
+            makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
-            makeCard("💬", "Mga Utos", "Voice commands") { showManageCommandsDialog() },
+            makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
             makeCard("🧭", "Camera Nav", "Obstacle avoidance") { showNavSettingsDialog() },
-            makeCard("🗒️", "Voice Log", "Kasaysayan") { showVoiceLogDialog() }
+            makeCard("🗒️", "Voice Log", tr("Kasaysayan")) { showVoiceLogDialog() }
         )
 
         val grid = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
@@ -1491,7 +1574,7 @@ class MainActivity : ComponentActivity() {
             setPadding(48, 24, 48, 24)
         }
         container.addView(TextView(this).apply {
-            text = "Pindutin ang I-edit para baguhin ang bati, DFPlayer tracks, at expression ng mata ng bawat isa."
+            text = tr("Pindutin ang I-edit para baguhin ang bati, DFPlayer tracks, at expression ng mata ng bawat isa.")
             textSize = 11f
             setPadding(0, 0, 0, 16)
         })
@@ -1504,9 +1587,9 @@ class MainActivity : ComponentActivity() {
             .distinct()
 
         fun subjectTitle(sub: String): String = when (sub) {
-            greetUnknownKey -> "👤 Hindi kilalang tao"
-            "aso" -> "🐶 Aso"
-            "pusa" -> "🐱 Pusa"
+            greetUnknownKey -> tr("👤 Hindi kilalang tao")
+            "aso" -> tr("🐶 Aso")
+            "pusa" -> tr("🐱 Pusa")
             else -> "🙂 $sub"
         }
 
@@ -1515,9 +1598,9 @@ class MainActivity : ComponentActivity() {
             val parts = mutableListOf<String>()
             if (tracks.isNotBlank()) parts.add("Tracks $tracks")
             val custom = greetingLinesFor(sub)
-            if (custom.isNotEmpty()) parts.add("💬 ${custom.size} bati")
+            if (custom.isNotEmpty()) parts.add(tr("💬 {0} bati", custom.size))
             val expr = greetMapGet("greeting_expr", sub)
-            if (expr.isNotEmpty()) parts.add("mata: ${expressionLabel(expr)}")
+            if (expr.isNotEmpty()) parts.add(tr("mata: {0}", expressionLabel(expr)))
             return if (parts.isEmpty()) "default" else parts.joinToString(" • ")
         }
 
@@ -1534,13 +1617,13 @@ class MainActivity : ComponentActivity() {
             texts.addView(TextView(this).apply { text = subjectSummary(subject); textSize = 11f })
             row.addView(texts)
             row.addView(Button(this).apply {
-                text = "I-edit"
+                text = tr("I-edit")
                 textSize = 10f
                 setOnClickListener { showEditGreetingDialog(subject) }
             })
             if (subject !in builtins) {
                 row.addView(Button(this).apply {
-                    text = "Tanggalin"
+                    text = tr("Tanggalin")
                     textSize = 10f
                     setOnClickListener {
                         greetMapSet("greeting_tracks", subject, "")
@@ -1556,10 +1639,10 @@ class MainActivity : ComponentActivity() {
         val scrollView = ScrollView(this).apply { addView(container) }
 
         ModernDialog()
-            .setTitle("🎙️ Mga Greeting")
+            .setTitle(tr("🎙️ Mga Greeting"))
             .setView(scrollView)
-            .setNeutralButton("➕ Bagong greeting") { _, _ -> showEditGreetingDialog(null) }
-            .setPositiveButton("Tapos", null)
+            .setNeutralButton(tr("➕ Bagong greeting")) { _, _ -> showEditGreetingDialog(null) }
+            .setPositiveButton(tr("Tapos"), null)
             .showImmersive()
     }
 
@@ -1574,23 +1657,23 @@ class MainActivity : ComponentActivity() {
         }
 
         val dialogTitle = when (subject) {
-            null -> "➕ Bagong Greeting"
-            greetUnknownKey -> "👤 Hindi kilalang tao"
-            "aso" -> "🐶 Aso"
-            "pusa" -> "🐱 Pusa"
+            null -> tr("➕ Bagong Greeting")
+            greetUnknownKey -> tr("👤 Hindi kilalang tao")
+            "aso" -> tr("🐶 Aso")
+            "pusa" -> tr("🐱 Pusa")
             else -> "✏️ $subject"
         }
 
         val nameInput = EditText(this).apply {
-            hint = "Eksaktong pangalan (kagaya ng naka-enroll)"
+            hint = tr("Eksaktong pangalan (kagaya ng naka-enroll)")
             inputType = InputType.TYPE_CLASS_TEXT
             setText(if (subject != null && !isBuiltin) subject else "")
         }
         if (!isBuiltin) {
-            container.addView(TextView(this).apply { text = "Pangalan ng tao:" })
+            container.addView(TextView(this).apply { text = tr("Pangalan ng tao:") })
             container.addView(nameInput)
             container.addView(TextView(this).apply {
-                text = "Pwede ring \"aso\" o \"pusa\" para sa pet greeting."
+                text = tr("Pwede ring \"aso\" o \"pusa\" para sa pet greeting.")
                 textSize = 11f
                 setPadding(0, 0, 0, 8)
             })
@@ -1601,17 +1684,17 @@ class MainActivity : ComponentActivity() {
         val shownLines = if (savedLines.isNotEmpty()) savedLines
             else if (subject != null) defaultGreetingLines(subject) else emptyList()
         val linesInput = EditText(this).apply {
-            hint = "hal. Kumusta, {name}!"
+            hint = tr("hal. Kumusta, {name}!")
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 3
             maxLines = 8
             gravity = Gravity.TOP or Gravity.START
             setText(shownLines.joinToString("\n"))
         }
-        container.addView(TextView(this).apply { text = "Mga bati (isang linya = isang bati):"; setPadding(0, 16, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Mga bati (isang linya = isang bati):"); setPadding(0, 16, 0, 0) })
         container.addView(linesInput)
         container.addView(TextView(this).apply {
-            text = "Random ang pipiliin. Pwedeng ilagay ang {name} para sa pangalan ng tao. Kapag may sarili kang bati, ito ang gagamitin kaysa kay Gemini at sa DFPlayer track. Blangko o hindi binago ang default = dating behavior."
+            text = tr("Random ang pipiliin. Pwedeng ilagay ang {name} para sa pangalan ng tao. Kapag may sarili kang bati, ito ang gagamitin kaysa kay Gemini at sa DFPlayer track. Blangko o hindi binago ang default = dating behavior.")
             textSize = 11f
             setPadding(0, 0, 0, 8)
         })
@@ -1619,21 +1702,21 @@ class MainActivity : ComponentActivity() {
         fun tracksOf(sub: String): String =
             if (sub == greetUnknownKey) unknownGreetingTracksRaw else greetMapGet("greeting_tracks", sub)
         val tracksInput = EditText(this).apply {
-            hint = "hal. 25,26,27 (blangko = walang track)"
+            hint = tr("hal. 25,26,27 (blangko = walang track)")
             inputType = InputType.TYPE_CLASS_TEXT
             setText(subject?.let { tracksOf(it) }.orEmpty())
         }
         container.addView(TextView(this).apply { text = "DFPlayer tracks (comma-separated):"; setPadding(0, 16, 0, 0) })
         container.addView(tracksInput)
 
-        container.addView(TextView(this).apply { text = "Expression ng mata kapag binati:"; setPadding(0, 24, 0, 8) })
+        container.addView(TextView(this).apply { text = tr("Expression ng mata kapag binati:"); setPadding(0, 24, 0, 8) })
         val (expressionPicker, getExpression) = buildExpressionPicker(
             subject?.let { greetMapGet("greeting_expr", it) }.orEmpty(),
             forGreeting = true
         )
         container.addView(expressionPicker)
         container.addView(TextView(this).apply {
-            text = "Default = walang pagbabago sa mata."
+            text = tr("Default = walang pagbabago sa mata.")
             textSize = 11f
             setPadding(0, 4, 0, 0)
         })
@@ -1643,10 +1726,10 @@ class MainActivity : ComponentActivity() {
         val dlg = ModernDialog()
             .setTitle(dialogTitle)
             .setView(scrollView)
-            .setPositiveButton("I-save") { _, _ ->
+            .setPositiveButton(tr("I-save")) { _, _ ->
                 val name = if (isBuiltin && subject != null) subject else nameInput.text.toString().trim()
                 if (name.isEmpty()) {
-                    statusText.text = "Kailangan ng pangalan para sa greeting"
+                    statusText.text = tr("Kailangan ng pangalan para sa greeting")
                 } else {
                     // Kung pinalitan ang pangalan, tanggalin muna ang luma
                     if (!isBuiltin && subject != null && name != subject) {
@@ -1664,18 +1747,18 @@ class MainActivity : ComponentActivity() {
                     else greetMapSet("greeting_tracks", name, tracks)
 
                     greetMapSet("greeting_expr", name, getExpression())
-                    statusText.text = "Na-save ang greeting: ${if (name == greetUnknownKey) "hindi kilalang tao" else name}"
+                    statusText.text = tr("Na-save ang greeting: {0}", if (name == greetUnknownKey) "hindi kilalang tao" else name)
                 }
                 showGreetingTracksDialog()
             }
             .setNegativeButton("Cancel") { _, _ -> showGreetingTracksDialog() }
 
         if (isBuiltin && subject != null) {
-            dlg.setNeutralButton("I-reset") { _, _ ->
+            dlg.setNeutralButton(tr("I-reset")) { _, _ ->
                 greetMapSet("greeting_lines", subject, "")
                 greetMapSet("greeting_expr", subject, "")
                 if (subject == greetUnknownKey) unknownGreetingTracksRaw = "" else greetMapSet("greeting_tracks", subject, "")
-                statusText.text = "Na-reset sa default ang greeting"
+                statusText.text = tr("Na-reset sa default ang greeting")
                 showGreetingTracksDialog()
             }
         }
@@ -1686,9 +1769,9 @@ class MainActivity : ComponentActivity() {
         appState = AppState.EYES
         canEnroll = false
         statusText.text = if (yoloDetector.isReady) {
-            "Naghahanap ng tao..."
+            tr("Naghahanap ng tao...")
         } else {
-            "Naghahanap ng tao... (kulang: assets/yolo_person.tflite)"
+            tr("Naghahanap ng tao... (kulang: assets/yolo_person.tflite)")
         }
         lastGreetedName = null
         lastUnknownGreetTime = 0L
@@ -1702,7 +1785,7 @@ class MainActivity : ComponentActivity() {
         appState = AppState.CAMERA
         lastPersonSeenTime = System.currentTimeMillis()
         roboEyesView.setMood(RoboEyesView.Mood.ALERT)
-        statusText.text = "May tao! Sinusubukang kilalanin..."
+        statusText.text = tr("May tao! Sinusubukang kilalanin...")
     }
 
     private fun runOnUi(block: () -> Unit) = runOnUiThread(block)
@@ -1721,17 +1804,17 @@ class MainActivity : ComponentActivity() {
     }
 
     // Mga pagpipilian sa Mga Utos: (key na naka-save, pangalan sa app)
-    private val expressionOptions: List<Pair<String, String>> = listOf(
+    private val expressionOptions: List<Pair<String, String>> get() = listOf(
         "" to "⭐ Default",
-        "NONE" to "🚫 Wala",
-        "ANGRY" to "😠 Galit",
-        "HAPPY" to "😊 Masaya",
-        "SLEEPY" to "😴 Inaantok",
-        "SURPRISED" to "😲 Gulat",
+        "NONE" to tr("🚫 Wala"),
+        "ANGRY" to tr("😠 Galit"),
+        "HAPPY" to tr("😊 Masaya"),
+        "SLEEPY" to tr("😴 Inaantok"),
+        "SURPRISED" to tr("😲 Gulat"),
         "LOVE" to "😍 In love",
-        "SAD" to "😢 Malungkot",
-        "THINKING" to "🤔 Nag-iisip",
-        "LISTENING" to "🎧 Nakikinig"
+        "SAD" to tr("😢 Malungkot"),
+        "THINKING" to tr("🤔 Nag-iisip"),
+        "LISTENING" to tr("🎧 Nakikinig")
     )
 
     private fun expressionLabel(key: String): String =
@@ -1814,7 +1897,7 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 e.printStackTrace()
                 runOnUi {
-                    statusText.text = "Naghahanap ng tao... (camera setup error: ${e.javaClass.simpleName}: ${e.message})"
+                    statusText.text = tr("Naghahanap ng tao... (camera setup error: {0}: {1})", e.javaClass.simpleName, e.message)
                 }
             }
         }, ContextCompat.getMainExecutor(this))
@@ -1830,7 +1913,7 @@ class MainActivity : ComponentActivity() {
             if (grantedMap[Manifest.permission.CAMERA] == PackageManager.PERMISSION_GRANTED) {
                 startCamera()
             } else if (permissions.contains(Manifest.permission.CAMERA)) {
-                statusText.text = "Naghahanap ng tao... (TINANGGIHAN ang camera permission)"
+                statusText.text = tr("Naghahanap ng tao... (TINANGGIHAN ang camera permission)")
             }
 
             if (grantedMap[Manifest.permission.RECORD_AUDIO] == PackageManager.PERMISSION_GRANTED) {
@@ -1919,7 +2002,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             e.printStackTrace()
             runOnUi {
-                statusText.text = "Naghahanap ng tao... (crash: ${e.javaClass.simpleName}: ${e.message})"
+                statusText.text = tr("Naghahanap ng tao... (crash: {0}: {1})", e.javaClass.simpleName, e.message)
             }
         } finally {
             imageProxy.close()
@@ -1986,16 +2069,16 @@ class MainActivity : ComponentActivity() {
                         val match = faceStore.match(embedding)
                         runOnUi {
                             if (match != null) {
-                                statusText.text = "Kilala: ${match.name} (${(match.similarity * 100).toInt()}%)"
+                                statusText.text = tr("Kilala: {0} ({1}%)", match.name, (match.similarity * 100).toInt())
                                 canEnroll = false
                                 lastUnknownFaceEmbedding = null
                                 currentRecognizedName = match.name
                                 greetIfNeeded(match.name)
                             } else {
                                 statusText.text = if (faceStore.isEmpty()) {
-                                    "May tao pero wala pang naka-enroll na mukha"
+                                    tr("May tao pero wala pang naka-enroll na mukha")
                                 } else {
-                                    "May Tao"
+                                    tr("May Tao")
                                 }
                                 lastUnknownFaceEmbedding = embedding
                                 canEnroll = true
@@ -2011,17 +2094,17 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val unknownGreetings = listOf(
-        "Kumusta, ano ginagawa mo ngayon.",
-        "Hi kaibigan na tao! Gusto mo bang makipag laro sa akin.",
-        "Kumusta! Saan pala kayo papunta?",
-        "Hello! Pwede mo ba akong Kausapin?",
-        "Hi! kausapin mo ako",
-        "Ngayon ka lang ba naka kita ng laruan na kagaya ko",
-        "Kumain na ba kayo",
-        "tara laro tayo",
-        "Nagyayaya ba ang tropa ng inuman?",
-        "Huwag mo ako kalimutan na e charge!",
+    private val unknownGreetings: List<String> get() = listOf(
+        tr("Kumusta, ano ginagawa mo ngayon."),
+        tr("Hi kaibigan na tao! Gusto mo bang makipag laro sa akin."),
+        tr("Kumusta! Saan pala kayo papunta?"),
+        tr("Hello! Pwede mo ba akong Kausapin?"),
+        tr("Hi! kausapin mo ako"),
+        tr("Ngayon ka lang ba naka kita ng laruan na kagaya ko"),
+        tr("Kumain na ba kayo"),
+        tr("tara laro tayo"),
+        tr("Nagyayaya ba ang tropa ng inuman?"),
+        tr("Huwag mo ako kalimutan na e charge!"),
     )
 
     // ---------- Greeting Tracks (per-enrolled-name DFPlayer greeting) ----------
@@ -2108,9 +2191,8 @@ class MainActivity : ComponentActivity() {
             // Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - subukang gawing
             // bago/iba-iba ang bati sa pamamagitan ni Gemini, may fallback pa rin kung mabigo.
             sayDynamicOrFallback(
-                "May nakita kang kilalang kaibigan/kasama na si $name sa harap mo ngayon - " +
-                    "batiin mo siya nang maikli at natural, parang kakakita mo lang talaga sa kanya.",
-                "Kumusta, $name!"
+                "May nakita kang kilalang kaibigan/kasama na si $name sa harap mo ngayon - batiin mo siya nang maikli at natural, parang kakakita mo lang talaga sa kanya.",
+                tr("Kumusta, {0}!", name)
             )
         }
     }
@@ -2128,8 +2210,7 @@ class MainActivity : ComponentActivity() {
             sendPlayTrack(tracks.random())
         } else if (geminiEnabled) {
             sayDynamicOrFallback(
-                "May nakita kang BAGONG tao sa harap mo na hindi mo pa kilala - batiin mo siya " +
-                    "nang friendly, maikli, at natural.",
+                "May nakita kang BAGONG tao sa harap mo na hindi mo pa kilala - batiin mo siya nang friendly, maikli, at natural.",
                 unknownGreetings.random()
             )
         } else if (ttsReady) {
@@ -2159,8 +2240,7 @@ class MainActivity : ComponentActivity() {
         val options = petGreetings[label]
         if (geminiEnabled && options != null) {
             sayDynamicOrFallback(
-                "May nakita kang $label sa harap ng camera mo ngayon - magreact ka nang maikli " +
-                    "at masaya, parang kakakita mo lang talaga.",
+                "May nakita kang $label sa harap ng camera mo ngayon - magreact ka nang maikli at masaya, parang kakakita mo lang talaga.",
                 options.random()
             )
             return
@@ -2187,7 +2267,7 @@ class MainActivity : ComponentActivity() {
     private fun downloadAndExtractVoskModel() {
         Thread {
             try {
-                runOnUi { statusText.text = "⬇️ Dina-download ang Filipino voice model (~320MB, isang beses lang ito)..." }
+                runOnUi { statusText.text = tr("⬇️ Dina-download ang Filipino voice model (~320MB, isang beses lang ito)...") }
 
                 val request = Request.Builder().url(voskModelUrl).build()
                 val response = httpClient.newCall(request).execute()
@@ -2210,21 +2290,21 @@ class MainActivity : ComponentActivity() {
                             if (totalBytes > 0 && now - lastUpdate > 500) {
                                 lastUpdate = now
                                 val percent = (downloadedBytes * 100 / totalBytes).toInt()
-                                runOnUi { statusText.text = "⬇️ Dina-download ang voice model... $percent%" }
+                                runOnUi { statusText.text = tr("⬇️ Dina-download ang voice model... {0}%", percent) }
                             }
                         }
                     }
                 }
                 response.close()
 
-                runOnUi { statusText.text = "📦 Ina-extract ang voice model..." }
+                runOnUi { statusText.text = tr("📦 Ina-extract ang voice model...") }
                 extractZip(zipFile, filesDir)
                 zipFile.delete()
 
                 loadVoskModel(voskModelDir().absolutePath)
             } catch (e: Exception) {
                 e.printStackTrace()
-                runOnUi { statusText.text = "❌ Hindi na-download ang voice model: ${e.message}" }
+                runOnUi { statusText.text = tr("❌ Hindi na-download ang voice model: {0}", e.message) }
             }
         }.start()
     }
@@ -2259,12 +2339,12 @@ class MainActivity : ComponentActivity() {
                 voskModel = model
                 runOnUi {
                     voskReady = true
-                    statusText.text = "🎤 Handa na makinig (offline)"
+                    statusText.text = tr("🎤 Handa na makinig (offline)")
                     startVoskListening()
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
-                runOnUi { statusText.text = "❌ Hindi na-load ang voice model: ${e.message}" }
+                runOnUi { statusText.text = tr("❌ Hindi na-load ang voice model: {0}", e.message) }
             }
         }.start()
     }
@@ -2317,7 +2397,7 @@ class MainActivity : ComponentActivity() {
 
             val candidateTexts = candidates.map { it.first }
             runOnUi {
-                statusText.text = "[MIC] Narinig: $topText"
+                statusText.text = tr("[MIC] Narinig: {0}", topText)
                 handleVoiceCommand(candidateTexts)
             }
         }
@@ -2352,8 +2432,8 @@ class MainActivity : ComponentActivity() {
         if (!useGemini) {
             val reason = when {
                 !geminiEnabled -> ""
-                geminiApiKey.isBlank() -> " (walang Gemini API key)"
-                geminiUsedToday() >= geminiDailyLimit -> " (naabot ang daily limit ng Gemini)"
+                geminiApiKey.isBlank() -> tr(" (walang Gemini API key)")
+                geminiUsedToday() >= geminiDailyLimit -> tr(" (naabot ang daily limit ng Gemini)")
                 else -> " (Gemini cooldown)"
             }
             addVoiceLogEntry(heardText, processVoiceCommand(candidates) + reason)
@@ -2363,7 +2443,7 @@ class MainActivity : ComponentActivity() {
         // 1) KALIGTASAN: STOP ay laging lokal at agad - hindi na dumadaan sa internet.
         if (candidates.any { it.contains("hinto") || it.contains("stop") || it.contains("tigil") }) {
             flashCommandEyes()
-            speak("Hihinto na po!")
+            speak(tr("Hihinto na po!"))
             sendCommandToEsp32("FORCE_STOP")
             addVoiceLogEntry(heardText, "FORCE_STOP")
             return
@@ -2427,13 +2507,13 @@ class MainActivity : ComponentActivity() {
             if (mentionsCamera && hasSwitchIntent) {
                 showRoboEyes = false
                 applyDisplayMode()
-                playTransitionCue("ipakita ang camera", "dfplayer play 47", "Sige, ipapakita ko na ang camera.")
+                playTransitionCue("ipakita ang camera", "dfplayer play 47", tr("Sige, ipapakita ko na ang camera."))
                 return "display: camera"
             }
             if (mentionsEyes && hasSwitchIntent) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
+                speakTransitionCue("balik sa mata", tr("Sige, babalik na sa mata."))
                 return "display: eyes"
             }
         }
@@ -2458,7 +2538,7 @@ class MainActivity : ComponentActivity() {
         geminiBusy = true
         lastGeminiRequestTime = System.currentTimeMillis()
         bumpGeminiCount()
-        statusText.text = "🧠 Nag-iisip... ($heardText)"
+        statusText.text = tr("🧠 Nag-iisip... ({0})", heardText)
         roboEyesView.flashMood(RoboEyesView.Mood.THINKING, 20_000L)
 
         geminiBrain.ask(
@@ -2498,7 +2578,7 @@ class MainActivity : ComponentActivity() {
         geminiBusy = true
         lastGeminiRequestTime = System.currentTimeMillis()
         bumpGeminiCount()
-        statusText.text = "👁️ Tumitingin... ($question)"
+        statusText.text = tr("👁️ Tumitingin... ({0})", question)
         roboEyesView.flashMood(RoboEyesView.Mood.THINKING, 20_000L)
 
         // Kailangan ng live camera view para may makuhang larawan - lumipat muna papuntang
@@ -2506,7 +2586,7 @@ class MainActivity : ComponentActivity() {
         if (showRoboEyes) {
             showRoboEyes = false
             applyDisplayMode()
-            playTransitionCue("ipakita ang camera", "dfplayer play 47", "Sandali lang, tumitingin ako...")
+            playTransitionCue("ipakita ang camera", "dfplayer play 47", tr("Sandali lang, tumitingin ako..."))
         }
 
         pendingVisionCapture = { bitmap ->
@@ -2585,7 +2665,7 @@ class MainActivity : ComponentActivity() {
         val action = if (allowAction) reply.action.uppercase() else "NONE"
 
         if (text.isEmpty() && action == "NONE") {
-            statusText.text = "[MIC] (hindi para sa akin) $heardText"
+            statusText.text = tr("[MIC] (hindi para sa akin) {0}", heardText)
             addVoiceLogEntry(heardText, "gemini: hindi pinansin")
             return
         }
@@ -2625,11 +2705,11 @@ class MainActivity : ComponentActivity() {
                 lastGeminiErrorSpeakTime = now
                 speak(
                     when (fail.kind) {
-                        GeminiBrain.FailKind.RATE_LIMIT -> "Sandali lang, napagod ang utak ko. Mamaya ulit tayo mag-usap."
-                        GeminiBrain.FailKind.NETWORK -> "Wala akong signal ngayon, hindi ako makapag-isip nang malalim."
-                        GeminiBrain.FailKind.BAD_KEY -> "Mukhang may mali sa API key ko. Pakitingnan sa menu."
-                        GeminiBrain.FailKind.BLOCKED -> "Hmm, hindi ko masagot yan. Iba na lang."
-                        else -> "May gumulo sa utak ko. Ulitin mo nga."
+                        GeminiBrain.FailKind.RATE_LIMIT -> tr("Sandali lang, napagod ang utak ko. Mamaya ulit tayo mag-usap.")
+                        GeminiBrain.FailKind.NETWORK -> tr("Wala akong signal ngayon, hindi ako makapag-isip nang malalim.")
+                        GeminiBrain.FailKind.BAD_KEY -> tr("Mukhang may mali sa API key ko. Pakitingnan sa menu.")
+                        GeminiBrain.FailKind.BLOCKED -> tr("Hmm, hindi ko masagot yan. Iba na lang.")
+                        else -> tr("May gumulo sa utak ko. Ulitin mo nga.")
                     }
                 )
             }
@@ -2653,28 +2733,28 @@ class MainActivity : ComponentActivity() {
             when {
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
                     flashCommandEyes()
-                    speak("Hihinto na po!")
+                    speak(tr("Hihinto na po!"))
                     sendCommandToEsp32("FORCE_STOP")
                     return "FORCE_STOP"
                 }
                 text.contains("kaliwa") || text.contains("left") -> {
                     flashCommandEyes()
-                    speak("Lilikot sa kaliwa.")
+                    speak(tr("Lilikot sa kaliwa."))
                     sendTimedCommand("LEFT", voiceMovementDurationMs)
                     return "LEFT"
                 }
                 text.contains("kanan") || text.contains("right") -> {
                     flashCommandEyes()
-                    speak("Lilikot sa kanan.")
+                    speak(tr("Lilikot sa kanan."))
                     sendTimedCommand("RIGHT", voiceMovementDurationMs)
                     return "RIGHT"
                 }
                 text.contains("sino ako") || text.contains("sino po ako") || text.contains("sino ba ako") -> {
                     val name = currentRecognizedName
                     val reply = when {
-                        name != null -> "Ikaw ay si $name!"
-                        appState == AppState.CAMERA -> "Hindi pa kita kilala. Pwede mo akong i-enroll."
-                        else -> "Wala akong nakikitang tao ngayon."
+                        name != null -> tr("Ikaw ay si {0}!", name)
+                        appState == AppState.CAMERA -> tr("Hindi pa kita kilala. Pwede mo akong i-enroll.")
+                        else -> tr("Wala akong nakikitang tao ngayon.")
                     }
                     speak(reply)
                     return "sino ako"
@@ -2683,11 +2763,11 @@ class MainActivity : ComponentActivity() {
                 text.contains("ano ngalan mo") || text.contains("ano name mo") ||
                 text.contains("sino ka ba") || text.contains("pangalan mo") || text.contains("name mo") -> {
                     val RustechReplies = listOf(
-                        "Ako ay si Rustech.. Ang laruan mo na ROBOT!",
-                        "Ako ay si Rustech, ang kaibigan mo!",
-                        "Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo.",
-                        "Rustech ang pangalan ko, ang paborito mong robot companion!",
-                        "Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!"
+                        tr("Ako ay si Rustech.. Ang laruan mo na ROBOT!"),
+                        tr("Ako ay si Rustech, ang kaibigan mo!"),
+                        tr("Ako si Rustech! Handang maglingkod at makipaglaro sa 'yo."),
+                        tr("Rustech ang pangalan ko, ang paborito mong robot companion!"),
+                        tr("Ako si Rustech, ang AI robot na laging handang tumulong sa 'yo!")
                     )
                     speak(RustechReplies.random())
                     return "sino ka"
@@ -2712,7 +2792,7 @@ class MainActivity : ComponentActivity() {
 
         if (voiceLog.isEmpty()) {
             container.addView(TextView(this).apply {
-                text = "Wala pang narinig na boses sa session na ito."
+                text = tr("Wala pang narinig na boses sa session na ito.")
                 setPadding(0, 0, 0, 24)
             })
         } else {
@@ -2732,7 +2812,7 @@ class MainActivity : ComponentActivity() {
             .setTitle("🗒️ Voice Log")
             .setView(scrollView)
             .setPositiveButton("I-clear") { _, _ -> voiceLog.clear() }
-            .setNegativeButton("Isara", null)
+            .setNegativeButton(tr("Isara"), null)
             .showImmersive()
     }
 
@@ -2746,9 +2826,9 @@ class MainActivity : ComponentActivity() {
         val engine = tts
         if (engine == null) {
             ModernDialog()
-                .setTitle("🗣️ Boses (Lokal na TTS)")
-                .setMessage("Hindi pa handa ang lokal na TTS engine. Subukan ulit mamaya.")
-                .setPositiveButton("Sige", null)
+                .setTitle(tr("🗣️ Boses (Lokal na TTS)"))
+                .setMessage(tr("Hindi pa handa ang lokal na TTS engine. Subukan ulit mamaya."))
+                .setPositiveButton(tr("Sige"), null)
                 .showImmersive()
             return
         }
@@ -2756,9 +2836,9 @@ class MainActivity : ComponentActivity() {
         val allVoices = try { engine.voices?.toList() ?: emptyList() } catch (e: Exception) { emptyList() }
         if (allVoices.isEmpty()) {
             ModernDialog()
-                .setTitle("🗣️ Boses (Lokal na TTS)")
-                .setMessage("Walang nakitang listahan ng boses sa TTS engine ng phone mo.")
-                .setPositiveButton("Sige", null)
+                .setTitle(tr("🗣️ Boses (Lokal na TTS)"))
+                .setMessage(tr("Walang nakitang listahan ng boses sa TTS engine ng phone mo."))
+                .setPositiveButton(tr("Sige"), null)
                 .showImmersive()
             return
         }
@@ -2774,9 +2854,7 @@ class MainActivity : ComponentActivity() {
         }
 
         container.addView(TextView(this).apply {
-            text = "I-tap ang ▶️ para pakinggan ang bawat boses. Kapag nahanap mo yung gusto mo, " +
-                "i-tap ang ✅ Piliin. (Walang paraan ang Android para malaman kung babae o lalaki " +
-                "ang boses nang hindi pinapakinggan muna.)"
+            text = tr("I-tap ang ▶️ para pakinggan ang bawat boses. Kapag nahanap mo yung gusto mo, i-tap ang ✅ Piliin. (Walang paraan ang Android para malaman kung babae o lalaki ang boses nang hindi pinapakinggan muna.)")
             textSize = 12f
             setPadding(0, 0, 0, 20)
         })
@@ -2799,7 +2877,7 @@ class MainActivity : ComponentActivity() {
                 setOnClickListener {
                     val previous = engine.voice
                     engine.voice = voice
-                    engine.speak("Kumusta, ako si Rustech!", TextToSpeech.QUEUE_FLUSH, null, "voice_preview")
+                    engine.speak(tr("Kumusta, ako si Rustech!"), TextToSpeech.QUEUE_FLUSH, null, "voice_preview")
                     // Ibalik ang dating gamit na boses pagkatapos ng ilang segundo - preview lang ito.
                     if (previous != null) {
                         rootLayout.postDelayed({ engine.voice = previous }, 3000)
@@ -2807,13 +2885,13 @@ class MainActivity : ComponentActivity() {
                 }
             })
             row.addView(Button(this@MainActivity).apply {
-                text = "✅ Piliin"
+                text = tr("✅ Piliin")
                 textSize = 12f
                 isAllCaps = false
                 setOnClickListener {
                     selectedTtsVoiceName = voice.name
                     engine.voice = voice
-                    statusText.text = "🗣️ Napiling boses: ${voice.name}"
+                    statusText.text = tr("🗣️ Napiling boses: {0}", voice.name)
                 }
             })
             container.addView(row)
@@ -2829,7 +2907,7 @@ class MainActivity : ComponentActivity() {
         }
         if (filipinoNetworkVoices.isNotEmpty()) {
             container.addView(TextView(this).apply {
-                text = "🇵🇭 Filipino/Tagalog (kailangan ng internet):"
+                text = tr("🇵🇭 Filipino/Tagalog (kailangan ng internet):")
                 textSize = 13f
                 setPadding(0, 16, 0, 4)
             })
@@ -2837,7 +2915,7 @@ class MainActivity : ComponentActivity() {
         }
         if (otherVoices.isNotEmpty()) {
             container.addView(TextView(this).apply {
-                text = "🌐 Iba pang wika/boses (kung sakaling wala kang Filipino options):"
+                text = tr("🌐 Iba pang wika/boses (kung sakaling wala kang Filipino options):")
                 textSize = 13f
                 setPadding(0, 16, 0, 4)
             })
@@ -2847,9 +2925,9 @@ class MainActivity : ComponentActivity() {
         val scrollView = ScrollView(this).apply { addView(container) }
 
         ModernDialog()
-            .setTitle("🗣️ Boses (Lokal na TTS)")
+            .setTitle(tr("🗣️ Boses (Lokal na TTS)"))
             .setView(scrollView)
-            .setNegativeButton("Isara") { _, _ ->
+            .setNegativeButton(tr("Isara")) { _, _ ->
                 // Siguraduhing naka-apply ang napiling boses (hindi yung ginamit lang sa preview).
                 if (selectedTtsVoiceName.isNotBlank()) {
                     val match = allVoices.firstOrNull { it.name == selectedTtsVoiceName }
@@ -2880,22 +2958,9 @@ class MainActivity : ComponentActivity() {
         }
         val engine = tts ?: return
 
-        fun isOk(r: Int) = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
-        var filipinoOk = true
-        if (!isOk(engine.setLanguage(Locale("fil", "PH")))) {
-            if (!isOk(engine.setLanguage(Locale("tl", "PH")))) {
-                engine.setLanguage(Locale.US)
-                filipinoOk = false
-            }
-        }
+        val filipinoOk = applyTtsLanguage()
         engine.setSpeechRate(1.0f)
         engine.setPitch(1.0f)
-
-        // Gamitin ang sariling napiling boses (kung meron at available pa sa phone na ito).
-        if (selectedTtsVoiceName.isNotBlank()) {
-            val match = try { engine.voices?.firstOrNull { it.name == selectedTtsVoiceName } } catch (e: Exception) { null }
-            if (match != null) engine.voice = match
-        }
 
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
@@ -2912,7 +2977,7 @@ class MainActivity : ComponentActivity() {
 
         if (!filipinoOk) {
             runOnUi {
-                statusText.text = "⚠️ Walang Filipino voice ang TTS. I-install ang Filipino sa Settings > Text-to-speech (Google)."
+                statusText.text = tr("⚠️ Walang Filipino voice ang TTS. I-install ang Filipino sa Settings > Text-to-speech (Google).")
             }
         }
     }
@@ -3038,7 +3103,7 @@ class MainActivity : ComponentActivity() {
                     runOnUi {
                         elevenLabsBusy = false
                         addVoiceLogEntry("ElevenLabs TTS", "HTTP ${response.code} - fallback sa lokal na TTS")
-                        statusText.text = "⚠️ ElevenLabs error (${response.code}) - gamit muna lokal na TTS"
+                        statusText.text = tr("⚠️ ElevenLabs error ({0}) - gamit muna lokal na TTS", response.code)
                     }
                     response.close()
                     runOnUi { speakWithLocalTts(clean) }
@@ -3338,7 +3403,7 @@ class MainActivity : ComponentActivity() {
     private fun onEspPingResult(body: String?) {
         if (body == null) {
             pingFailCount++
-            if (navActive && pingFailCount >= 5) exitNavMode("nawala ang link sa robot")
+            if (navActive && pingFailCount >= 5) exitNavMode(tr("nawala ang link sa robot"))
             return
         }
         pingFailCount = 0
@@ -3354,15 +3419,15 @@ class MainActivity : ComponentActivity() {
                 } else {
                     // MOVING na ang robot pero wala pang depth model - ipaalam para hindi mukhang "walang nangyayari"
                     statusText.text = if (depthModelBusy) {
-                        "⏳ Camera Nav: hinihintay ang depth model..."
+                        tr("⏳ Camera Nav: hinihintay ang depth model...")
                     } else {
-                        "⚠️ Camera Nav: walang depth model (tignan ang error sa taas / i-restart ang app)"
+                        tr("⚠️ Camera Nav: walang depth model (tignan ang error sa taas / i-restart ang app)")
                     }
                 }
             }
         } else if (navActive) {
             navNonMovingPolls++
-            if (navNonMovingPolls >= 2) exitNavMode("hindi na MOVING ang robot")
+            if (navNonMovingPolls >= 2) exitNavMode(tr("hindi na MOVING ang robot"))
         }
     }
 
@@ -3467,15 +3532,11 @@ class MainActivity : ComponentActivity() {
      * linya tungkol sa kasalukuyang ginagawang transition. */
     private fun situationCueFor(canonicalKey: String): String = when (canonicalKey) {
         "ipakita ang camera" ->
-            "Lilipat ka ngayon mula sa mata/idle screen mo papuntang live camera view, dahil " +
-                "inutusan kang ipakita ang camera - sabihin mo ito nang maikli at masaya, parang " +
-                "totoong inaanunsyo mo habang ginagawa mo."
+            "Lilipat ka ngayon mula sa mata/idle screen mo papuntang live camera view, dahil inutusan kang ipakita ang camera - sabihin mo ito nang maikli at masaya, parang totoong inaanunsyo mo habang ginagawa mo."
         "balik sa mata" ->
-            "Babalik ka ngayon mula sa camera view papuntang mata/idle screen mo - sabihin mo " +
-                "ito nang maikli at natural."
+            "Babalik ka ngayon mula sa camera view papuntang mata/idle screen mo - sabihin mo ito nang maikli at natural."
         "kuha ng litrato" ->
-            "Kukuha ka ngayon ng litrato gamit ang camera mo - sabihin mo ito nang masaya bago " +
-                "ka kumuha, parang totoong inaanunsyo mo."
+            "Kukuha ka ngayon ng litrato gamit ang camera mo - sabihin mo ito nang masaya bago ka kumuha, parang totoong inaanunsyo mo."
         else ->
             "Sabihin mo ang isang maikli at masayang linya tungkol sa ginagawa mong aksyon ngayon."
     }
@@ -3500,7 +3561,7 @@ class MainActivity : ComponentActivity() {
             showRoboEyes = false
             applyDisplayMode()
         }
-        playTransitionCue("kuha ng litrato", "dfplayer play 47", "Kunan na kita ng litrato, ngiti ka!")
+        playTransitionCue("kuha ng litrato", "dfplayer play 47", tr("Kunan na kita ng litrato, ngiti ka!"))
         // bigyan ng oras ang display na maka-switch sa camera preview bago kunin ang frame
         rootLayout.postDelayed({ pendingPhotoCapture = true }, 600)
     }
@@ -3514,7 +3575,7 @@ class MainActivity : ComponentActivity() {
             savePhotoToGallery(upright)
         } catch (e: Exception) {
             e.printStackTrace()
-            runOnUi { statusText.text = "Hindi nakuha ang litrato (${e.javaClass.simpleName})" }
+            runOnUi { statusText.text = tr("Hindi nakuha ang litrato ({0})", e.javaClass.simpleName) }
         } finally {
             imageProxy.close()
         }
@@ -3530,7 +3591,7 @@ class MainActivity : ComponentActivity() {
             if (!showRoboEyes) {
                 showRoboEyes = true
                 applyDisplayMode()
-                speakTransitionCue("balik sa mata", "Sige, babalik na sa mata.")
+                speakTransitionCue("balik sa mata", tr("Sige, babalik na sa mata."))
             }
         }, 5000)
     }
@@ -3565,7 +3626,7 @@ class MainActivity : ComponentActivity() {
             e.printStackTrace()
             runOnUi {
                 geminiBusy = false
-                statusText.text = "Hindi nakuha ang larawan para kay Gemini (${e.javaClass.simpleName})"
+                statusText.text = tr("Hindi nakuha ang larawan para kay Gemini ({0})", e.javaClass.simpleName)
             }
         } finally {
             imageProxy.close()
@@ -3715,14 +3776,14 @@ class MainActivity : ComponentActivity() {
 
     private fun startNavTest() {
         if (obstacleAnalyzer == null) {
-            statusText.text = "❌ Wala pang depth model (hintayin ang download/load)"
+            statusText.text = tr("❌ Wala pang depth model (hintayin ang download/load)")
             return
         }
         obstacleAnalyzer?.reset()
         navTestUntil = System.currentTimeMillis() + 180_000L
         navTestMode = true
         sendCommandToEsp32("STOP", navServoA) // itakda ang tilt ng camera (gumagana kapag BOOT_WAIT)
-        statusText.text = "🧪 Nav TEST (3 min): tignan ang L/C/R, walang utos sa robot"
+        statusText.text = tr("🧪 Nav TEST (3 min): tignan ang L/C/R, walang utos sa robot")
     }
 
     private fun stopNavTest() {
@@ -3733,11 +3794,11 @@ class MainActivity : ComponentActivity() {
 
     private fun startNavCalibration() {
         if (obstacleAnalyzer == null) {
-            statusText.text = "❌ Wala pang depth model (hintayin ang download/load)"
+            statusText.text = tr("❌ Wala pang depth model (hintayin ang download/load)")
             return
         }
         navTestMode = false
-        statusText.text = "🎯 Calibrate: ilagay ang robot ~30cm sa harap ng harang. Magsisimula sa 4 segundo..."
+        statusText.text = tr("🎯 Calibrate: ilagay ang robot ~30cm sa harap ng harang. Magsisimula sa 4 segundo...")
         sendCommandToEsp32("STOP", navServoA) // itakda ang tilt ng camera (gumagana kapag BOOT_WAIT)
         rootLayout.postDelayed({
             obstacleAnalyzer?.reset()
@@ -3750,7 +3811,7 @@ class MainActivity : ComponentActivity() {
     private fun finishNavCalibration() {
         navCalibrating = false
         if (navCalibSamples.size < 3) {
-            statusText.text = "❌ Calibrate: kulang ang samples, subukan ulit"
+            statusText.text = tr("❌ Calibrate: kulang ang samples, subukan ulit")
             return
         }
         val avg = navCalibSamples.average().toFloat()
@@ -3758,7 +3819,7 @@ class MainActivity : ComponentActivity() {
         obstacleAnalyzer?.reset()
         showEyesUi()
         statusText.text = String.format(
-            Locale.US, "🎯 Na-calibrate: danger threshold = %.2f (center avg %.2f)", navBlockThreshold, avg
+            Locale.US, tr("🎯 Na-calibrate: danger threshold = %.2f (center avg %.2f)"), navBlockThreshold, avg
         )
     }
 
@@ -3778,7 +3839,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 obstacleAnalyzer = ObstacleAnalyzer(modelFile)
-                runOnUi { statusText.text = "🧭 Depth model handa (camera obstacle avoidance)" }
+                runOnUi { statusText.text = tr("🧭 Depth model handa (camera obstacle avoidance)") }
             } catch (e: Throwable) {
                 e.printStackTrace()
                 runOnUi { statusText.text = "❌ Depth model: ${e.javaClass.simpleName}: ${e.message}" }
@@ -3800,7 +3861,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun downloadDepthModel(target: File) {
-        runOnUi { statusText.text = "⬇️ Dina-download ang depth model (~66MB, isang beses lang)..." }
+        runOnUi { statusText.text = tr("⬇️ Dina-download ang depth model (~66MB, isang beses lang)...") }
 
         val partFile = File(filesDir, "$depthModelFileName.part")
         val request = Request.Builder().url(depthModelUrl).build()
@@ -3823,7 +3884,7 @@ class MainActivity : ComponentActivity() {
                         if (totalBytes > 0 && now - lastUpdate > 500) {
                             lastUpdate = now
                             val percent = (downloadedBytes * 100 / totalBytes).toInt()
-                            runOnUi { statusText.text = "⬇️ Dina-download ang depth model... $percent%" }
+                            runOnUi { statusText.text = tr("⬇️ Dina-download ang depth model... {0}%", percent) }
                         }
                     }
                 }
@@ -3846,31 +3907,31 @@ class MainActivity : ComponentActivity() {
 
         val modelStatus = TextView(this).apply {
             text = if (obstacleAnalyzer != null) {
-                "✅ Depth model: handa"
+                tr("✅ Depth model: handa")
             } else {
-                "⏳ Depth model: hindi pa handa (dina-download / nilo-load...)"
+                tr("⏳ Depth model: hindi pa handa (dina-download / nilo-load...)")
             }
             textSize = 12f
             setPadding(0, 0, 0, 16)
         }
 
         val enabledSwitch = Switch(this).apply {
-            text = "🧭  Gamitin ang camera bilang obstacle sensor (habang AUTO)"
+            text = tr("🧭  Gamitin ang camera bilang obstacle sensor (habang AUTO)")
             isChecked = navEnabled
             setPadding(0, 16, 0, 16)
         }
         val scanSwitch = Switch(this).apply {
-            text = "↕️  Servo scan (palitan ang tilt A ↔ B)"
+            text = tr("↕️  Servo scan (palitan ang tilt A ↔ B)")
             isChecked = navScanEnabled
             setPadding(0, 16, 0, 16)
         }
         val invertSwitch = Switch(this).apply {
-            text = "↔️  I-invert ang kaliwa/kanan (kung mali ang liko)"
+            text = tr("↔️  I-invert ang kaliwa/kanan (kung mali ang liko)")
             isChecked = navInvert
             setPadding(0, 16, 0, 16)
         }
         val testSwitch = Switch(this).apply {
-            text = "🧪  Test mode (live scores, WALANG utos sa robot, 3 min)"
+            text = tr("🧪  Test mode (live scores, WALANG utos sa robot, 3 min)")
             isChecked = navTestMode
             setPadding(0, 16, 0, 16)
         }
@@ -3892,18 +3953,18 @@ class MainActivity : ComponentActivity() {
         }
 
         val rowTopInput = EditText(this).apply {
-            hint = "Band itaas % (default 30)"
+            hint = tr("Band itaas % (default 30)")
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(navRowTopPercent.toString())
         }
         val rowBottomInput = EditText(this).apply {
-            hint = "Band baba % (default 75)"
+            hint = tr("Band baba % (default 75)")
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(navRowBottomPercent.toString())
         }
 
         val calibrateButton = Button(this).apply {
-            text = "🎯  Calibrate danger (harang ~30cm)"
+            text = tr("🎯  Calibrate danger (harang ~30cm)")
             isAllCaps = false
         }
 
@@ -3912,24 +3973,22 @@ class MainActivity : ComponentActivity() {
         container.addView(scanSwitch)
         container.addView(invertSwitch)
         container.addView(testSwitch)
-        container.addView(TextView(this).apply { text = "Tilt A (nakatingin pababa / malapit na sahig):"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Tilt A (nakatingin pababa / malapit na sahig):"); setPadding(0, 24, 0, 0) })
         container.addView(servoAInput)
-        container.addView(TextView(this).apply { text = "Tilt B (mas nakatingin sa unahan / malayo):"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Tilt B (mas nakatingin sa unahan / malayo):"); setPadding(0, 24, 0, 0) })
         container.addView(servoBInput)
-        container.addView(TextView(this).apply { text = "Danger threshold (mas mababa = mas maaga mag-iwas):"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Danger threshold (mas mababa = mas maaga mag-iwas):"); setPadding(0, 24, 0, 0) })
         container.addView(thresholdInput)
-        container.addView(TextView(this).apply { text = "Band na sinusuri (% ng taas ng larawan, 0 = itaas): itaas at baba"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Band na sinusuri (% ng taas ng larawan, 0 = itaas): itaas at baba"); setPadding(0, 24, 0, 0) })
         container.addView(rowTopInput)
         container.addView(rowBottomInput)
         container.addView(TextView(this).apply {
-            text = "Kung hindi makatingin pababa ang camera at kisame/pader ang nakikita, ibaba ang band (hal. 45 at 90)."
+            text = tr("Kung hindi makatingin pababa ang camera at kisame/pader ang nakikita, ibaba ang band (hal. 45 at 90).")
             textSize = 11f
         })
         container.addView(calibrateButton)
         container.addView(TextView(this).apply {
-            text = "Tip: sa Test mode, tignan ang L / C / R sa taas. Ilagay ang robot ~30cm sa harap ng harang - " +
-                "dapat lumampas sa threshold ang C. Sa bukas na daan, dapat mas mababa ang C. " +
-                "Kung baligtad ang liko ng robot, i-ON ang Invert. Ang score ay RELATIVE, kaya i-Calibrate kapag nagpalit ng sahig/ilaw."
+            text = tr("Tip: sa Test mode, tignan ang L / C / R sa taas. Ilagay ang robot ~30cm sa harap ng harang - dapat lumampas sa threshold ang C. Sa bukas na daan, dapat mas mababa ang C. Kung baligtad ang liko ng robot, i-ON ang Invert. Ang score ay RELATIVE, kaya i-Calibrate kapag nagpalit ng sahig/ilaw.")
             textSize = 11f
             setPadding(0, 16, 0, 0)
         })
@@ -3945,7 +4004,7 @@ class MainActivity : ComponentActivity() {
         dialogRef = ModernDialog()
             .setTitle("🧭 Camera Nav (obstacle avoidance)")
             .setView(scrollView)
-            .setPositiveButton("I-save") { _, _ ->
+            .setPositiveButton(tr("I-save")) { _, _ ->
                 navEnabled = enabledSwitch.isChecked
                 navScanEnabled = scanSwitch.isChecked
                 navInvert = invertSwitch.isChecked
@@ -3960,10 +4019,10 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (testSwitch.isChecked) startNavTest() else stopNavTest()
-                if (!navEnabled && navActive) exitNavMode("naka-OFF ang Camera Nav")
-                if (!testSwitch.isChecked) statusText.text = "Na-save ang Camera Nav settings"
+                if (!navEnabled && navActive) exitNavMode(tr("naka-OFF ang Camera Nav"))
+                if (!testSwitch.isChecked) statusText.text = tr("Na-save ang Camera Nav settings")
             }
-            .setNegativeButton("Isara", null)
+            .setNegativeButton(tr("Isara"), null)
             .showImmersive()
     }
 
@@ -3976,33 +4035,31 @@ class MainActivity : ComponentActivity() {
         }
 
         val enabledSwitch = Switch(this).apply {
-            text = "Gamitin si Gemini (matalinong usapan)"
+            text = tr("Gamitin si Gemini (matalinong usapan)")
             isChecked = geminiEnabled
             setPadding(0, 8, 0, 24)
         }
         val ttsSwitch = Switch(this).apply {
-            text = "🔊 Gamitin ang App TTS (Filipino voice)"
+            text = tr("🔊 Gamitin ang App TTS (Filipino voice)")
             isChecked = appTtsEnabled
             setPadding(0, 0, 0, 8)
         }
         val ttsNote = TextView(this).apply {
-            text = "OFF ito kapag ang boses ng ESP32/DFPlayer na ang gagamitin, para hindi magsabay ang dalawang audio."
+            text = tr("OFF ito kapag ang boses ng ESP32/DFPlayer na ang gagamitin, para hindi magsabay ang dalawang audio.")
             textSize = 11f
             setPadding(0, 0, 0, 24)
         }
         val elevenLabsSwitch = Switch(this).apply {
-            text = "🎙️ Gamitin ang ElevenLabs (mas natural na boses)"
+            text = tr("🎙️ Gamitin ang ElevenLabs (mas natural na boses)")
             isChecked = elevenLabsEnabled
             setPadding(0, 0, 0, 8)
         }
         val elevenLabsNote = TextView(this).apply {
-            text = "May FREE TIER LIMIT ang ElevenLabs (character quota kada buwan). Pag naubos na o may error, " +
-                "AWTOMATIKONG babalik sa lokal na Android TTS habang naka-ON pa rin ang switch na ito - " +
-                "pero pwede mo ring i-OFF dito anumang oras para talagang bumalik sa lokal na TTS."
+            text = tr("May FREE TIER LIMIT ang ElevenLabs (character quota kada buwan). Pag naubos na o may error, AWTOMATIKONG babalik sa lokal na Android TTS habang naka-ON pa rin ang switch na ito - pero pwede mo ring i-OFF dito anumang oras para talagang bumalik sa lokal na TTS.")
             textSize = 11f
             setPadding(0, 0, 0, 16)
         }
-        val elevenLabsKeyLabel = TextView(this).apply { text = "ElevenLabs API key (kunin sa elevenlabs.io):" }
+        val elevenLabsKeyLabel = TextView(this).apply { text = tr("ElevenLabs API key (kunin sa elevenlabs.io):") }
         val elevenLabsKeyInput = EditText(this).apply {
             hint = "sk_..."
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -4021,7 +4078,7 @@ class MainActivity : ComponentActivity() {
             setPadding(0, 0, 0, 24)
         }
         val elevenLabsBoostLabel = TextView(this).apply {
-            text = "🔊 Extra Volume Boost (dB, 0-40 - lagpas sa system volume):"
+            text = tr("🔊 Extra Volume Boost (dB, 0-40 - lagpas sa system volume):")
         }
         val elevenLabsBoostInput = EditText(this).apply {
             hint = "10"
@@ -4030,18 +4087,17 @@ class MainActivity : ComponentActivity() {
             setSingleLine(true)
         }
         val elevenLabsBoostNote = TextView(this).apply {
-            text = "0 = walang dagdag na boost. Mas mataas = mas malakas, pero posibleng magka-distortion/" +
-                "crackle depende sa speaker ng phone mo - subukan lang at hanapin ang sweet spot."
+            text = tr("0 = walang dagdag na boost. Mas mataas = mas malakas, pero posibleng magka-distortion/crackle depende sa speaker ng phone mo - subukan lang at hanapin ang sweet spot.")
             textSize = 11f
             setPadding(0, 0, 0, 24)
         }
         val usageText = TextView(this).apply {
-            text = "📊 Nagamit ngayong araw: ${geminiUsedToday()} / $geminiDailyLimit requests\n(nagre-reset ~3 PM oras sa Pilipinas)"
+            text = tr("📊 Nagamit ngayong araw: {0} / {1} requests\n(nagre-reset ~3 PM oras sa Pilipinas)", geminiUsedToday(), geminiDailyLimit)
             textSize = 13f
             setPadding(0, 0, 0, 24)
         }
         val limitLabel = TextView(this).apply {
-            text = "Daily limit (tingnan sa AI Studio, hal. 500):"
+            text = tr("Daily limit (tingnan sa AI Studio, hal. 500):")
             setPadding(0, 24, 0, 0)
         }
         val limitInput = EditText(this).apply {
@@ -4049,7 +4105,7 @@ class MainActivity : ComponentActivity() {
             setText(geminiDailyLimit.toString())
             setSingleLine(true)
         }
-        val keyLabel = TextView(this).apply { text = "API key (kunin sa aistudio.google.com):" }
+        val keyLabel = TextView(this).apply { text = tr("API key (kunin sa aistudio.google.com):") }
         val keyInput = EditText(this).apply {
             hint = "AIza..."
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
@@ -4067,7 +4123,7 @@ class MainActivity : ComponentActivity() {
             setSingleLine(true)
         }
         val note = TextView(this).apply {
-            text = "Ang STOP ay laging lokal at agad. Kapag walang internet o naubos ang free quota, babalik sa dating lokal na mga utos."
+            text = tr("Ang STOP ay laging lokal at agad. Kapag walang internet o naubos ang free quota, babalik sa dating lokal na mga utos.")
             textSize = 12f
             setPadding(0, 24, 0, 0)
         }
@@ -4108,11 +4164,11 @@ class MainActivity : ComponentActivity() {
                 limitInput.text.toString().trim().toIntOrNull()?.let { geminiDailyLimit = it }
                 geminiCooldownUntil = 0L
                 statusText.text = if (geminiEnabled && geminiApiKey.isNotBlank())
-                    "🧠 Gemini naka-on (${geminiModel})" else "🧠 Gemini naka-off"
+                    tr("🧠 Gemini naka-on ({0})", geminiModel) else tr("🧠 Gemini naka-off")
             }
-            .setNeutralButton("I-reset ang usapan") { _, _ ->
+            .setNeutralButton(tr("I-reset ang usapan")) { _, _ ->
                 geminiBrain.resetConversation()
-                statusText.text = "🧠 Nabura na ang memorya ng usapan"
+                statusText.text = tr("🧠 Nabura na ang memorya ng usapan")
             }
             .setNegativeButton("Cancel", null)
             .showImmersive()
@@ -4120,20 +4176,20 @@ class MainActivity : ComponentActivity() {
 
     private fun showIpSettingDialog() {
         val input = EditText(this).apply {
-            hint = "hal. 192.168.1.25 o 192.168.43.100"
+            hint = tr("hal. 192.168.1.25 o 192.168.43.100")
             inputType = InputType.TYPE_CLASS_TEXT
             setText(esp32BaseUrl.removePrefix("http://"))
         }
 
         ModernDialog()
-            .setTitle("I-set ang IP Address ng Robot")
-            .setMessage("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save.")
+            .setTitle(tr("I-set ang IP Address ng Robot"))
+            .setMessage(tr("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save."))
             .setView(input)
             .setPositiveButton("Save") { _, _ ->
                 val newIp = input.text.toString().trim()
                 if (newIp.isNotEmpty()) {
                     esp32BaseUrl = newIp
-                    statusText.text = "IP na-update: $newIp"
+                    statusText.text = tr("IP na-update: {0}", newIp)
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -4162,14 +4218,14 @@ class MainActivity : ComponentActivity() {
             setText(tooFarFaceWidthRatio.toString())
         }
 
-        container.addView(TextView(this).apply { text = "Close (BACKWARD kapag lumagpas dito):" })
+        container.addView(TextView(this).apply { text = tr("Close (BACKWARD kapag lumagpas dito):") })
         container.addView(closeInput)
-        container.addView(TextView(this).apply { text = "Far (FORWARD kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Far (FORWARD kapag mas mababa dito):"); setPadding(0, 24, 0, 0) })
         container.addView(farInput)
-        container.addView(TextView(this).apply { text = "Too Far (STOP/give up kapag mas mababa dito):"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Too Far (STOP/give up kapag mas mababa dito):"); setPadding(0, 24, 0, 0) })
         container.addView(tooFarInput)
         container.addView(TextView(this).apply {
-            text = "Tip: dapat close > far > too far. Mas mababa = mas maagang mag-react ang robot."
+            text = tr("Tip: dapat close > far > too far. Mas mababa = mas maagang mag-react ang robot.")
             textSize = 11f
             setPadding(0, 16, 0, 0)
         })
@@ -4179,7 +4235,7 @@ class MainActivity : ComponentActivity() {
         ModernDialog()
             .setTitle("📏 Distance Settings")
             .setView(scrollView)
-            .setPositiveButton("I-save") { _, _ ->
+            .setPositiveButton(tr("I-save")) { _, _ ->
                 val newClose = closeInput.text.toString().toFloatOrNull()
                 val newFar = farInput.text.toString().toFloatOrNull()
                 val newTooFar = tooFarInput.text.toString().toFloatOrNull()
@@ -4190,16 +4246,16 @@ class MainActivity : ComponentActivity() {
                     closeFaceWidthRatio = newClose
                     farFaceWidthRatio = newFar
                     tooFarFaceWidthRatio = newTooFar
-                    statusText.text = "Na-update ang distance settings"
+                    statusText.text = tr("Na-update ang distance settings")
                 } else {
-                    statusText.text = "Invalid values — dapat close > far > too far"
+                    statusText.text = tr("Invalid values — dapat close > far > too far")
                 }
             }
-            .setNeutralButton("I-reset sa default") { _, _ ->
+            .setNeutralButton(tr("I-reset sa default")) { _, _ ->
                 closeFaceWidthRatio = 0.40f
                 farFaceWidthRatio = 0.23f
                 tooFarFaceWidthRatio = 0.15f
-                statusText.text = "Na-reset sa default ang distance settings"
+                statusText.text = tr("Na-reset sa default ang distance settings")
             }
             .setNegativeButton("Cancel", null)
             .showImmersive()
@@ -4214,20 +4270,20 @@ class MainActivity : ComponentActivity() {
 
         ModernDialog()
             .setTitle("🎤 Mic Sensitivity")
-            .setMessage("Minimum confidence (%) bago ituring na valid ang narinig. Mas mataas = mas mahigpit/malinaw kailangan sabihin.")
+            .setMessage(tr("Minimum confidence (%) bago ituring na valid ang narinig. Mas mataas = mas mahigpit/malinaw kailangan sabihin."))
             .setView(input)
-            .setPositiveButton("I-save") { _, _ ->
+            .setPositiveButton(tr("I-save")) { _, _ ->
                 val percent = input.text.toString().toIntOrNull()
                 if (percent != null && percent in 0..100) {
                     micConfidenceThreshold = percent / 100f
-                    statusText.text = "Mic sensitivity na-update: $percent%"
+                    statusText.text = tr("Mic sensitivity na-update: {0}%", percent)
                 } else {
-                    statusText.text = "Invalid value — dapat 0-100"
+                    statusText.text = tr("Invalid value — dapat 0-100")
                 }
             }
-            .setNeutralButton("I-reset sa default (50%)") { _, _ ->
+            .setNeutralButton(tr("I-reset sa default (50%)")) { _, _ ->
                 micConfidenceThreshold = 0.5f
-                statusText.text = "Na-reset sa default ang mic sensitivity"
+                statusText.text = tr("Na-reset sa default ang mic sensitivity")
             }
             .setNegativeButton("Cancel", null)
             .showImmersive()
@@ -4236,23 +4292,23 @@ class MainActivity : ComponentActivity() {
     private fun showEnrollDialog() {
         val embedding = lastUnknownFaceEmbedding
         if (embedding == null) {
-            statusText.text = "Wala pang mukha na nakuha, subukan ulit"
+            statusText.text = tr("Wala pang mukha na nakuha, subukan ulit")
             return
         }
 
         val input = EditText(this).apply {
-            hint = "Pangalan (hal. Rusty)"
+            hint = tr("Pangalan (hal. Rusty)")
             inputType = InputType.TYPE_CLASS_TEXT
         }
 
         ModernDialog()
-            .setTitle("Mag-enroll ng mukha")
+            .setTitle(tr("Mag-enroll ng mukha"))
             .setView(input)
             .setPositiveButton("Save") { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isNotEmpty()) {
                     faceStore.enroll(name, embedding)
-                    statusText.text = "Na-enroll: $name"
+                    statusText.text = tr("Na-enroll: {0}", name)
                     canEnroll = false
                     lastUnknownFaceEmbedding = null
                 }
@@ -4270,7 +4326,7 @@ class MainActivity : ComponentActivity() {
         val existing = commandStore.all()
         if (existing.isEmpty()) {
             container.addView(TextView(this).apply {
-                text = "Wala pang custom na command."
+                text = tr("Wala pang custom na command.")
                 setPadding(0, 0, 0, 24)
             })
         } else {
@@ -4283,20 +4339,20 @@ class MainActivity : ComponentActivity() {
                     val actionPart = if (cmd.action.isNotBlank()) " [ESP32: ${cmd.action}]" else ""
                     val replyDisplay = cmd.reply.replace("||", " / ")
                     val triggerDisplay = cmd.trigger.replace("||", " / ")
-                    val exprPart = if (cmd.expression.isNotEmpty()) " [mata: ${expressionLabel(cmd.expression)}]" else ""
+                    val exprPart = if (cmd.expression.isNotEmpty()) tr(" [mata: {0}]", expressionLabel(cmd.expression)) else ""
                     text = "\"$triggerDisplay\" -> \"$replyDisplay\"$actionPart$exprPart"
                     textSize = 13f
                     layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 })
                 row.addView(Button(this@MainActivity).apply {
-                    text = "I-edit"
+                    text = tr("I-edit")
                     textSize = 10f
                     setOnClickListener {
                         showEditCommandDialog(cmd)
                     }
                 })
                 row.addView(Button(this@MainActivity).apply {
-                    text = "Tanggalin"
+                    text = tr("Tanggalin")
                     textSize = 10f
                     setOnClickListener {
                         commandStore.remove(cmd.trigger)
@@ -4313,26 +4369,26 @@ class MainActivity : ComponentActivity() {
                 .apply { topMargin = 32; bottomMargin = 32 }
         })
 
-        container.addView(TextView(this).apply { text = "Magdagdag ng bagong command:" })
+        container.addView(TextView(this).apply { text = tr("Magdagdag ng bagong command:") })
 
         val triggerInput = EditText(this).apply {
-            hint = "Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi)"
+            hint = tr("Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi)")
             inputType = InputType.TYPE_CLASS_TEXT
         }
         container.addView(triggerInput)
         container.addView(
             TextView(this).apply {
-                text = "Tip: pwede maglagay ng ibat-ibang paraan ng pagsabi na pinaghihiwalay ng || (hal. \"abante||punta ka sa unahan||forward\") - kahit alin ang sabihin, tutugma pa rin sa parehong command."
+                text = tr("Tip: pwede maglagay ng ibat-ibang paraan ng pagsabi na pinaghihiwalay ng || (hal. \"abante||punta ka sa unahan||forward\") - kahit alin ang sabihin, tutugma pa rin sa parehong command.")
                 textSize = 11f
                 setPadding(0, 4, 0, 12)
             }
         )
         val replyInput = EditText(this).apply {
-            hint = "Isasagot ng robot (hiwalayin ng || kung gusto ng ilang variation)"
+            hint = tr("Isasagot ng robot (hiwalayin ng || kung gusto ng ilang variation)")
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val actionInput = EditText(this).apply {
-            hint = "ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N - hiwalayin ng || kung gusto ng sabay)"
+            hint = tr("ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N - hiwalayin ng || kung gusto ng sabay)")
             // Walang autocapitalize/autocorrect - ang mga ESP32 param na gaya ng "track=" ay
             // case-sensitive, kaya delikado kung baguhin ng keyboard ang unang letra.
             inputType = InputType.TYPE_CLASS_TEXT or
@@ -4342,18 +4398,18 @@ class MainActivity : ComponentActivity() {
         container.addView(replyInput)
         container.addView(
             TextView(this).apply {
-                text = "Tip: pwede maglagay ng maraming sagot na pinaghihiwalay ng || (hal. \"sige||ok sige||heto na\") - random na pipiliin ng robot para di paulit-ulit."
+                text = tr("Tip: pwede maglagay ng maraming sagot na pinaghihiwalay ng || (hal. \"sige||ok sige||heto na\") - random na pipiliin ng robot para di paulit-ulit.")
                 textSize = 11f
                 setPadding(0, 4, 0, 12)
             }
         )
         container.addView(actionInput)
-        container.addView(TextView(this).apply { text = "Expression ng mata kapag natanggap ang command:"; setPadding(0, 24, 0, 8) })
+        container.addView(TextView(this).apply { text = tr("Expression ng mata kapag natanggap ang command:"); setPadding(0, 24, 0, 8) })
         val (expressionPicker, getExpression) = buildExpressionPicker("")
         container.addView(expressionPicker)
         container.addView(
             TextView(this).apply {
-                text = "Default = galit na mata sandali. Wala = hindi gagalaw ang mata."
+                text = tr("Default = galit na mata sandali. Wala = hindi gagalaw ang mata.")
                 textSize = 11f
                 setPadding(0, 4, 0, 0)
             }
@@ -4362,18 +4418,18 @@ class MainActivity : ComponentActivity() {
         val scrollView = ScrollView(this).apply { addView(container) }
 
         ModernDialog()
-            .setTitle("Mga Voice Command")
+            .setTitle(tr("Mga Voice Command"))
             .setView(scrollView)
-            .setPositiveButton("Idagdag") { _, _ ->
+            .setPositiveButton(tr("Idagdag")) { _, _ ->
                 val trigger = triggerInput.text.toString().trim()
                 val reply = replyInput.text.toString().trim()
                 val action = actionInput.text.toString().trim()
                 if (trigger.isNotEmpty() && reply.isNotEmpty()) {
                     commandStore.add(trigger, reply, action, getExpression())
-                    statusText.text = "Idinagdag na command: \"$trigger\""
+                    statusText.text = tr("Idinagdag na command: \"{0}\"", trigger)
                 }
             }
-            .setNegativeButton("Isara", null)
+            .setNegativeButton(tr("Isara"), null)
             .showImmersive()
     }
 
@@ -4384,35 +4440,35 @@ class MainActivity : ComponentActivity() {
         }
 
         val triggerInput = EditText(this).apply {
-            hint = "Sasabihin"
+            hint = tr("Sasabihin")
             inputType = InputType.TYPE_CLASS_TEXT
             setText(cmd.trigger)
         }
         val replyInput = EditText(this).apply {
-            hint = "Isasagot ng robot"
+            hint = tr("Isasagot ng robot")
             inputType = InputType.TYPE_CLASS_TEXT
             setText(cmd.reply)
         }
         val actionInput = EditText(this).apply {
-            hint = "ESP32 action (opsyonal)"
+            hint = tr("ESP32 action (opsyonal)")
             // Walang autocapitalize/autocorrect - case-sensitive ang mga ESP32 param.
             inputType = InputType.TYPE_CLASS_TEXT or
                 InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS or
                 InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
             setText(cmd.action)
         }
-        container.addView(TextView(this).apply { text = "Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi):" })
+        container.addView(TextView(this).apply { text = tr("Sasabihin (hiwalayin ng || kung ibat-ibang paraan ng pagsabi):") })
         container.addView(triggerInput)
-        container.addView(TextView(this).apply { text = "Isasagot ng robot:"; setPadding(0, 24, 0, 0) })
+        container.addView(TextView(this).apply { text = tr("Isasagot ng robot:"); setPadding(0, 24, 0, 0) })
         container.addView(replyInput)
         container.addView(TextView(this).apply { text = "ESP32 action:"; setPadding(0, 24, 0, 0) })
         container.addView(actionInput)
-        container.addView(TextView(this).apply { text = "Expression ng mata kapag natanggap ang command:"; setPadding(0, 24, 0, 8) })
+        container.addView(TextView(this).apply { text = tr("Expression ng mata kapag natanggap ang command:"); setPadding(0, 24, 0, 8) })
         val (expressionPicker, getExpression) = buildExpressionPicker(cmd.expression)
         container.addView(expressionPicker)
         container.addView(
             TextView(this).apply {
-                text = "Default = galit na mata sandali. Wala = hindi gagalaw ang mata."
+                text = tr("Default = galit na mata sandali. Wala = hindi gagalaw ang mata.")
                 textSize = 11f
                 setPadding(0, 4, 0, 0)
             }
@@ -4421,9 +4477,9 @@ class MainActivity : ComponentActivity() {
         val scrollView = ScrollView(this).apply { addView(container) }
 
         ModernDialog()
-            .setTitle("I-edit ang Command")
+            .setTitle(tr("I-edit ang Command"))
             .setView(scrollView)
-            .setPositiveButton("I-save") { _, _ ->
+            .setPositiveButton(tr("I-save")) { _, _ ->
                 val newTrigger = triggerInput.text.toString().trim()
                 val newReply = replyInput.text.toString().trim()
                 val newAction = actionInput.text.toString().trim()
@@ -4432,7 +4488,7 @@ class MainActivity : ComponentActivity() {
                         commandStore.remove(cmd.trigger)
                     }
                     commandStore.add(newTrigger, newReply, newAction, getExpression())
-                    statusText.text = "Na-update: \"$newTrigger\""
+                    statusText.text = tr("Na-update: \"{0}\"", newTrigger)
                 }
                 showManageCommandsDialog()
             }
