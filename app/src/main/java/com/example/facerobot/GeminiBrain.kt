@@ -29,6 +29,9 @@ class GeminiBrain(baseClient: OkHttpClient) {
         // Palitan sa app (Menu -> Gemini) kung mag-shutdown o magbago ang model name.
         const val DEFAULT_MODEL = "gemini-3.1-flash-lite"
 
+        // "fil" = Tagalog/Taglish (default), "en" = English. Itinatakda ng MainActivity ayon sa wika ng app.
+        @Volatile var language: String = "fil"
+
         val ALLOWED_ACTIONS = setOf(
             "NONE", "FORWARD", "BACKWARD", "LEFT", "RIGHT", "STOP",
             "DANCE", "SHAKING", "LASER_ON", "LASER_OFF"
@@ -362,6 +365,11 @@ class GeminiBrain(baseClient: OkHttpClient) {
         })
     }
 
+    private fun languageRule(): String =
+        if (language == "en")
+            "\n\nLANGUAGE (OVERRIDES any language rule above): ALWAYS reply in natural, simple English only - NOT Tagalog - even if the user speaks Tagalog. Keep the same personality and the same JSON format. The \"reply\" field must be in English."
+        else ""
+
     private fun buildSayLineSystemPrompt(): String = """
 Ikaw si Rustech - isang maliit na robot na kaibigan, masayahin at medyo pilyo. Bibigyan ka ng maikling sitwasyon, at gagawa ka ng ISANG bago at natural na reaksyon/linya na sasabihin mo nang boses tungkol dito - gawing iba-iba tuwing tinatawag ito, wag palaging parehong pananalita.
 
@@ -371,7 +379,7 @@ PATAKARAN:
 - Palaging "NONE" ang "action" - hindi ito para sa pagkilos, boses lang ito.
 
 Laging JSON ang sagot: {"reply": "...", "action": "NONE"}
-    """.trimIndent()
+    """.trimIndent() + languageRule()
 
     private fun buildVisionSystemPrompt(s: Situation): String {
         val who = s.recognizedName?.takeIf { it.isNotBlank() }?.let { "Kilala mo ang kausap mo: si $it." }
@@ -395,7 +403,7 @@ PAANO SASAGOT:
 MGA KILOS (action): NONE lang palagi dito, MALIBAN kung malinaw na hiniling sa tanong na kumilos ka rin habang sumasagot (hal. "sayaw nga habang sinasabi mo kung ano nakikita mo") - kung ganon, isa sa: FORWARD, BACKWARD, LEFT, RIGHT, STOP, DANCE, SHAKING, LASER_ON, LASER_OFF.
 
 Laging JSON ang sagot: {"reply": "...", "action": "..."}
-        """.trimIndent()
+        """.trimIndent() + languageRule()
     }
 
     private fun buildSystemPrompt(s: Situation): String {
@@ -438,6 +446,6 @@ MGA ALAM MO TUNGKOL SA SARILI MO / MGA PAALALA NG MAY-ARI (gamitin bilang kaalam
 ${knownCommands.ifEmpty { "- (wala pa)" }}
 
 Laging JSON ang sagot: {"reply": "...", "action": "..."}
-        """.trimIndent()
+        """.trimIndent() + languageRule()
     }
 }
