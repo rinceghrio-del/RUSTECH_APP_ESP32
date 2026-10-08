@@ -22,7 +22,15 @@ class CommandStore(context: Context) {
     // reply = pwedeng maglaman ng ilang "||"-separated na variation (hal. "sige||ok
     // sige||heto na") - random na pipipilin ng randomReply() sa bawat tawag, para
     // hindi laging pareho ang sinasabi kahit paulit-ulit na tinatanong.
-    data class VoiceCommand(val trigger: String, val reply: String, val action: String = "") {
+    // expression = expression ng RoboEyes kapag natanggap ang command. "" = default (galit), "NONE" = walang
+    // gagalaw sa mata, o isa sa mga key ng RoboEyesView.Mood (ANGRY, HAPPY, SLEEPY, SURPRISED, LOVE, SAD,
+    // THINKING, LISTENING, NORMAL).
+    data class VoiceCommand(
+        val trigger: String,
+        val reply: String,
+        val action: String = "",
+        val expression: String = ""
+    ) {
         fun randomReply(): String {
             val variations = reply.split("||").map { it.trim() }.filter { it.isNotEmpty() }
             return if (variations.isEmpty()) reply else variations.random()
@@ -56,7 +64,8 @@ class CommandStore(context: Context) {
                     VoiceCommand(
                         obj.getString("trigger"),
                         obj.getString("reply"),
-                        obj.optString("action", "") // "" kung wala pa dating action noon (lumang data)
+                        obj.optString("action", ""), // "" kung wala pa dating action noon (lumang data)
+                        obj.optString("expression", "") // "" kung wala pa dating expression (lumang data)
                     )
                 )
             }
@@ -74,16 +83,17 @@ class CommandStore(context: Context) {
             obj.put("trigger", cmd.trigger)
             obj.put("reply", cmd.reply)
             obj.put("action", cmd.action)
+            obj.put("expression", cmd.expression)
             array.put(obj)
         }
         prefs.edit().putString(KEY_COMMANDS, array.toString()).apply()
     }
 
     /** Idinadagdag o pinapalitan (kung existing na ang trigger phrase) ang isang command. */
-    fun add(trigger: String, reply: String, action: String = "") {
+    fun add(trigger: String, reply: String, action: String = "", expression: String = "") {
         val cleanTrigger = trigger.trim().lowercase()
         commands.removeAll { it.trigger == cleanTrigger }
-        commands.add(VoiceCommand(cleanTrigger, reply.trim(), action.trim().uppercase()))
+        commands.add(VoiceCommand(cleanTrigger, reply.trim(), action.trim().uppercase(), expression.trim().uppercase()))
         persist()
     }
 
