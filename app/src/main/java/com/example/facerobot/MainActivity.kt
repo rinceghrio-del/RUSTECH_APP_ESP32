@@ -1188,7 +1188,7 @@ class MainActivity : ComponentActivity() {
         val onAccent = 0xFF04342C.toInt()
 
         // true = magsasara ang menu kapag may pinili (laging fresh ang IP / mic % kapag binuksan ulit)
-        val closeMenuOnPick = true
+        val closeMenuOnPick = false
 
         val dialog = android.app.Dialog(ctx)
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
@@ -1218,7 +1218,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val titleCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-        titleCol.addView(label("RUSTECH", 20f, accent, bold = true).apply { letterSpacing = 0.14f })
+        titleCol.addView(label("Rustech", 20f, accent, bold = true).apply { letterSpacing = 0.14f })
         titleCol.addView(label("Control Center  •  FaceRobot", 12f, textDim))
         header.addView(titleCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
