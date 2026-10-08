@@ -10,6 +10,7 @@ import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
 import android.view.animation.LinearInterpolator
+import androidx.core.graphics.ColorUtils
 import kotlin.random.Random
 
 /**
@@ -47,6 +48,14 @@ class RoboEyesView @JvmOverloads constructor(
 
     private var mood = Mood.IDLE
 
+    // Pansamantalang mood (hal. GALIT kapag may natanggap na command). Kusa itong nawawala pagkatapos
+    // ng itinakdang oras at bumabalik ang mata sa dating mood - hindi na kailangang i-restore sa MainActivity.
+    @Volatile private var overrideMood: Mood? = null
+    @Volatile private var overrideUntilMs = 0L
+
+    private val calmColor = Color.parseColor("#00E5FF")   // cyan
+    private val angryColor = Color.parseColor("#FF4D4D")  // pula kapag galit
+
     // 0f = wide open, 1f = fully closed (blink)
     private var blinkAmount = 0f
 
@@ -73,6 +82,21 @@ class RoboEyesView @JvmOverloads constructor(
         mood = newMood
         scheduleNextLookChange() // agad na susunod sa bagong mood (hal. SEARCHING = mas malawak lumingon)
         invalidate()
+    }
+
+    /**
+     * Ipakita ang [flash] mood nang [durationMs] milliseconds, tapos kusang babalik sa dating mood.
+     * Ligtas tawagin kahit sa background thread.
+     */
+    fun flashMood(flash: Mood, durationMs: Long = 2000L) {
+        overrideMood = flash
+        overrideUntilMs = System.currentTimeMillis() + durationMs
+        postInvalidate()
+    }
+
+    private fun effectiveMood(now: Long): Mood {
+        val o = overrideMood
+        return if (o != null && now < overrideUntilMs) o else mood
     }
 
     override fun onAttachedToWindow() {
@@ -123,6 +147,8 @@ class RoboEyesView @JvmOverloads constructor(
     private var blinkPhase = 0 // 0 idle, 1 closing, 2 opening
     private fun tick() {
         val now = System.currentTimeMillis()
+        val m = effectiveMood(now)
+        val flashing = overrideMood != null && now < overrideUntilMs
 
         // Blink state machine
         if (blinkPhase == 0 && now >= nextBlinkAtMs) {
@@ -141,17 +167,22 @@ class RoboEyesView @JvmOverloads constructor(
 
         // Idle look-around, lerp papunta sa target
         if (now >= nextLookChangeAtMs) scheduleNextLookChange()
+        // Habang galit (flash), diretso ang titig - hindi lumilingon-lingon
+        if (flashing && m == Mood.ANGRY) { lookTargetX = 0f; lookTargetY = 0f }
         lookX += (lookTargetX - lookX) * 0.07f
         lookY += (lookTargetY - lookY) * 0.07f
 
         // Happy eyes: smooth na pagtaas/pagbaba ng lower eyelid
-        val happyTarget = if (mood == Mood.ALERT) 1f else 0f
+        val happyTarget = if (m == Mood.ALERT) 1f else 0f
         happyAmount += (happyTarget - happyAmount) * 0.2f
         if (kotlin.math.abs(happyTarget - happyAmount) < 0.01f) happyAmount = happyTarget
 
-        val angryTarget = if (mood == Mood.ANGRY) 1f else 0f
+        val angryTarget = if (m == Mood.ANGRY) 1f else 0f
         angryAmount += (angryTarget - angryAmount) * 0.25f
         if (kotlin.math.abs(angryTarget - angryAmount) < 0.01f) angryAmount = angryTarget
+
+        // Nagiging pula ang mata habang galit, bumabalik sa cyan pagkatapos
+        eyePaint.color = ColorUtils.blendARGB(calmColor, angryColor, angryAmount)
 
         invalidate()
     }
@@ -164,7 +195,12 @@ class RoboEyesView @JvmOverloads constructor(
         val spacing = width * 0.10f
 
         val centerY = height / 2f + lookY * height * 0.08f
-        val shiftX = lookX * width * 0.06f
+        // Bahagyang nanginginig (shake) ang mata habang galit na galit
+        val nowDraw = System.currentTimeMillis()
+        val flashingDraw = overrideMood != null && nowDraw < overrideUntilMs
+        val shake = if (flashingDraw && angryAmount > 0.3f)
+            (kotlin.math.sin(nowDraw / 32.0) * width * 0.005 * angryAmount).toFloat() else 0f
+        val shiftX = lookX * width * 0.06f + shake
 
         val leftCenterX = width / 2f - spacing / 2f - eyeWidth / 2f + shiftX
         val rightCenterX = width / 2f + spacing / 2f + eyeWidth / 2f + shiftX
