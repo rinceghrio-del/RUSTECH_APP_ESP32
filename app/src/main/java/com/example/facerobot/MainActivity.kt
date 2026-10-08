@@ -603,17 +603,67 @@ class MainActivity : ComponentActivity() {
         val darkChip = 0xFF1E1E2E.toInt()
         val darkChipPressed = 0xFF2A2A3E.toInt()
 
+        // ---------- Status pill: glass look, may kulay na dot ayon sa uri ng mensahe, at animation kada palit ----------
+        val statusPillBg = GradientDrawable().apply {
+            setColor(0xD90B0D13.toInt())
+            cornerRadius = dpPx(22).toFloat()
+            setStroke(dpPx(1), 0x6600E5C7)
+        }
+        val statusDot = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(accentColor)
+            setSize(dpPx(8), dpPx(8))
+        }
+        var lastStatusAnimMs = 0L
+
         statusText = TextView(this).apply {
-            setTextColor(0xFFFFFFFF.toInt())
-            textSize = 13f
-            setPadding(40, 22, 40, 22)
-            gravity = Gravity.CENTER
-            typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            background = GradientDrawable().apply {
-                setColor(0xE6121212.toInt())
-                cornerRadius = 100f
-                setStroke(2, 0x22FFFFFF)
-            }
+            setTextColor(0xFFF1F3F9.toInt())
+            textSize = 12.5f
+            letterSpacing = 0.02f
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            maxWidth = (resources.displayMetrics.widthPixels * 0.86f).toInt()
+            gravity = Gravity.CENTER_VERTICAL
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dpPx(14), dpPx(9), dpPx(18), dpPx(9))
+            compoundDrawablePadding = dpPx(10)
+            setCompoundDrawablesWithIntrinsicBounds(statusDot, null, null, null)
+            background = statusPillBg
+            elevation = dpPx(6).toFloat()
+            visibility = View.GONE // lalabas lang kapag may laman
+
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    val t = s?.toString()?.trim().orEmpty()
+                    if (t.isEmpty()) {
+                        statusText.visibility = View.GONE
+                        return
+                    }
+                    // Kulay ng dot/outline: pula = error, amber = naglo-load, asul = mic, lila = AI, cyan = normal
+                    val tone = when {
+                        t.startsWith("❌") || t.startsWith("⚠️") || t.contains("error", ignoreCase = true) -> 0xFFFF5C5C.toInt()
+                        t.startsWith("⬇️") || t.startsWith("📦") || t.startsWith("🧪") || t.startsWith("🎯") -> 0xFFFFB84D.toInt()
+                        t.startsWith("[MIC]") || t.startsWith("🎤") -> 0xFF4DA3FF.toInt()
+                        t.startsWith("🧠") || t.startsWith("🤖") || t.startsWith("👁") -> 0xFFB388FF.toInt()
+                        else -> accentColor
+                    }
+                    statusDot.setColor(tone)
+                    statusPillBg.setStroke(dpPx(1), (tone and 0x00FFFFFF) or 0x66000000)
+
+                    if (statusText.visibility != View.VISIBLE) statusText.visibility = View.VISIBLE
+
+                    // Maliit na "pop-in" animation (hindi kada-percent para hindi kumukurap habang nagda-download)
+                    val now = System.currentTimeMillis()
+                    if (now - lastStatusAnimMs > 700L) {
+                        lastStatusAnimMs = now
+                        statusText.alpha = 0.35f
+                        statusText.translationY = -dpPx(6).toFloat()
+                        statusText.animate().alpha(1f).translationY(0f).setDuration(200).start()
+                    }
+                }
+            })
         }
 
         menuButton = Button(this).apply {
@@ -1137,7 +1187,7 @@ class MainActivity : ComponentActivity() {
         val onAccent = 0xFF04342C.toInt()
 
         // true = magsasara ang menu kapag may pinili (laging fresh ang IP / mic % kapag binuksan ulit)
-        val closeMenuOnPick = false
+        val closeMenuOnPick = true
 
         val dialog = android.app.Dialog(ctx)
         dialog.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
@@ -1167,7 +1217,7 @@ class MainActivity : ComponentActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         val titleCol = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
-        titleCol.addView(label("Rustech", 20f, accent, bold = true).apply { letterSpacing = 0.14f })
+        titleCol.addView(label("RUSTECH", 20f, accent, bold = true).apply { letterSpacing = 0.14f })
         titleCol.addView(label("Control Center  •  FaceRobot", 12f, textDim))
         header.addView(titleCol, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
 
@@ -1554,6 +1604,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun runOnUi(block: () -> Unit) = runOnUiThread(block)
+
+    /** Galit na mata (pula, nanginginig) sandali kapag may natanggap na utos - kusang bumabalik sa dating mood. */
+    private fun flashCommandEyes() {
+        roboEyesView.flashMood(RoboEyesView.Mood.ANGRY, 2000L)
+    }
 
     // ---------- Camera setup ----------
 
@@ -2080,6 +2135,7 @@ class MainActivity : ComponentActivity() {
 
         // 1) KALIGTASAN: STOP ay laging lokal at agad - hindi na dumadaan sa internet.
         if (candidates.any { it.contains("hinto") || it.contains("stop") || it.contains("tigil") }) {
+            flashCommandEyes()
             speak("Hihinto na po!")
             sendCommandToEsp32("FORCE_STOP")
             addVoiceLogEntry(heardText, "FORCE_STOP")
@@ -2101,6 +2157,7 @@ class MainActivity : ComponentActivity() {
         // 2) Maiikling eksaktong utos (hal. "sayaw", "abante") - lokal at instant, gaya ng dati.
         val exact = findExactCustomCommand(candidates)
         if (exact != null) {
+            flashCommandEyes()
             speak(exact.randomReply())
             if (exact.action.isNotBlank()) executeEsp32Actions(exact.action)
             addVoiceLogEntry(heardText, "custom: \"${exact.trigger}\"")
@@ -2311,7 +2368,10 @@ class MainActivity : ComponentActivity() {
             "STOP" -> "FORCE_STOP"
             else -> if (action in GeminiBrain.ALLOWED_ACTIONS) action else null
         }
-        if (espAction != null) executeEsp32Actions(espAction)
+        if (espAction != null) {
+            flashCommandEyes()
+            executeEsp32Actions(espAction)
+        }
 
         addVoiceLogEntry(heardText, "gemini → \"${text.take(70)}\" [$action]")
     }
@@ -2350,6 +2410,7 @@ class MainActivity : ComponentActivity() {
         for (text in candidates) {
             val custom = commandStore.findMatch(text)
             if (custom != null) {
+                flashCommandEyes()
                 speak(custom.randomReply())
                 if (custom.action.isNotBlank()) {
                     executeEsp32Actions(custom.action)
@@ -2359,16 +2420,19 @@ class MainActivity : ComponentActivity() {
 
             when {
                 text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
+                    flashCommandEyes()
                     speak("Hihinto na po!")
                     sendCommandToEsp32("FORCE_STOP")
                     return "FORCE_STOP"
                 }
                 text.contains("kaliwa") || text.contains("left") -> {
+                    flashCommandEyes()
                     speak("Lilikot sa kaliwa.")
                     sendTimedCommand("LEFT", voiceMovementDurationMs)
                     return "LEFT"
                 }
                 text.contains("kanan") || text.contains("right") -> {
+                    flashCommandEyes()
                     speak("Lilikot sa kanan.")
                     sendTimedCommand("RIGHT", voiceMovementDurationMs)
                     return "RIGHT"
