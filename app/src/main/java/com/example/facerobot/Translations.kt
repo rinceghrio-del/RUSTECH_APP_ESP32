@@ -6,6 +6,21 @@ package com.example.facerobot
  */
 object Translations {
     val en: Map<String, String> = mapOf(
+        "IP ng strip (hal. 192.168.1.4)" to "Strip IP (e.g. 192.168.1.4)",
+        "Local Key (16 characters)" to "Local Key (16 characters)",
+        "DP ng mga outlet (hal. 1,2,3,4)" to "Outlet DPs (e.g. 1,2,3,4)",
+        "USB DP (hal. 7)" to "USB DP (e.g. 7)",
+        "Version (3.3)" to "Version (3.3)",
+        "📴 Offline (local WiFi) - walang internet na kailangan:" to "📴 Offline (local WiFi) - no internet needed:",
+        "📥 I-paste mula sa devices.json" to "📥 Paste from devices.json",
+        "☁️ Cloud (opsyonal - fallback at auto-detect ng device):" to "☁️ Cloud (optional - fallback and device auto-detect):",
+        "Subukan ang strip:" to "Test the strip:",
+        "Buksan ang devices.json (o snapshot.json) ng TinyTuya, kopyahin ang entry ng strip (o ang buong file), at i-paste dito. Kukunin nito ang Device ID, Local Key, IP at version." to "Open TinyTuya's devices.json (or snapshot.json), copy the strip's entry (or the whole file), and paste it here. This reads the Device ID, Local Key, IP and version.",
+        "📥 I-import ang strip" to "📥 Import the strip",
+        "I-import" to "Import",
+        "Na-import: {0}" to "Imported: {0}",
+        "ilagay pa ang IP ng strip" to "enter the strip's IP too",
+        "Piliin ang strip" to "Choose the strip",
         "🔎 Hanapin ang mga device ko" to "🔎 Find my devices",
         "Hinahanap ang mga device sa Smart Life account..." to "Looking for devices in the Smart Life account...",
         "Piliin ang RM mini 3" to "Choose the RM mini 3",
