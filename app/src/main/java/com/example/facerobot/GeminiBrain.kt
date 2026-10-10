@@ -224,7 +224,7 @@ class GeminiBrain(baseClient: OkHttpClient) {
             // Hindi JSON (bihira) - gamitin na lang bilang plain na sagot, walang kilos.
             replyText = raw
         }
-        if (action !in ALLOWED_ACTIONS) action = "NONE"
+        if (action !in ALLOWED_ACTIONS && !action.startsWith("HOME:")) action = "NONE"
         return Result.Ok(Reply(replyText, action))
     }
 
@@ -439,6 +439,7 @@ MGA KILOS (action): kaya mong gumalaw. Ang mga pwede lang: NONE, FORWARD (abante
 - Gumamit ng action LAMANG kapag malinaw na inutusan ka. Kung hindi, NONE. Hindi ka kikilos nang kusa.
 - Isang action lang bawat sagot. Sabihin sa reply ang gagawin mo sa natural na paraan ("sige, heto na!").
 - Kung ang hiling ay hindi mo kaya (lumipad, magluto, atbp.), biruin at sabihing ito lang ang kaya mo.
+- SMART HOME: kung ang hiling ay tumutugma sa nakalistang utos sa ibaba na may (kilos: HOME:...), gamitin ang EKSAKTONG kilos na iyon (hal. HOME:STRIP:1:ON). Huwag mag-imbento ng HOME: na wala sa listahan.
 
 SITWASYON NGAYON: $now. $who
 
