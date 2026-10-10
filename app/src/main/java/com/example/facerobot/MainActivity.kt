@@ -172,7 +172,9 @@ class MainActivity : ComponentActivity() {
                 if (negative != null) d.setNegativeButton(negative) { _, _ -> onNegative?.invoke() }
                 d.showImmersive()
             },
-            onStatus = { msg -> statusText.text = msg }
+            onStatus = { msg -> statusText.text = msg },
+            testTrack = { track, done -> testDfPlayerTrack(track, done) },
+            isGeminiOn = { geminiEnabled }
         )
     }
 
@@ -544,6 +546,27 @@ class MainActivity : ComponentActivity() {
                 addVoiceLogEntry("smart home: ${action.trim()}", msg)
             }
         }
+    }
+
+    /**
+     * Para sa Smart Home editor: subukan ang DFPlayer track. HINDI ito naka-mute kahit naka-ON ang Gemini,
+     * para makumpirma kung gumagana ang ESP32 voice. Ang callback ay tinatawag sa UI thread.
+     */
+    private fun testDfPlayerTrack(track: Int, done: (Boolean, String) -> Unit) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
+            .build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { done(false, "DFPlayer track $track: ${e.message ?: "walang koneksyon sa ESP32"}") }
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                val ok = response.isSuccessful
+                val code = response.code
+                response.close()
+                runOnUi { done(ok, if (ok) "DFPlayer track $track naipadala sa ESP32" else "DFPlayer track $track: HTTP $code") }
+            }
+        })
     }
 
     private fun sendPlayTrack(track: Int) {
