@@ -16,7 +16,7 @@ import java.util.concurrent.Executors
  *  - Naka-cache ang session ng RM (hindi nag-a-auth kada utos); maiikli ang timeouts.
  *
  * FORMAT NG ACTION (isulat sa "ESP32 action" ng Mga Utos; puwedeng isama sa || combo):
- *   HOME:STRIP:<1..N | ALL>:<ON | OFF>   hal. HOME:STRIP:2:ON    HOME:STRIP:ALL:OFF
+ *   HOME:STRIP:<1..N | ALL | USB>:<ON | OFF>   hal. HOME:STRIP:2:ON  HOME:STRIP:ALL:OFF  HOME:STRIP:USB:ON
  *   HOME:IR:<PANGALAN>                   hal. HOME:IR:TV_POWER
  */
 class SmartHome(context: Context) {
@@ -25,6 +25,42 @@ class SmartHome(context: Context) {
         const val PREFIX = "HOME:"
         const val DEFAULT_TUYA_ENDPOINT = "https://openapi-sg.iotbing.com"
         const val DEFAULT_SOCKET_CODES = "switch_1,switch_2,switch_3,switch_4"
+
+        data class TuyaImport(val name: String, val id: String, val key: String, val ip: String, val version: String)
+
+        /**
+         * Basahin ang entry/entries mula sa TinyTuya (devices.json o snapshot.json). Tumatanggap ng
+         * buong file, isang { } entry, o kahit ang laman lang na walang panlabas na { }.
+         */
+        fun parseTuyaImport(text: String): List<TuyaImport> {
+            val t = text.trim()
+            val root: Any? = try {
+                MiniJson.parse(t)
+            } catch (e: Exception) {
+                try {
+                    MiniJson.parse("{" + t.trim().trimEnd(',') + "}")
+                } catch (e2: Exception) {
+                    throw IllegalArgumentException("Hindi mabasa ang JSON - kopyahin ang buong entry ng strip (kasama ang { })")
+                }
+            }
+            val items: List<Any?> = when (root) {
+                is List<*> -> root
+                is Map<*, *> -> MiniJson.arr(root["devices"]) ?: listOf(root)
+                else -> emptyList()
+            }
+            val out = items.mapNotNull { MiniJson.obj(it) }.mapNotNull { d ->
+                val id = MiniJson.str(d["id"])
+                if (id.isEmpty()) null else TuyaImport(
+                    name = MiniJson.str(d["name"]).ifEmpty { id },
+                    id = id,
+                    key = MiniJson.str(d["key"]).ifEmpty { MiniJson.str(d["local_key"]) },
+                    ip = MiniJson.str(d["ip"]).ifEmpty { MiniJson.str(d["address"]) },
+                    version = MiniJson.str(d["ver"]).ifEmpty { MiniJson.str(d["version"]) }
+                )
+            }
+            if (out.isEmpty()) throw IllegalArgumentException("Walang device na may \"id\" sa na-paste")
+            return out
+        }
 
         fun isHomeAction(action: String): Boolean = action.trim().uppercase().startsWith(PREFIX)
 
@@ -60,6 +96,29 @@ class SmartHome(context: Context) {
     var tuyaSocketCodes: String
         get() = prefs.getString("tuya_socket_codes", DEFAULT_SOCKET_CODES) ?: DEFAULT_SOCKET_CODES
         set(v) { prefs.edit().putString("tuya_socket_codes", v.trim().ifEmpty { DEFAULT_SOCKET_CODES }).apply() }
+
+    // Offline (local WiFi) na kontrol ng strip - walang internet/cloud na kailangan.
+    var stripIp: String
+        get() = prefs.getString("strip_ip", "") ?: ""
+        set(v) { prefs.edit().putString("strip_ip", v.trim()).apply() }
+
+    var tuyaLocalKey: String
+        get() = prefs.getString("tuya_local_key", "") ?: ""
+        set(v) { prefs.edit().putString("tuya_local_key", v.trim()).apply() }
+
+    var tuyaVersion: String
+        get() = prefs.getString("tuya_version", "3.3") ?: "3.3"
+        set(v) { prefs.edit().putString("tuya_version", v.trim().ifEmpty { "3.3" }).apply() }
+
+    /** DP number ng mga outlet, nakaayos (socket 1, 2, 3...). Default ayon sa Lasco strip: 1,2,3,4. */
+    var stripDps: String
+        get() = prefs.getString("strip_dps", "1,2,3,4") ?: "1,2,3,4"
+        set(v) { prefs.edit().putString("strip_dps", v.trim().ifEmpty { "1,2,3,4" }).apply() }
+
+    /** DP ng USB ports (default 7). Walang laman = walang USB control. */
+    var usbDp: String
+        get() = prefs.getString("usb_dp", "7") ?: "7"
+        set(v) { prefs.edit().putString("usb_dp", v.trim()).apply() }
 
     // --- Naka-save na IR codes --------------------------------------------------------------
 
@@ -101,6 +160,14 @@ class SmartHome(context: Context) {
     @Volatile private var tuyaClient: TuyaCloudClient? = null
     @Volatile private var tuyaClientKey: String = ""
 
+    /** I-save ang nabasang device (id, local key, ip, version) - ang walang laman ay hindi ginagalaw. */
+    fun applyImport(d: TuyaImport) {
+        tuyaDeviceId = d.id
+        if (d.key.isNotEmpty()) tuyaLocalKey = d.key
+        if (d.ip.isNotEmpty()) stripIp = d.ip
+        if (d.version.isNotEmpty()) tuyaVersion = d.version
+    }
+
     // --- Pagpapatakbo ng action -------------------------------------------------------------
 
     /** Callback ay tinatawag sa BACKGROUND thread - gumamit ng runOnUi sa MainActivity. */
@@ -114,7 +181,7 @@ class SmartHome(context: Context) {
             "IR" -> runIr(parts.drop(2).joinToString("_"), onResult)
             "STRIP" -> {
                 if (parts.size != 4 || (parts[3] != "ON" && parts[3] != "OFF")) {
-                    onResult(false, "Maling STRIP action: dapat HOME:STRIP:<numero|ALL>:<ON|OFF>")
+                    onResult(false, "Maling STRIP action: dapat HOME:STRIP:<numero|ALL|USB>:<ON|OFF>")
                 } else {
                     runStrip(parts[2], parts[3] == "ON", onResult)
                 }
@@ -140,28 +207,71 @@ class SmartHome(context: Context) {
         }
     }
 
-    private fun runStrip(target: String, on: Boolean, onResult: (Boolean, String) -> Unit) {
-        val deviceId = tuyaDeviceId
-        if (tuyaAccessId.isBlank() || tuyaAccessSecret.isBlank() || deviceId.isBlank()) {
-            onResult(false, "Kulang ang Tuya settings (Access ID, Secret, Device ID) sa Smart Home menu")
+    private fun localConfigured(): Boolean =
+        stripIp.isNotBlank() && tuyaDeviceId.isNotBlank() && tuyaLocalKey.isNotBlank()
+
+    private fun cloudConfigured(): Boolean =
+        tuyaAccessId.isNotBlank() && tuyaAccessSecret.isNotBlank() && tuyaDeviceId.isNotBlank()
+
+    /**
+     * Unahin ang OFFLINE (local WiFi). Kung pumalya at may cloud settings, subukan ang cloud bilang fallback.
+     * target: 1..N | ALL (lahat ng outlet, hindi kasama ang USB) | USB
+     */
+    private fun runStrip(targetRaw: String, on: Boolean, onResult: (Boolean, String) -> Unit) {
+        val target = targetRaw.trim().uppercase()
+        val local = localConfigured()
+        val cloud = cloudConfigured()
+        if (!local && !cloud) {
+            onResult(false, "Kulang ang settings ng strip - ilagay ang IP + Local Key (offline) o ang Tuya cloud settings sa Smart Home menu")
             return
         }
-        val allCodes = parseCodes()
-        val codes: List<String> = if (target == "ALL") {
-            allCodes
-        } else {
-            val idx = target.toIntOrNull()
-            val code = if (idx != null) allCodes.getOrNull(idx - 1) else null
-            if (code == null) {
-                onResult(false, "Walang socket #$target (may ${allCodes.size} socket code na naka-set)")
-                return
-            }
-            listOf(code)
+
+        val dpList = parseDps()
+        val codes = parseCodes()
+        val idx = if (target == "ALL" || target == "USB") null else target.toIntOrNull()
+        if (target != "ALL" && target != "USB" && idx == null) {
+            onResult(false, "Maling target \"$targetRaw\" - gamitin ang numero ng socket, ALL, o USB")
+            return
         }
+
+        val localDps: List<String>? = when {
+            target == "ALL" -> dpList.ifEmpty { null }
+            target == "USB" -> usbDp.takeIf { it.matches(Regex("\\d{1,3}")) }?.let { listOf(it) }
+            else -> dpList.getOrNull(idx!! - 1)?.let { listOf(it) }
+        }
+        val cloudCodes: List<String>? = when {
+            target == "ALL" -> codes.ifEmpty { null }
+            target == "USB" -> listOf("switch_usb1")
+            else -> codes.getOrNull(idx!! - 1)?.let { listOf(it) }
+        }
+        if ((!local || localDps == null) && (!cloud || cloudCodes == null)) {
+            onResult(false, "Walang socket \"$targetRaw\" sa mga naka-set na DP/code")
+            return
+        }
+
+        val what = when (target) { "ALL" -> "lahat ng socket"; "USB" -> "USB"; else -> "socket $target" }
+        val state = if (on) "ON" else "OFF"
+
         cloudExecutor.execute {
-            val res = tuya().setSwitches(deviceId, codes, on)
-            val what = if (target == "ALL") "lahat ng socket" else "socket $target"
-            onResult(res.ok, if (res.ok) "Power strip: $what ${if (on) "ON" else "OFF"}" else res.message)
+            var localFail: String? = null
+            if (local && localDps != null) {
+                val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).setDps(localDps.associateWith { on })
+                if (r.ok) {
+                    onResult(true, "Power strip: $what $state (offline)")
+                    return@execute
+                }
+                localFail = r.message
+            }
+            if (cloud && cloudCodes != null) {
+                val r = tuya().setSwitches(tuyaDeviceId, cloudCodes, on)
+                if (r.ok) {
+                    onResult(true, "Power strip: $what $state (cloud" + (if (localFail != null) ", pumalya ang offline" else "") + ")")
+                } else {
+                    onResult(false, (localFail?.let { "Offline: $it | " } ?: "") + "Cloud: " + r.message)
+                }
+                return@execute
+            }
+            onResult(false, localFail ?: "Hindi naipadala ang utos")
         }
     }
 
@@ -251,11 +361,41 @@ class SmartHome(context: Context) {
         }
     }
 
+    /** Status ng strip: offline muna; kung hindi available, cloud. */
+    fun stripStatus(onDone: (ok: Boolean, message: String) -> Unit) {
+        val local = localConfigured()
+        val cloud = cloudConfigured()
+        if (!local && !cloud) {
+            onDone(false, "Kulang ang settings ng strip - ilagay ang IP + Local Key (offline) o ang Tuya cloud settings")
+            return
+        }
+        cloudExecutor.execute {
+            var localFail: String? = null
+            if (local) {
+                val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).status()
+                if (r.ok) {
+                    onDone(true, "(offline)\n" + r.message)
+                    return@execute
+                }
+                localFail = r.message
+            }
+            if (cloud) {
+                val r = tuya().status(tuyaDeviceId)
+                onDone(r.ok, (if (r.ok) "(cloud)\n" else (localFail?.let { "Offline: $it | " } ?: "") + "Cloud: ") + r.message)
+            } else {
+                onDone(false, localFail ?: "Walang sagot")
+            }
+        }
+    }
+
     /** Test ng power strip nang walang voice command. */
     fun testStrip(target: String, on: Boolean, onDone: (Boolean, String) -> Unit) =
         runStrip(target.trim().uppercase(), on, onDone)
 
     // --- Internal ---------------------------------------------------------------------------
+
+    private fun parseDps(): List<String> =
+        stripDps.split(",").map { it.trim() }.filter { it.matches(Regex("\\d{1,3}")) }
 
     private fun parseCodes(): List<String> =
         tuyaSocketCodes.split(",").map { it.trim() }.filter { it.matches(Regex("[A-Za-z0-9_]+")) }
