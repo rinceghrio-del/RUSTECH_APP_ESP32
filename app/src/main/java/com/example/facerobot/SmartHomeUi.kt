@@ -94,6 +94,11 @@ class SmartHomeUi(
         val secretInput = plainInput("Access Secret", smartHome.tuyaAccessSecret, secret = true)
         val deviceInput = plainInput("Device ID ng Lasco strip", smartHome.tuyaDeviceId)
         val codesInput = plainInput("Socket codes (hal. switch_1,switch_2,switch_3,switch_4)", smartHome.tuyaSocketCodes)
+        val stripIpInput = plainInput(tr("IP ng strip (hal. 192.168.1.4)"), smartHome.stripIp)
+        val localKeyInput = plainInput(tr("Local Key (16 characters)"), smartHome.tuyaLocalKey, secret = true)
+        val dpsInput = plainInput(tr("DP ng mga outlet (hal. 1,2,3,4)"), smartHome.stripDps)
+        val usbDpInput = plainInput(tr("USB DP (hal. 7)"), smartHome.usbDp)
+        val versionInput = plainInput(tr("Version (3.3)"), smartHome.tuyaVersion)
         val socketInput = plainInput("#", "1").apply { inputType = InputType.TYPE_CLASS_NUMBER }
         val irNameInput = plainInput(tr("Pangalan ng IR code (hal. TV_POWER)"), "")
 
@@ -104,6 +109,11 @@ class SmartHomeUi(
             smartHome.tuyaAccessSecret = secretInput.text.toString()
             smartHome.tuyaDeviceId = deviceInput.text.toString()
             smartHome.tuyaSocketCodes = codesInput.text.toString()
+            smartHome.stripIp = stripIpInput.text.toString()
+            smartHome.tuyaLocalKey = localKeyInput.text.toString()
+            smartHome.stripDps = dpsInput.text.toString()
+            smartHome.usbDp = usbDpInput.text.toString()
+            smartHome.tuyaVersion = versionInput.text.toString()
         }
 
         container.addView(ipInput)
@@ -183,7 +193,21 @@ class SmartHomeUi(
         }
 
         // ---------------- Lasco strip ----------------
-        container.addView(label("🔌 Lasco Smart Power Strip (Tuya Cloud)", 22, 15f))
+        container.addView(label("🔌 Lasco Smart Power Strip", 22, 15f))
+        container.addView(label(tr("📴 Offline (local WiFi) - walang internet na kailangan:"), 8, 12f))
+        container.addView(stripIpInput)
+        container.addView(deviceInput)
+        container.addView(localKeyInput)
+        container.addView(dpsInput)
+        container.addView(row(usbDpInput, versionInput))
+        container.addView(row(
+            button(tr("📥 I-paste mula sa devices.json")) {
+                saveFields()
+                showImportDialog()
+            }
+        ))
+
+        container.addView(label(tr("☁️ Cloud (opsyonal - fallback at auto-detect ng device):"), 16, 12f))
         container.addView(endpointInput)
         container.addView(idInput)
         container.addView(secretInput)
@@ -215,13 +239,14 @@ class SmartHomeUi(
                 }
             }
         ))
-        container.addView(deviceInput)
         container.addView(codesInput)
+
+        container.addView(label(tr("Subukan ang strip:"), 16, 12f))
         container.addView(row(
             button(tr("📋 Status")) {
                 saveFields()
                 say(tr("Binabasa ang status..."))
-                smartHome.tuyaStatus { ok, msg -> say((if (ok) "✅ " else "⚠️ ") + msg) }
+                smartHome.stripStatus { ok, msg -> say((if (ok) "✅ " else "⚠️ ") + msg) }
             },
             button(tr("ON lahat")) {
                 saveFields()
@@ -245,6 +270,17 @@ class SmartHomeUi(
             }
         ))
         container.addView(row(
+            TextView(activity).apply { text = "USB"; textSize = 13f },
+            button("ON") {
+                saveFields()
+                smartHome.testStrip("USB", true) { ok, msg -> say((if (ok) "✅ " else "⚠️ ") + msg) }
+            },
+            button("OFF") {
+                saveFields()
+                smartHome.testStrip("USB", false) { ok, msg -> say((if (ok) "✅ " else "⚠️ ") + msg) }
+            }
+        ))
+        container.addView(row(
             button(tr("💬 Gumawa ng voice command para sa socket")) {
                 saveFields()
                 val n = socketInput.text.toString().trim().ifEmpty { "1" }
@@ -252,21 +288,86 @@ class SmartHomeUi(
             }
         ))
 
-        container.addView(label(tr("Resulta:"), 20, 12f))
-        container.addView(statusView)
         container.addView(label(
-            tr("Tip: ang action ay maaari ring i-type nang manu-mano sa Mga Utos, hal. HOME:STRIP:2:OFF, HOME:STRIP:ALL:OFF o HOME:IR:TV_POWER."),
+            tr("Tip: ang action ay maaari ring i-type nang manu-mano sa Mga Utos, hal. HOME:STRIP:2:OFF, HOME:STRIP:ALL:OFF, HOME:STRIP:USB:ON o HOME:IR:TV_POWER."),
             12, 11f
         ))
 
-        val scroll = ScrollView(activity).apply { addView(container) }
+        // Naka-pin sa TAAS ang status (hindi kasama sa scroll) para laging kita ang resulta ng pinindot na button.
+        val d = activity.resources.displayMetrics.density
+        statusView.apply {
+            textSize = 13f
+            setPadding((16 * d).toInt(), (8 * d).toInt(), (16 * d).toInt(), (8 * d).toInt())
+        }
+        val root = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(statusView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+            addView(ScrollView(activity).apply { addView(container) }, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        }
         openDialog(
             "🏠 Smart Home",
-            scroll,
+            root,
             tr("I-save"),
             { visible = false; saveFields(); onStatus(tr("Na-save ang Smart Home settings")) },
             tr("Isara"),
             { visible = false; saveFields() }
+        )
+    }
+
+    /** I-paste ang entry mula sa TinyTuya (devices.json / snapshot.json) - kukunin ang id, local key, IP at version. */
+    private fun showImportDialog() {
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 24)
+        }
+        val box = EditText(activity).apply {
+            hint = "{ \"name\": \"...\", \"id\": \"...\", \"key\": \"...\" }"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 6
+            setGravity(Gravity.TOP)
+        }
+        container.addView(label(
+            tr("Buksan ang devices.json (o snapshot.json) ng TinyTuya, kopyahin ang entry ng strip (o ang buong file), at i-paste dito. Kukunin nito ang Device ID, Local Key, IP at version."),
+            0, 12f
+        ))
+        container.addView(box)
+
+        fun imported(d: SmartHome.Companion.TuyaImport): String =
+            "✅ " + tr("Na-import: {0}").replace("{0}", d.name) +
+                (if (d.ip.isEmpty()) " - " + tr("ilagay pa ang IP ng strip") else "")
+
+        openDialog(
+            tr("📥 I-import ang strip"),
+            ScrollView(activity).apply { addView(container) },
+            tr("I-import"),
+            {
+                val list = try {
+                    SmartHome.parseTuyaImport(box.text.toString())
+                } catch (e: IllegalArgumentException) {
+                    show("⚠️ " + (e.message ?: "Hindi mabasa"))
+                    null
+                }
+                if (list != null) {
+                    if (list.size == 1) {
+                        smartHome.applyImport(list.first())
+                        show(imported(list.first()))
+                    } else {
+                        showPicker(
+                            tr("Piliin ang strip"),
+                            list.map { d ->
+                                (d.name + (if (d.ip.isNotEmpty()) " @ ${d.ip}" else "")) to {
+                                    smartHome.applyImport(d)
+                                    show(imported(d))
+                                }
+                            }
+                        )
+                    }
+                }
+            },
+            tr("Cancel"),
+            { show() }
         )
     }
 
