@@ -157,6 +157,24 @@ class MainActivity : ComponentActivity() {
     private lateinit var faceEmbedder: FaceEmbedder
     private lateinit var faceStore: FaceStore
     private lateinit var commandStore: CommandStore
+    private lateinit var smartHome: SmartHome
+
+    // Smart Home (RM mini 3 + Lasco power strip) - dialog ay nasa SmartHomeUi.kt
+    private val smartHomeUi: SmartHomeUi by lazy {
+        SmartHomeUi(
+            activity = this,
+            smartHome = smartHome,
+            commandStore = commandStore,
+            tr = { tr(it) },
+            openDialog = { title, content, positive, onPositive, negative, onNegative ->
+                val d = ModernDialog().setTitle(title).setView(content)
+                if (positive != null) d.setPositiveButton(positive) { _, _ -> onPositive?.invoke() }
+                if (negative != null) d.setNegativeButton(negative) { _, _ -> onNegative?.invoke() }
+                d.showImmersive()
+            },
+            onStatus = { msg -> statusText.text = msg }
+        )
+    }
 
     private var micConfidenceThreshold: Float
         get() = prefs.getFloat("mic_confidence_threshold", 0.5f)
@@ -435,6 +453,7 @@ class MainActivity : ComponentActivity() {
         faceEmbedder = FaceEmbedder(this)
         faceStore = FaceStore(this)
         commandStore = CommandStore(this)
+        smartHome = SmartHome(this)
         commandStore.seedDefaultsIfNeeded()
 
         buildUi()
@@ -505,10 +524,24 @@ class MainActivity : ComponentActivity() {
     private fun runMovementParts(otherParts: List<String>) {
         for (part in otherParts) {
             val partUpper = part.uppercase()
+            if (SmartHome.isHomeAction(part)) {
+                // RM mini 3 / Lasco power strip - hiwalay na daan, hindi dumadaan sa ESP32
+                runSmartHomeAction(part)
+                continue
+            }
             if (partUpper in movementActions) {
                 sendTimedCommand(partUpper, voiceMovementDurationMs)
             } else {
                 sendCommandToEsp32(part)
+            }
+        }
+    }
+
+    private fun runSmartHomeAction(action: String) {
+        smartHome.execute(action.trim()) { ok, msg ->
+            runOnUi {
+                statusText.text = (if (ok) "🏠 " else "⚠️ ") + msg
+                addVoiceLogEntry("smart home: ${action.trim()}", msg)
             }
         }
     }
@@ -1462,6 +1495,7 @@ class MainActivity : ComponentActivity() {
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
+            makeCard("🏠", "Smart Home", "RM mini 3 + Lasco") { smartHomeUi.show() },
             makeCard("🧭", "Camera Nav", "Obstacle avoidance") { showNavSettingsDialog() },
             makeCard("🗒️", "Voice Log", tr("Kasaysayan")) { showVoiceLogDialog() }
         )
@@ -2676,7 +2710,15 @@ class MainActivity : ComponentActivity() {
         val espAction = when (action) {
             "NONE" -> null
             "STOP" -> "FORCE_STOP"
-            else -> if (action in GeminiBrain.ALLOWED_ACTIONS) action else null
+            else -> when {
+                action in GeminiBrain.ALLOWED_ACTIONS -> action
+                // Smart home: tatanggapin LAMANG kung eksaktong action na ginawa mismo ni idol sa Mga Utos.
+                // Hindi puwedeng mag-imbento si Gemini ng sariling HOME: action.
+                SmartHome.isHomeAction(action) && commandStore.all().any { c ->
+                    c.action.split("||").any { it.trim().equals(action, ignoreCase = true) }
+                } -> action
+                else -> null
+            }
         }
         if (espAction != null) {
             flashCommandEyes()
