@@ -394,6 +394,9 @@ class SmartHome(context: Context) {
 
     // --- Internal ---------------------------------------------------------------------------
 
+    /** Ilang outlet ang naka-set (para sa listahan ng mapagpipiliang aksyon). */
+    fun socketCount(): Int = parseDps().size.takeIf { it > 0 } ?: 4
+
     private fun parseDps(): List<String> =
         stripDps.split(",").map { it.trim() }.filter { it.matches(Regex("\\d{1,3}")) }
 
