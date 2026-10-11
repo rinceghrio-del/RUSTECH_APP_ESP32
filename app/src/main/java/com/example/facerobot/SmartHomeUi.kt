@@ -542,10 +542,13 @@ class SmartHomeUi(
                 val t = triggerInput.text.toString()
                 val r = replyInput.text.toString()
                 val tk = trackInput.text.toString()
+                // Palitan LAMANG ang HOME: na bahagi - panatilihin ang ibang action na nakasulat na
+                // (hal. PLAYSONG&TRACK=50&ADVERT=65 o movement), hindi dapat mabura.
+                val keep = actionParts(actionInput.text.toString()).filter { !SmartHome.isHomeAction(it) }
                 showPicker(
                     tr("Piliin ang aksyon"),
                     actionChoices().map { (text, act) ->
-                        text to { showCommandEditor(original, t, r, act, tk) }
+                        text to { showCommandEditor(original, t, r, (listOf(act) + keep).joinToString("||"), tk) }
                     },
                     onCancel = { showCommandEditor(original, t, r, actionInput.text.toString(), tk) }
                 )
