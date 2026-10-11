@@ -160,6 +160,10 @@ class SmartHome(context: Context) {
     @Volatile private var tuyaClient: TuyaCloudClient? = null
     @Volatile private var tuyaClientKey: String = ""
 
+    init {
+        warmUp()
+    }
+
     /** I-save ang nabasang device (id, local key, ip, version) - ang walang laman ay hindi ginagalaw. */
     fun applyImport(d: TuyaImport) {
         tuyaDeviceId = d.id
@@ -197,11 +201,14 @@ class SmartHome(context: Context) {
             return
         }
         rmExecutor.execute {
+            val t0 = System.nanoTime()
             try {
                 resolveRm().sendData(data)
-                onResult(true, "IR $name naipadala")
+                val ms = (System.nanoTime() - t0) / 1_000_000
+                onResult(true, "IR $name naipadala ($ms ms)")
             } catch (e: Exception) {
                 rmDevice = null // baka nagbago ang IP/session - hanapin ulit sa susunod
+                clearCachedRm()
                 onResult(false, friendlyError(e))
             }
         }
@@ -418,16 +425,53 @@ class SmartHome(context: Context) {
         val savedIp = rmIp
         rmDevice?.let { if (savedIp.isBlank() || it.host == savedIp) return it }
 
-        val found = Broadlink.discover(savedIp.ifBlank { null }, 3500)
+        // May naka-save nang info ng RM (type + MAC) para sa IP na ito - hindi na kailangang mag-discover.
+        if (savedIp.isNotBlank()) {
+            loadCachedRm(savedIp)?.let { rmDevice = it; return it }
+        }
+
+        val found = Broadlink.discover(savedIp.ifBlank { null }, 3500, stopWhenFound = true)
         val pick = found.firstOrNull { savedIp.isBlank() || it.host == savedIp }
             ?: throw BroadlinkException(
                 if (savedIp.isBlank()) "Walang Broadlink na nakita sa WiFi - ilagay ang IP ng RM mini 3"
                 else "Walang sumagot sa $savedIp - tama ba ang IP at nasa parehong WiFi?"
             )
         if (savedIp.isBlank()) rmIp = pick.host
+        saveCachedRm(pick)
         val dev = BroadlinkDevice(pick)
         rmDevice = dev
         return dev
+    }
+
+    // --- Cache ng impormasyon ng RM (para hindi na mag-discover tuwing bubuksan ang app) ---------
+
+    private fun saveCachedRm(f: Broadlink.Found) {
+        val mac = f.macRaw.joinToString("") { "%02x".format(it) }
+        prefs.edit().putString("rm_info", listOf(f.host, f.devType, mac, f.name.replace("|", " "), f.locked).joinToString("|")).apply()
+    }
+
+    private fun loadCachedRm(host: String): BroadlinkDevice? {
+        val p = (prefs.getString("rm_info", "") ?: "").split("|")
+        if (p.size < 5 || p[0] != host) return null
+        val devType = p[1].toIntOrNull() ?: return null
+        val mac = runCatching { Broadlink.hexToBytes(p[2]) }.getOrNull()?.takeIf { it.size == 6 } ?: return null
+        return BroadlinkDevice(host, devType, mac, p[3], p[4] == "true")
+    }
+
+    private fun clearCachedRm() {
+        prefs.edit().remove("rm_info").apply()
+    }
+
+    /** Ihanda ang RM sa background (discover kung kailangan + auth) para mabilis na ang unang utos. Isang beses lang. */
+    fun warmUp() {
+        if (rmIp.isBlank()) return
+        rmExecutor.execute {
+            try {
+                resolveRm().connect()
+            } catch (e: Exception) {
+                rmDevice = null // tahimik lang - baka wala pang WiFi; susubukan ulit sa unang utos
+            }
+        }
     }
 
     private fun friendlyError(e: Exception): String = when (e) {
