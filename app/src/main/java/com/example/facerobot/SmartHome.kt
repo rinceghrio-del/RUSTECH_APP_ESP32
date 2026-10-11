@@ -217,8 +217,16 @@ class SmartHome(context: Context) {
     private fun localConfigured(): Boolean =
         stripIp.isNotBlank() && tuyaDeviceId.isNotBlank() && tuyaLocalKey.isNotBlank()
 
+    /**
+     * OFFLINE LANG ang strip. Ang cloud fallback ay patay (default) - hindi na tatawag sa Tuya cloud kahit pumalya
+     * ang local, kaya walang kasamang error ng subscription at mabilis ang pagbalik ng resulta. Kung kailanganin
+     * pa, puwedeng i-ON ulit sa pamamagitan ng setting na "cloud_fallback" (wala itong menu).
+     */
+    private val cloudFallbackEnabled: Boolean
+        get() = prefs.getBoolean("cloud_fallback", false)
+
     private fun cloudConfigured(): Boolean =
-        tuyaAccessId.isNotBlank() && tuyaAccessSecret.isNotBlank() && tuyaDeviceId.isNotBlank()
+        cloudFallbackEnabled && tuyaAccessId.isNotBlank() && tuyaAccessSecret.isNotBlank() && tuyaDeviceId.isNotBlank()
 
     /**
      * Unahin ang OFFLINE (local WiFi). Kung pumalya at may cloud settings, subukan ang cloud bilang fallback.
@@ -229,7 +237,7 @@ class SmartHome(context: Context) {
         val local = localConfigured()
         val cloud = cloudConfigured()
         if (!local && !cloud) {
-            onResult(false, "Kulang ang settings ng strip - ilagay ang IP + Local Key (offline) o ang Tuya cloud settings sa Smart Home menu")
+            onResult(false, "Kulang ang settings ng strip - ilagay ang IP, Device ID at Local Key sa Smart Home menu")
             return
         }
 
@@ -373,7 +381,7 @@ class SmartHome(context: Context) {
         val local = localConfigured()
         val cloud = cloudConfigured()
         if (!local && !cloud) {
-            onDone(false, "Kulang ang settings ng strip - ilagay ang IP + Local Key (offline) o ang Tuya cloud settings")
+            onDone(false, "Kulang ang settings ng strip - ilagay ang IP, Device ID at Local Key")
             return
         }
         cloudExecutor.execute {
