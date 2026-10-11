@@ -39,6 +39,7 @@ class TuyaLocalClient(
     private class Frame(val cmd: Int, val retcode: Int, val payload: ByteArray)
 
     companion object {
+        private const val MAX_CONNECT_ATTEMPTS = 3
         private const val PREFIX = 0x000055AA
         private const val SUFFIX = 0x0000AA55
         private const val CMD_CONTROL = 7
@@ -112,22 +113,40 @@ class TuyaLocalClient(
         else -> null
     }
 
+    /**
+     * Ang strip ay isang koneksyon lang ang tinatanggap at kung minsan ay nire-reset ang unang koneksyon
+     * (hal. unang utos pagkabukas ng app). Kaya kapag pumalya ang KONEKSYON (reset, refused, timeout),
+     * umuulit ito nang hanggang 3 beses na may maikling pahinga. Ligtas ito: ang ON/OFF at status ay
+     * paulit-ulit na puwedeng ipadala at pareho ang resulta. Ang mali sa key/version ay hindi inuulit.
+     */
     private fun session(block: (Socket) -> Result): Result {
-        val sock = Socket()
-        return try {
-            sock.tcpNoDelay = true
-            sock.connect(InetSocketAddress(host.trim(), port), connectTimeoutMs)
-            block(sock)
-        } catch (e: java.net.ConnectException) {
-            Result(false, "Hindi maabot ang strip sa $host:$port - tama ba ang IP at parehong WiFi? Baka may ibang app o bridge na nakakonekta (isang koneksyon lang ang tinatanggap ng strip)")
-        } catch (e: SocketTimeoutException) {
-            Result(false, "Walang sagot ang strip sa $host (timeout)")
-        } catch (e: IOException) {
-            Result(false, "Error sa koneksyon sa strip: ${e.message ?: e.javaClass.simpleName}")
-        } catch (e: Exception) {
-            Result(false, "Error: ${e.message ?: e.javaClass.simpleName}")
-        } finally {
-            try { sock.close() } catch (_: Exception) { }
+        var attempt = 0
+        while (true) {
+            attempt++
+            val sock = Socket()
+            var retryable = false
+            var maxAttempts = MAX_CONNECT_ATTEMPTS
+            val result: Result = try {
+                sock.tcpNoDelay = true
+                sock.connect(InetSocketAddress(host.trim(), port), connectTimeoutMs)
+                block(sock)
+            } catch (e: java.net.ConnectException) {
+                retryable = true
+                Result(false, "Hindi maabot ang strip sa $host:$port - tama ba ang IP at parehong WiFi? Baka may ibang app o bridge na nakakonekta (isang koneksyon lang ang tinatanggap ng strip)")
+            } catch (e: SocketTimeoutException) {
+                retryable = true
+                maxAttempts = 2 // mahaba ang hintay ng timeout - isang ulit lang
+                Result(false, "Walang sagot ang strip sa $host (timeout)")
+            } catch (e: IOException) {
+                retryable = true
+                Result(false, "Error sa koneksyon sa strip: ${e.message ?: e.javaClass.simpleName}")
+            } catch (e: Exception) {
+                Result(false, "Error: ${e.message ?: e.javaClass.simpleName}")
+            } finally {
+                try { sock.close() } catch (_: Exception) { }
+            }
+            if (result.ok || !retryable || attempt >= maxAttempts) return result
+            try { Thread.sleep(300L * attempt) } catch (_: InterruptedException) { return result }
         }
     }
 
