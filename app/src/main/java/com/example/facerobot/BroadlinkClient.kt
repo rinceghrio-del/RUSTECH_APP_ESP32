@@ -96,7 +96,12 @@ object Broadlink {
      * Naghahanap ng Broadlink device. Kung may targetIp - diretso (unicast) sa IP na iyon;
      * kung wala - broadcast sa buong WiFi network. Blocking ito, tawagin sa background thread.
      */
-    fun discover(targetIp: String? = null, timeoutMs: Int = 3000, port: Int = DEFAULT_PORT): List<Found> {
+    fun discover(
+        targetIp: String? = null,
+        timeoutMs: Int = 3000,
+        port: Int = DEFAULT_PORT,
+        stopWhenFound: Boolean = false // huminto agad sa unang sagot (mas mabilis; hindi na hinihintay ang buong timeout)
+    ): List<Found> {
         val packet = ByteArray(0x30)
         val now = ZonedDateTime.now()
         putLe32(packet, 0x08, now.offset.totalSeconds / 3600)
@@ -143,6 +148,7 @@ object Broadlink {
                 val name = String(buf, 0x40, end - 0x40, Charsets.UTF_8)
                 val locked = dp.length > 0x7F && buf[0x7F].toInt() != 0
                 found.add(Found(host, devType, mac, name, locked))
+                if (stopWhenFound) break
             }
         }
         return found
@@ -171,6 +177,12 @@ class BroadlinkDevice(
 
     constructor(f: Broadlink.Found, port: Int = Broadlink.DEFAULT_PORT, timeoutMs: Int = 4000) :
         this(f.host, f.devType, f.macRaw, f.name, f.locked, port, timeoutMs)
+
+    /** I-authenticate na agad (kung hindi pa) para handa na ang session bago ang unang utos. */
+    @Synchronized
+    fun connect() {
+        if (!authed) auth()
+    }
 
     @Synchronized
     fun auth() {
@@ -214,14 +226,19 @@ class BroadlinkDevice(
 
     // ---------------------------------------------------------------------------------------
 
+    // Mabilis ang unang subok (maikling hintay, mas madalas na ulit) para hindi tayo maghintay ng 4 na segundo
+    // kapag lumang session na ang hawak natin. Ang RM mini ay karaniwang sumasagot sa loob ng ilang milliseconds.
+    private val fastTotalMs = 1500
+    private val fastRetryMs = 700
+
     private fun commandWithRetry(cmd: Int, data: ByteArray): ByteArray = try {
-        command(cmd, data)
+        command(cmd, data, fastTotalMs, fastRetryMs)
     } catch (e: BroadlinkException) {
         authed = false // baka nag-expire ang session - subukan ulit na may bagong auth
         command(cmd, data)
     }
 
-    private fun command(cmd: Int, data: ByteArray): ByteArray {
+    private fun command(cmd: Int, data: ByteArray, totalMs: Int = timeoutMs, retryMs: Int = 1000): ByteArray {
         if (!authed) auth()
         val payload = if (lengthPrefixed) {
             val h = ByteArray(6)
@@ -233,7 +250,7 @@ class BroadlinkDevice(
             Broadlink.putLe32(h, 0, cmd)
             h + data
         }
-        val resp = sendPacket(0x6A, payload)
+        val resp = sendPacket(0x6A, payload, totalMs, retryMs)
         checkError(resp)
         val dec = decryptBody(resp)
         return if (lengthPrefixed) {
@@ -261,7 +278,7 @@ class BroadlinkDevice(
         return Broadlink.aes(false, resp.copyOfRange(0x38, 0x38 + usable), key)
     }
 
-    private fun sendPacket(type: Int, payload: ByteArray): ByteArray {
+    private fun sendPacket(type: Int, payload: ByteArray, totalMs: Int = timeoutMs, retryMs: Int = 1000): ByteArray {
         count = ((count + 1) or 0x8000) and 0xFFFF
 
         val header = ByteArray(0x38)
@@ -281,13 +298,13 @@ class BroadlinkDevice(
         val addr = InetAddress.getByName(host)
         DatagramSocket().use { sock ->
             sock.connect(addr, port) // sagot lang galing sa device na ito ang tatanggapin
-            val deadline = System.currentTimeMillis() + timeoutMs
+            val deadline = System.currentTimeMillis() + totalMs
             val buf = ByteArray(2048)
             while (true) {
                 val remaining = deadline - System.currentTimeMillis()
                 if (remaining <= 0) throw BroadlinkException("Walang sagot ang RM mini 3 ($host) - timeout")
                 sock.send(DatagramPacket(packet, packet.size))
-                sock.soTimeout = minOf(1000L, remaining).toInt().coerceAtLeast(50)
+                sock.soTimeout = minOf(retryMs.toLong(), remaining).toInt().coerceAtLeast(50)
                 val dp = DatagramPacket(buf, buf.size)
                 try {
                     sock.receive(dp)
