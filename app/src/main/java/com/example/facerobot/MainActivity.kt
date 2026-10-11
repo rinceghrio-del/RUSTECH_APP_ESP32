@@ -501,8 +501,14 @@ class MainActivity : ComponentActivity() {
      */
     private fun executeEsp32Actions(actionField: String) {
         val parts = actionField.split("||").map { it.trim() }.filter { it.isNotEmpty() }
-        val dfTracks = parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.toIntOrNull() }
-        val otherParts = parts.filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
+        // Kapag ang TTS ng phone ang boses (naka-ON ang TTS switch), PATAY ang DFPlayer output ng
+        // utos - para hindi sabay magsalita ang phone at ang robot. Tuloy pa rin ang movement/HOME.
+        val ttsIsVoice = appTtsEnabled
+        val dfTracks = if (ttsIsVoice) emptyList()
+            else parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+        val otherParts = parts
+            .filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
+            .filterNot { ttsIsVoice && isDfPlayerRawCommand(it) }
 
         if (dfTracks.isEmpty()) {
             runMovementParts(otherParts)
@@ -518,6 +524,13 @@ class MainActivity : ComponentActivity() {
         // Kung sakaling may isa pang "dfplayer play N" sa parehong combo (bihira),
         // ipadala na lang agad ang mga sumunod nang walang hintayan.
         dfTracks.drop(1).forEach { sendPlayTrack(it) }
+    }
+
+    /** Raw na DFPlayer command ng ESP32, hal. PLAYSONG&TRACK=50&ADVERT=65 (hindi ang HOME: o movement). */
+    private fun isDfPlayerRawCommand(part: String): Boolean {
+        val u = part.trim().uppercase()
+        if (u.startsWith("HOME:")) return false
+        return u.startsWith("PLAYSONG") || u.contains("ADVERT=") || u.contains("TRACK=")
     }
 
     private fun unknownGreetingTrackList(): List<Int> =
