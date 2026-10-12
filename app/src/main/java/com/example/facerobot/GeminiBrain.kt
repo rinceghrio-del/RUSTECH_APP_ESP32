@@ -224,7 +224,7 @@ class GeminiBrain(baseClient: OkHttpClient) {
             // Hindi JSON (bihira) - gamitin na lang bilang plain na sagot, walang kilos.
             replyText = raw
         }
-        if (action !in ALLOWED_ACTIONS && !action.startsWith("HOME:")) action = "NONE"
+        if (action !in ALLOWED_ACTIONS && !action.contains("HOME:")) action = "NONE"
         return Result.Ok(Reply(replyText, action))
     }
 
