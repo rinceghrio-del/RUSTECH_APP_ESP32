@@ -141,6 +141,16 @@ class MainActivity : ComponentActivity() {
         .callTimeout(0, java.util.concurrent.TimeUnit.SECONDS)
         .build()
 
+    // Para sa DFPlayer track na may kasunod na kilos: MAIKLI ang timeout (hanggang ~3s) imbes na 30s/60s ng
+    // httpClient, para hindi maghintay nang matagal ang kasunod na movement kapag hindi sumasagot ang ESP32.
+    private val dfThenClient: OkHttpClient by lazy {
+        httpClient.newBuilder()
+            .connectTimeout(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .readTimeout(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .callTimeout(3000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .build()
+    }
+
     // Hiwalay na client para sa camera-nav hints + ping: MAIKLI ang timeouts at sarili nitong dispatcher.
     // Ang pangkalahatang httpClient ay may 30s/60s timeout - kapag nag-hang ang isang request, napupuno ang
     // dispatcher slots at naiipit ang lahat ng hints/ping (kaya "minsan hindi gumagana" ang camera avoidance).
@@ -510,8 +520,14 @@ class MainActivity : ComponentActivity() {
             .filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
             .filterNot { ttsIsVoice && isDfPlayerRawCommand(it) }
 
+        // Ang smart home (HOME:) ay HINDI naghihintay sa DFPlayer - tumatakbo agad, para hindi maantala
+        // kapag mabagal o hindi sumasagot ang ESP32.
+        val homeParts = otherParts.filter { SmartHome.isHomeAction(it) }
+        val restParts = otherParts.filterNot { SmartHome.isHomeAction(it) }
+        if (homeParts.isNotEmpty()) runMovementParts(homeParts)
+
         if (dfTracks.isEmpty()) {
-            runMovementParts(otherParts)
+            runMovementParts(restParts)
             return
         }
 
@@ -519,7 +535,7 @@ class MainActivity : ComponentActivity() {
         // DFPlayer track bago ipadala ang movement/ibang commands - kaysa manghula
         // tayo ng magic delay number na baka minsan hindi sapat.
         sendPlayTrackThen(dfTracks.first()) {
-            runMovementParts(otherParts)
+            runMovementParts(restParts)
         }
         // Kung sakaling may isa pang "dfplayer play N" sa parehong combo (bihira),
         // ipadala na lang agad ang mga sumunod nang walang hintayan.
@@ -549,6 +565,20 @@ class MainActivity : ComponentActivity() {
             } else {
                 sendCommandToEsp32(part)
             }
+        }
+    }
+
+    /**
+     * Tatanggapin ang HOME action mula kay Gemini LAMANG kung ito ay eksaktong action (buo, o isang bahagi ng "||" combo)
+     * na ginawa mismo ni idol sa Mga Utos. Hindi puwedeng mag-imbento si Gemini ng sarili.
+     */
+    private fun isOwnerDefinedHomeAction(action: String): Boolean {
+        val a = action.trim()
+        if (!a.uppercase().contains("HOME:")) return false
+        fun norm(s: String) = s.split("||").map { it.trim().uppercase() }.filter { it.isNotEmpty() }.joinToString("||")
+        val na = norm(a)
+        return commandStore.all().any { c ->
+            norm(c.action) == na || c.action.split("||").any { it.trim().equals(a, ignoreCase = true) }
         }
     }
 
@@ -623,7 +653,7 @@ class MainActivity : ComponentActivity() {
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
             .build()
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        dfThenClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                 runOnUi {
                     addVoiceLogEntry("DFPlayer track $track", "HTTP FAILED: ${e.message}")
@@ -2750,9 +2780,7 @@ class MainActivity : ComponentActivity() {
                 action in GeminiBrain.ALLOWED_ACTIONS -> action
                 // Smart home: tatanggapin LAMANG kung eksaktong action na ginawa mismo ni idol sa Mga Utos.
                 // Hindi puwedeng mag-imbento si Gemini ng sariling HOME: action.
-                SmartHome.isHomeAction(action) && commandStore.all().any { c ->
-                    c.action.split("||").any { it.trim().equals(action, ignoreCase = true) }
-                } -> action
+                isOwnerDefinedHomeAction(action) -> action
                 else -> null
             }
         }
