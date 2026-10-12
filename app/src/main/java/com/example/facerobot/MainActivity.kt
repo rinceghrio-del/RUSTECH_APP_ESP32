@@ -169,6 +169,33 @@ class MainActivity : ComponentActivity() {
     private lateinit var commandStore: CommandStore
     private lateinit var smartHome: SmartHome
 
+    // Export / Import ng settings (SettingsBackupUi.kt) - Storage Access Framework, walang kailangang permission
+    private val settingsExportLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.CreateDocument("application/json")
+    ) { uri -> if (uri != null) settingsBackupUi.onExportUri(uri) }
+
+    private val settingsImportLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.OpenDocument()
+    ) { uri -> if (uri != null) settingsBackupUi.onImportUri(uri) }
+
+    private val settingsBackupUi: SettingsBackupUi by lazy {
+        SettingsBackupUi(
+            activity = this,
+            tr = { tr(it) },
+            openDialog = { title, content, positive, onPositive, negative, onNegative ->
+                val d = ModernDialog().setTitle(title).setView(content)
+                if (positive != null) d.setPositiveButton(positive) { _, _ -> onPositive?.invoke() }
+                if (negative != null) d.setNegativeButton(negative) { _, _ -> onNegative?.invoke() }
+                d.showImmersive()
+            },
+            onStatus = { msg -> statusText.text = msg },
+            launchExport = { name -> settingsExportLauncher.launch(name) },
+            launchImport = {
+                settingsImportLauncher.launch(arrayOf("application/json", "text/plain", "application/octet-stream", "*/*"))
+            }
+        )
+    }
+
     // Smart Home (RM mini 3 + Lasco power strip) - dialog ay nasa SmartHomeUi.kt
     private val smartHomeUi: SmartHomeUi by lazy {
         SmartHomeUi(
@@ -1562,6 +1589,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
             makeCard("🏠", "Smart Home", "RM mini 3 + Lasco") { smartHomeUi.show() },
+            makeCard("📦", "Export / Import", tr("Settings backup")) { settingsBackupUi.show() },
             makeCard("🧭", "Camera Nav", "Obstacle avoidance") { showNavSettingsDialog() },
             makeCard("🗒️", "Voice Log", tr("Kasaysayan")) { showVoiceLogDialog() }
         )
