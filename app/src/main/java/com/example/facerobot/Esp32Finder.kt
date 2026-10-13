@@ -113,12 +113,12 @@ object Esp32Finder {
         Thread({
             val result = try {
                 scan(localPrefixes(), currentIp)
-            } catch (e: Exception) {
-                emptyList()
+            } catch (t: Throwable) {
+                emptyList() // kahit anong error - walang lalabas sa thread na ito at hindi mag-crash ang app
             } finally {
                 scanning.set(false)
             }
-            onDone(result)
+            try { onDone(result) } catch (t: Throwable) { }
         }, "esp32-finder-main").apply { isDaemon = true }.start()
         return true
     }
