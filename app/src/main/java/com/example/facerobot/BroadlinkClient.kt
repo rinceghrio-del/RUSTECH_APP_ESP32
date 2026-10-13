@@ -153,6 +153,13 @@ object Broadlink {
         }
         return found
     }
+
+    /**
+     * Hanapin ang RM na may ganitong MAC (para makita pa rin kahit nagbago ang IP). Broadcast sa buong WiFi
+     * (o sa "via" kung ibinigay). Naghihintay ng buong timeout dahil kailangang makita ang lahat ng sumagot.
+     */
+    fun findByMac(mac: ByteArray, via: String? = null, timeoutMs: Int = 2500, port: Int = DEFAULT_PORT): Found? =
+        discover(via, timeoutMs, port).firstOrNull { it.macRaw.contentEquals(mac) }
 }
 
 /**
