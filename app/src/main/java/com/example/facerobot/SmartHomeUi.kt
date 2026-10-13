@@ -224,6 +224,18 @@ class SmartHomeUi(
         container.addView(label("🔌 Lasco Smart Power Strip", 22, 15f))
         container.addView(label(tr("📴 Offline (local WiFi) - walang internet na kailangan:"), 8, 12f))
         container.addView(stripIpInput)
+        container.addView(row(
+            button(tr("🔎 Hanapin ang strip sa WiFi")) {
+                saveFields()
+                say(tr("Hinahanap ang strip sa WiFi... (ilang segundo)"))
+                smartHome.findStrip { ip, msg ->
+                    ui {
+                        if (ip != null) stripIpInput.setText(ip)
+                        statusView.text = (if (ip != null) "✅ " else "⚠️ ") + msg
+                    }
+                }
+            }
+        ))
         container.addView(deviceInput)
         container.addView(localKeyInput)
         container.addView(dpsInput)
