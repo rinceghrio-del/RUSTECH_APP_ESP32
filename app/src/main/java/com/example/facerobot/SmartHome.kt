@@ -214,14 +214,25 @@ class SmartHome(context: Context) {
             onResult(false, "Walang naka-save na IR code na \"$name\" - turuan muna si RM sa Smart Home menu")
             return
         }
-        rmExecutor.execute {
+        safeExec(rmExecutor, { onResult(false, it) }) {
             val t0 = System.nanoTime()
+            var note = ""
             try {
-                resolveRm().sendData(data)
+                try {
+                    resolveRm().sendData(data)
+                } catch (e: Exception) {
+                    rmDevice = null // baka nagbago ang IP/session
+                    clearCachedRm()
+                    // Kung nagbago ang IP ng RM: hanapin gamit ang MAC at ulitin nang isang beses.
+                    val moved = if (e is BroadlinkException) relocateRm() else null
+                    if (moved == null) throw e
+                    resolveRm().sendData(data)
+                    note = " - nahanap sa bagong IP $moved"
+                }
                 val ms = (System.nanoTime() - t0) / 1_000_000
-                onResult(true, "IR $name naipadala ($ms ms)")
+                onResult(true, "IR $name naipadala ($ms ms)$note")
             } catch (e: Exception) {
-                rmDevice = null // baka nagbago ang IP/session - hanapin ulit sa susunod
+                rmDevice = null
                 clearCachedRm()
                 onResult(false, friendlyError(e))
             }
@@ -284,9 +295,9 @@ class SmartHome(context: Context) {
         safeExec(cloudExecutor, { onResult(false, it) }) {
             var localFail: String? = null
             if (local && localDps != null) {
-                val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).setDps(localDps.associateWith { on })
+                val (r, movedTo) = localWithRelocate { it.setDps(localDps.associateWith { v -> on }) }
                 if (r.ok) {
-                    onResult(true, "Power strip: $what $state (offline)")
+                    onResult(true, "Power strip: $what $state (offline)" + (movedTo?.let { " - nahanap sa bagong IP $it" } ?: ""))
                     return@safeExec
                 }
                 localFail = r.message
@@ -401,9 +412,9 @@ class SmartHome(context: Context) {
         safeExec(cloudExecutor, { onDone(false, it) }) {
             var localFail: String? = null
             if (local) {
-                val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).status()
+                val (r, movedTo) = localWithRelocate { it.status() }
                 if (r.ok) {
-                    onDone(true, "(offline)\n" + r.message)
+                    onDone(true, "(offline)" + (movedTo?.let { " - nahanap sa bagong IP $it" } ?: "") + "\n" + r.message)
                     return@safeExec
                 }
                 localFail = r.message
@@ -469,7 +480,91 @@ class SmartHome(context: Context) {
 
     private fun saveCachedRm(f: Broadlink.Found) {
         val mac = f.macRaw.joinToString("") { "%02x".format(it) }
-        prefs.edit().putString("rm_info", listOf(f.host, f.devType, mac, f.name.replace("|", " "), f.locked).joinToString("|")).apply()
+        prefs.edit()
+            .putString("rm_info", listOf(f.host, f.devType, mac, f.name.replace("|", " "), f.locked).joinToString("|"))
+            .putString("rm_mac", mac) // HINDI binubura - ginagamit para mahanap ang RM kapag nagbago ang IP
+            .apply()
+    }
+
+    @Volatile private var rmRelocateLastMs = 0L
+
+    /**
+     * Nagbago na marahil ang IP ng RM: hanapin sa WiFi gamit ang naka-save na MAC at i-update ang IP.
+     * Ibinabalik ang bagong IP, o null kung wala/hindi nagbago. Isang beses lang bawat 30 segundo.
+     */
+    private fun relocateRm(): String? {
+        val macHex = prefs.getString("rm_mac", "") ?: ""
+        if (macHex.length != 12) return null
+        val now = System.currentTimeMillis()
+        if (now - rmRelocateLastMs < 30_000L) return null
+        rmRelocateLastMs = now
+        val f = Broadlink.findByMac(Broadlink.hexToBytes(macHex)) ?: return null
+        if (f.host == rmIp) return null
+        rmIp = f.host
+        saveCachedRm(f)
+        rmDevice = null
+        return f.host
+    }
+
+    // --- Lasco strip: hanapin sa WiFi gamit ang Device ID + Local Key kapag nagbago ang IP --------
+
+    @Volatile private var stripRelocateLastMs = 0L
+    @Volatile private var stripRelocateBackoffMs = 30_000L
+
+    private fun isConnectionFailure(msg: String): Boolean =
+        msg.startsWith("Hindi maabot ang strip") ||
+            msg.startsWith("Error sa koneksyon sa strip") ||
+            msg.startsWith("Walang sagot ang strip sa ")
+
+    /** Hanapin ang strip at i-save ang bagong IP. Ibinabalik ang bagong IP kung nagbago. May paghihintay para hindi paulit-ulit. */
+    private fun relocateStrip(force: Boolean = false): String? {
+        val now = System.currentTimeMillis()
+        if (!force && now - stripRelocateLastMs < stripRelocateBackoffMs) return null
+        stripRelocateLastMs = now
+        val ip = StripFinder.find(Esp32Finder.localPrefixes(), tuyaDeviceId, tuyaLocalKey, tuyaVersion)
+        if (ip == null) {
+            stripRelocateBackoffMs = (stripRelocateBackoffMs * 2).coerceAtMost(600_000L)
+            return null
+        }
+        stripRelocateBackoffMs = 30_000L
+        if (ip == stripIp) return null
+        stripIp = ip
+        return ip
+    }
+
+    /**
+     * Subukan ang local; kung pumalya ang KONEKSYON, hanapin ang strip sa bagong IP at ulitin nang isang beses.
+     * @return (resulta, bagong IP kung doon nagtagumpay)
+     */
+    private fun localWithRelocate(op: (TuyaLocalClient) -> TuyaLocalClient.Result): Pair<TuyaLocalClient.Result, String?> {
+        val first = op(TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion))
+        if (first.ok || !isConnectionFailure(first.message)) return first to null
+        val moved = relocateStrip() ?: return first to null
+        val second = op(TuyaLocalClient(moved, tuyaDeviceId, tuyaLocalKey, tuyaVersion))
+        return if (second.ok) second to moved else second to null
+    }
+
+    /** Manual na paghahanap ng strip (button sa Smart Home screen). Blocking-safe: tumatakbo sa background. */
+    fun findStrip(onDone: (ip: String?, message: String) -> Unit) {
+        if (tuyaDeviceId.isBlank() || tuyaLocalKey.isBlank()) {
+            onDone(null, "Ilagay muna ang Device ID at Local Key ng strip")
+            return
+        }
+        safeExec(cloudExecutor, { onDone(null, it) }) {
+            val prefixes = Esp32Finder.localPrefixes()
+            if (prefixes.isEmpty()) {
+                onDone(null, "Walang WiFi na nakita - nakakonekta ba ang phone sa WiFi?")
+                return@safeExec
+            }
+            val ip = StripFinder.find(prefixes, tuyaDeviceId, tuyaLocalKey, tuyaVersion)
+            if (ip == null) {
+                onDone(null, "Walang strip na nahanap. Naka-on ba ito, nasa parehong WiFi, at tama ang Device ID, Local Key at version?")
+            } else {
+                stripIp = ip
+                stripRelocateBackoffMs = 30_000L
+                onDone(ip, "Nahanap ang strip sa $ip")
+            }
+        }
     }
 
     private fun loadCachedRm(host: String): BroadlinkDevice? {
