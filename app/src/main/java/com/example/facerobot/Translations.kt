@@ -6,6 +6,15 @@ package com.example.facerobot
  */
 object Translations {
     val en: Map<String, String> = mapOf(
+        "🔎 Nahanap ang robot sa {0} - na-update ang IP" to "🔎 Found the robot at {0} - IP updated",
+        "May {0} posibleng robot sa WiFi - piliin sa IP settings (Hanapin)" to "{0} possible robots on WiFi - choose in IP settings (Find)",
+        "🔎 Hanapin ang robot sa WiFi" to "🔎 Find the robot on WiFi",
+        "Hinahanap sa WiFi... (ilang segundo)" to "Searching WiFi... (a few seconds)",
+        "Walang nakitang robot. Naka-on ba ito at nasa parehong WiFi?" to "No robot found. Is it on and on the same WiFi?",
+        "✅ Nahanap: {0} - pindutin ang Save" to "✅ Found: {0} - press Save",
+        "May {0} nahanap: {1}. Ang una ang inilagay - tiyaking ito ang robot mo." to "{0} found: {1}. The first was filled in - make sure it is your robot.",
+        "Naghahanap pa - maghintay sandali" to "Still searching - please wait",
+        "Awtomatikong hanapin ang robot kapag nawala ang koneksyon" to "Automatically find the robot when the connection is lost",
         "I-save ang settings sa file para ilipat sa ibang phone, o i-import ang file mula sa ibang phone." to "Save your settings to a file to move them to another phone, or import a file from another phone.",
         "Isama sa EXPORT:" to "Include in EXPORT:",
         "Settings ng app (IP ng ESP32, boses, Gemini, nav, atbp.)" to "App settings (ESP32 IP, voice, Gemini, nav, etc.)",
