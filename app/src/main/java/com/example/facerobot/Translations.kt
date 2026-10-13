@@ -6,6 +6,8 @@ package com.example.facerobot
  */
 object Translations {
     val en: Map<String, String> = mapOf(
+        "🔎 Hanapin ang strip sa WiFi" to "🔎 Find the strip on WiFi",
+        "Hinahanap ang strip sa WiFi... (ilang segundo)" to "Searching WiFi for the strip... (a few seconds)",
         "🔎 Nahanap ang robot sa {0} - na-update ang IP" to "🔎 Found the robot at {0} - IP updated",
         "May {0} posibleng robot sa WiFi - piliin sa IP settings (Hanapin)" to "{0} possible robots on WiFi - choose in IP settings (Find)",
         "🔎 Hanapin ang robot sa WiFi" to "🔎 Find the robot on WiFi",
