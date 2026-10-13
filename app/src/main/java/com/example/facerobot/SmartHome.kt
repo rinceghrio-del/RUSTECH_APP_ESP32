@@ -156,6 +156,20 @@ class SmartHome(context: Context) {
     private val rmExecutor = daemonSingle("smarthome-rm")
     private val cloudExecutor = daemonSingle("smarthome-cloud")
 
+    /**
+     * Patakbuhin sa executor NANG LIGTAS: kahit anong hindi inaasahang error (kahit Error) ay hindi lalabas
+     * sa thread - dahil ang hindi nahuling error sa background thread ay nagpapa-crash ng buong Android app.
+     */
+    private fun safeExec(executor: ExecutorService, onFail: (String) -> Unit, block: () -> Unit) {
+        executor.execute {
+            try {
+                block()
+            } catch (t: Throwable) {
+                try { onFail("Error: ${t.message ?: t.javaClass.simpleName}") } catch (_: Throwable) { }
+            }
+        }
+    }
+
     @Volatile private var rmDevice: BroadlinkDevice? = null
     @Volatile private var tuyaClient: TuyaCloudClient? = null
     @Volatile private var tuyaClientKey: String = ""
@@ -267,13 +281,13 @@ class SmartHome(context: Context) {
         val what = when (target) { "ALL" -> "lahat ng socket"; "USB" -> "USB"; else -> "socket $target" }
         val state = if (on) "ON" else "OFF"
 
-        cloudExecutor.execute {
+        safeExec(cloudExecutor, { onResult(false, it) }) {
             var localFail: String? = null
             if (local && localDps != null) {
                 val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).setDps(localDps.associateWith { on })
                 if (r.ok) {
                     onResult(true, "Power strip: $what $state (offline)")
-                    return@execute
+                    return@safeExec
                 }
                 localFail = r.message
             }
@@ -284,7 +298,7 @@ class SmartHome(context: Context) {
                 } else {
                     onResult(false, (localFail?.let { "Offline: $it | " } ?: "") + "Cloud: " + r.message)
                 }
-                return@execute
+                return@safeExec
             }
             onResult(false, localFail ?: "Hindi naipadala ang utos")
         }
@@ -346,7 +360,7 @@ class SmartHome(context: Context) {
             onDone(false, "Kulang ang Tuya settings (Access ID, Secret, Device ID)")
             return
         }
-        cloudExecutor.execute {
+        safeExec(cloudExecutor, { onDone(false, it) }) {
             val res = tuya().status(deviceId)
             onDone(res.ok, res.message)
         }
@@ -358,13 +372,13 @@ class SmartHome(context: Context) {
             onDone(TuyaCloudClient.DeviceList(false, "Ilagay muna ang Access ID at Access Secret ng Tuya project", emptyList()))
             return
         }
-        cloudExecutor.execute { onDone(tuya().listDevices()) }
+        safeExec(cloudExecutor, { onDone(TuyaCloudClient.DeviceList(false, it, emptyList())) }) { onDone(tuya().listDevices()) }
     }
 
     /** Piliin ang device: sine-save ang Device ID at awtomatikong kinukuha ang mga socket code nito. */
     fun adoptTuyaDevice(d: TuyaCloudClient.Device, onDone: (ok: Boolean, message: String) -> Unit) {
         tuyaDeviceId = d.id
-        cloudExecutor.execute {
+        safeExec(cloudExecutor, { onDone(false, it) }) {
             val r = tuya().switchCodes(d.id)
             if (r.ok) {
                 tuyaSocketCodes = r.message
@@ -384,13 +398,13 @@ class SmartHome(context: Context) {
             onDone(false, "Kulang ang settings ng strip - ilagay ang IP, Device ID at Local Key")
             return
         }
-        cloudExecutor.execute {
+        safeExec(cloudExecutor, { onDone(false, it) }) {
             var localFail: String? = null
             if (local) {
                 val r = TuyaLocalClient(stripIp, tuyaDeviceId, tuyaLocalKey, tuyaVersion).status()
                 if (r.ok) {
                     onDone(true, "(offline)\n" + r.message)
-                    return@execute
+                    return@safeExec
                 }
                 localFail = r.message
             }
