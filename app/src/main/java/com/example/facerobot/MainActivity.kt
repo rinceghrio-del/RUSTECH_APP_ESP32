@@ -420,6 +420,14 @@ class MainActivity : ComponentActivity() {
     private val navPoseSwitchMs = 1400L
     private var navNonMovingPolls = 0
     private var pingFailCount = 0
+
+    // Auto-hanap ng IP ng ESP32 (Esp32Finder.kt) kapag nawala ang koneksyon at nagbago na marahil ang IP nito.
+    private var esp32AutoFind: Boolean
+        get() = prefs.getBoolean("esp32_autofind", true)
+        set(value) { prefs.edit().putBoolean("esp32_autofind", value).apply() }
+    private var autoFindBusy = false
+    private var autoFindLastMs = 0L
+    private var autoFindBackoffMs = 60_000L // dumodoble (hanggang 10 minuto) kung walang makita - para hindi paulit-ulit
     private var lastNavServoAngle = 0
 
     private var navLastDecision = ObstacleAnalyzer.Decision.CLEAR
@@ -3534,13 +3542,50 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /**
+     * Kapag matagal nang walang sagot ang ESP32, hanapin ito sa WiFi. Kung ISA lang ang nakita, awtomatikong
+     * ilalagay ang bagong IP. Kung higit sa isa, hindi pipili ang app (baka ibang robot) - sa IP settings pipili si idol.
+     */
+    private fun maybeAutoFindEsp32() {
+        if (!esp32AutoFind || autoFindBusy) return
+        val now = System.currentTimeMillis()
+        if (now - autoFindLastMs < autoFindBackoffMs) return
+        autoFindLastMs = now
+        autoFindBusy = true
+        val current = esp32BaseUrl.removePrefix("http://")
+        val started = Esp32Finder.scanAsync(current) { found ->
+            runOnUi {
+                autoFindBusy = false
+                val others = found.filter { it.ip != current }
+                when {
+                    found.any { it.ip == current } -> pingFailCount = 0 // sumasagot na pala
+                    others.size == 1 -> {
+                        esp32BaseUrl = others[0].ip
+                        pingFailCount = 0
+                        autoFindBackoffMs = 60_000L
+                        statusText.text = tr("🔎 Nahanap ang robot sa {0} - na-update ang IP", others[0].ip)
+                        addVoiceLogEntry("auto-hanap ng ESP32", others[0].ip)
+                    }
+                    others.size > 1 -> {
+                        autoFindBackoffMs = (autoFindBackoffMs * 2).coerceAtMost(600_000L)
+                        statusText.text = tr("May {0} posibleng robot sa WiFi - piliin sa IP settings (Hanapin)", others.size.toString())
+                    }
+                    else -> autoFindBackoffMs = (autoFindBackoffMs * 2).coerceAtMost(600_000L)
+                }
+            }
+        }
+        if (!started) autoFindBusy = false
+    }
+
     private fun onEspPingResult(body: String?) {
         if (body == null) {
             pingFailCount++
             if (navActive && pingFailCount >= 5) exitNavMode(tr("nawala ang link sa robot"))
+            if (pingFailCount >= 8) maybeAutoFindEsp32() // ~8 segundong walang sagot
             return
         }
         pingFailCount = 0
+        autoFindBackoffMs = 60_000L // nakakonekta - i-reset ang paghihintay
 
         val state = if (body.startsWith("PONG|")) body.substringAfter("|").trim() else ""
         val inNavState = state == "MOVING" || state.startsWith("AVOIDING")
@@ -4314,11 +4359,49 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_TEXT
             setText(esp32BaseUrl.removePrefix("http://"))
         }
+        val findStatus = TextView(this).apply { textSize = 12f }
+        val findButton = android.widget.Button(this).apply {
+            text = tr("🔎 Hanapin ang robot sa WiFi")
+            setAllCaps(false)
+            setOnClickListener {
+                findStatus.text = tr("Hinahanap sa WiFi... (ilang segundo)")
+                val started = Esp32Finder.scanAsync(input.text.toString().trim()) { found ->
+                    runOnUi {
+                        when {
+                            found.isEmpty() -> findStatus.text = tr("Walang nakitang robot. Naka-on ba ito at nasa parehong WiFi?")
+                            found.size == 1 -> {
+                                input.setText(found[0].ip)
+                                findStatus.text = tr("✅ Nahanap: {0} - pindutin ang Save", found[0].ip)
+                            }
+                            else -> {
+                                input.setText(found[0].ip)
+                                findStatus.text = tr("May {0} nahanap: {1}. Ang una ang inilagay - tiyaking ito ang robot mo.",
+                                    found.size.toString(), found.joinToString(", ") { it.ip })
+                            }
+                        }
+                    }
+                }
+                if (!started) findStatus.text = tr("Naghahanap pa - maghintay sandali")
+            }
+        }
+        val autoSwitch = android.widget.Switch(this).apply {
+            text = tr("Awtomatikong hanapin ang robot kapag nawala ang koneksyon")
+            isChecked = esp32AutoFind
+            setOnCheckedChangeListener { _, checked -> esp32AutoFind = checked }
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(input)
+            addView(findButton)
+            addView(findStatus)
+            addView(autoSwitch)
+        }
 
         ModernDialog()
             .setTitle(tr("I-set ang IP Address ng Robot"))
             .setMessage(tr("Tignan sa OLED screen ng robot o Serial Monitor ang kasalukuyang IP nito bago i-save."))
-            .setView(input)
+            .setView(box)
             .setPositiveButton("Save") { _, _ ->
                 val newIp = input.text.toString().trim()
                 if (newIp.isNotEmpty()) {
