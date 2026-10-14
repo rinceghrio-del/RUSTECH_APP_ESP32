@@ -5,8 +5,10 @@ import android.content.ContentValues
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
@@ -65,6 +67,7 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.face.Face
 import com.google.mlkit.vision.face.FaceDetection
 import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
 import okhttp3.OkHttpClient
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
@@ -391,6 +394,7 @@ class MainActivity : ComponentActivity() {
 
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+        .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
         .build()
     private val faceDetector = FaceDetection.getClient(faceDetectorOptions)
 
@@ -2158,7 +2162,7 @@ class MainActivity : ComponentActivity() {
         faceDetector.process(inputImage)
             .addOnSuccessListener { faces ->
                 if (faces.isNotEmpty()) {
-                    handleFaceFound(faces[0], imageProxy, rotation)
+                    handleFaceFound(faces.maxByOrNull { it.boundingBox.width() }!!, imageProxy, rotation)
                 } else {
                     handleNoFace()
                 }
@@ -2194,29 +2198,34 @@ class MainActivity : ComponentActivity() {
         val now = System.currentTimeMillis()
         if (faceEmbedder.isReady && now - lastRecognitionTime > recognitionIntervalMs) {
             lastRecognitionTime = now
+            if (!isGoodQuality(face)) return
             try {
                 val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-                val adjustedBox = adjustBoxForRotation(box, frameWidth, frameHeight, rotation)
-                val faceCrop = ImageUtils.safeCrop(bitmap, adjustedBox)
+                // naka-align na 112x112; kung walang landmarks, balik sa lumang crop
+                val faceCrop = alignFace(bitmap, rotation, face)
+                    ?: ImageUtils.safeCrop(bitmap, adjustBoxForRotation(box, frameWidth, frameHeight, rotation))
 
                 if (faceCrop != null) {
                     val embedding = faceEmbedder.getEmbedding(faceCrop)
                     if (embedding != null) {
-                        val match = faceStore.match(embedding)
+                        val rawMatch = faceStore.match(embedding)
+                        val voted = voteMatch(rawMatch)
                         runOnUi {
-                            if (match != null) {
-                                statusText.text = tr("Kilala: {0} ({1}%)", match.name, (match.similarity * 100).toInt())
+                            if (voted != null) {
+                                statusText.text = tr("Kilala: {0} ({1}%)", voted.name, (voted.similarity * 100).toInt())
                                 canEnroll = false
                                 lastUnknownFaceEmbedding = null
-                                currentRecognizedName = match.name
-                                greetIfNeeded(match.name)
-                            } else {
+                                recentUnknownEmbeddings.clear()
+                                currentRecognizedName = voted.name
+                                greetIfNeeded(voted.name)
+                            } else if (rawMatch == null) {
                                 statusText.text = if (faceStore.isEmpty()) {
                                     tr("May tao pero wala pang naka-enroll na mukha")
                                 } else {
                                     tr("May Tao")
                                 }
                                 lastUnknownFaceEmbedding = embedding
+                                rememberUnknownEmbedding(embedding)
                                 canEnroll = true
                                 currentRecognizedName = null
                                 greetUnknownIfNeeded()
@@ -3335,6 +3344,81 @@ class MainActivity : ComponentActivity() {
         } else {
             runOnUi { roboEyesView.setMood(RoboEyesView.Mood.SEARCHING) }
         }
+    }
+
+    // ---------- Face alignment + quality + voting (accuracy upgrade) ----------
+    // Standard ArcFace/MobileFaceNet 112x112 template para sa mata
+    private val alignLeftEyeX = 38.2946f
+    private val alignRightEyeX = 73.5318f
+    private val alignEyeY = 51.6f
+
+    /** Ibalik ang 112x112 na naka-align na mukha, o null kung kulang ang landmarks. */
+    private fun alignFace(rawBitmap: Bitmap, rotation: Int, face: Face): Bitmap? {
+        val le = face.getLandmark(FaceLandmark.LEFT_EYE)?.position ?: return null
+        val re = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position ?: return null
+
+        // I-upright muna ang bitmap para tugma sa coordinates ng ML Kit
+        val upright = if (rotation != 0) {
+            val m = Matrix().apply { postRotate(rotation.toFloat()) }
+            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, m, true)
+        } else rawBitmap
+
+        // Ang may mas maliit na x ang kaliwang mata sa larawan (iwas sa kalituhan ng LEFT/RIGHT)
+        val p1 = if (le.x <= re.x) le else re
+        val p2 = if (le.x <= re.x) re else le
+
+        val srcDx = p2.x - p1.x
+        val srcDy = p2.y - p1.y
+        val srcDist = Math.hypot(srcDx.toDouble(), srcDy.toDouble()).toFloat()
+        if (srcDist < 20f) return null // masyadong maliit/malabo ang mukha
+
+        val dstDist = alignRightEyeX - alignLeftEyeX
+        val scale = dstDist / srcDist
+        val angle = Math.toDegrees(Math.atan2(srcDy.toDouble(), srcDx.toDouble())).toFloat()
+
+        val matrix = Matrix().apply {
+            postTranslate(-p1.x, -p1.y)
+            postRotate(-angle)
+            postScale(scale, scale)
+            postTranslate(alignLeftEyeX, alignEyeY)
+        }
+
+        val out = Bitmap.createBitmap(112, 112, Bitmap.Config.ARGB_8888)
+        Canvas(out).drawBitmap(upright, matrix, Paint(Paint.FILTER_BITMAP_FLAG))
+        return out
+    }
+
+    /** Skip kung masyadong naka-side, tilted, o maliit ang mukha. */
+    private fun isGoodQuality(face: Face): Boolean {
+        return Math.abs(face.headEulerAngleY) < 25f &&
+               Math.abs(face.headEulerAngleZ) < 30f &&
+               face.boundingBox.width() >= 60
+    }
+
+    // Temporal voting: kailangan 2 sa huling 3 recognition na pareho ang pangalan
+    private val recentMatches = mutableListOf<FaceStore.MatchResult?>()
+    private val voteWindow = 3
+    private val votesNeeded = 2
+
+    private fun voteMatch(match: FaceStore.MatchResult?): FaceStore.MatchResult? {
+        recentMatches.add(match)
+        while (recentMatches.size > voteWindow) recentMatches.removeAt(0)
+        val groups = recentMatches.filterNotNull().groupBy { it.name }
+        val best = groups.maxByOrNull { it.value.size } ?: return null
+        if (best.value.size < votesNeeded) return null
+        return FaceStore.MatchResult(best.key, best.value.map { it.similarity }.average().toFloat())
+    }
+
+    // Buffer ng mga huling "hindi kilalang" embeddings - isasama lahat sa enroll para maraming samples
+    private val recentUnknownEmbeddings = mutableListOf<Pair<Long, FloatArray>>()
+    private val unknownBufferMax = 8
+    private val unknownBufferMaxAgeMs = 8000L
+
+    private fun rememberUnknownEmbedding(e: FloatArray) {
+        val now = System.currentTimeMillis()
+        recentUnknownEmbeddings.removeAll { now - it.first > unknownBufferMaxAgeMs }
+        recentUnknownEmbeddings.add(Pair(now, e))
+        while (recentUnknownEmbeddings.size > unknownBufferMax) recentUnknownEmbeddings.removeAt(0)
     }
 
     private fun adjustBoxForRotation(box: Rect, frameWidth: Int, frameHeight: Int, rotationDegrees: Int): Rect {
@@ -4513,6 +4597,13 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // Kunin ang snapshot ng mga huling frames (iba't ibang anggulo) para maraming samples ang ma-enroll
+        val nowMs = System.currentTimeMillis()
+        val snapshot = recentUnknownEmbeddings
+            .filter { nowMs - it.first <= unknownBufferMaxAgeMs }
+            .map { it.second }
+        val samples = FaceStore.filterConsistent(if (snapshot.isEmpty()) listOf(embedding) else snapshot)
+
         val input = EditText(this).apply {
             hint = tr("Pangalan (hal. Rusty)")
             inputType = InputType.TYPE_CLASS_TEXT
@@ -4524,7 +4615,8 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton("Save") { _, _ ->
                 val name = input.text.toString().trim()
                 if (name.isNotEmpty()) {
-                    faceStore.enroll(name, embedding)
+                    faceStore.enroll(name, samples)
+                    recentUnknownEmbeddings.clear()
                     statusText.text = tr("Na-enroll: {0}", name)
                     canEnroll = false
                     lastUnknownFaceEmbedding = null
