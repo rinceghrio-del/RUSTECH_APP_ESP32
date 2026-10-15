@@ -292,6 +292,21 @@ class MainActivity : ComponentActivity() {
         speechService?.setPause(false)
     }
 
+    // Safety net: kung hindi dumating ang onDone/onCompletion (nag-crash ang TTS engine, nawala ang
+    // utterance, nag-hang ang network), ibalik pa rin ang mic - para hindi mabingi ang robot at
+    // marinig pa rin ang "hinto". Ang normal na onDone ay papalit dito (scheduleMicResume).
+    private fun armMicWatchdog(text: String, extraMs: Long = 0L) {
+        val ms = (4000L + text.length * 90L + extraMs).coerceAtMost(90_000L)
+        ttsHandler.removeCallbacks(resumeMicRunnable)
+        ttsHandler.postDelayed(resumeMicRunnable, ms)
+    }
+
+    // Maikling call timeout para sa ElevenLabs: dati ay walang callTimeout ang httpClient, kaya ang
+    // naka-hang na request ay nag-iiwan ng bingi na mic hanggang 60s.
+    private val ttsClient by lazy {
+        httpClient.newBuilder().callTimeout(15, java.util.concurrent.TimeUnit.SECONDS).build()
+    }
+
     // ---------- GEMINI (utak ni Rustech) ----------
     private val geminiBrain by lazy { GeminiBrain(httpClient) }
     private var geminiEnabled: Boolean
@@ -376,8 +391,12 @@ class MainActivity : ComponentActivity() {
         "aso" to listOf(tr("Woof woof! Kumusta aso!"), tr("Ay, may aso! Kaibigan ko yan."), tr("Hi doggi!"))
     )
 
-    private var voskModel: Model? = null
-    private var speechService: SpeechService? = null
+    @Volatile private var voskModel: Model? = null
+    @Volatile private var speechService: SpeechService? = null
+    @Volatile private var voskRecognizer: Recognizer? = null
+    @Volatile private var voskSetupRunning = false     // iwas dobleng download/load
+    @Volatile private var voskRestartAttempts = 0      // na-reset kapag may narinig ulit
+    private var voskRedownloadTried = false
     private var voskReady = false
     private var isSpeaking = false
     private var currentRecognizedName: String? = null
@@ -402,23 +421,26 @@ class MainActivity : ComponentActivity() {
 
     // ---------- CAMERA NAV (depth-based obstacle avoidance habang MOVING ang ESP32) ----------
 
-    private var obstacleAnalyzer: ObstacleAnalyzer? = null
-    private var depthModelBusy = false
+    @Volatile private var obstacleAnalyzer: ObstacleAnalyzer? = null
+    @Volatile private var depthModelBusy = false
+    // Naka-set sa pinakaunang linya ng onDestroy - para huminto ang mga background thread
+    // (model load, mic restart, atbp.). (Hindi "isDestroyed": nagko-clash iyon sa Activity.isDestroyed().)
+    @Volatile private var shuttingDown = false
     private val depthModelFileName = "midas_small.tflite"
     private val depthModelUrl = "https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite"
     private val depthModelMinBytes = 50_000_000L
 
     @Volatile private var navActive = false          // naka-nav mode ba ngayon (MOVING ang ESP32)
     @Volatile private var navTestMode = false        // live scores lang, walang utos sa robot
-    private var navTestUntil = 0L
+    @Volatile private var navTestUntil = 0L
     @Volatile private var navCalibrating = false
     private var navCalibEndTime = 0L
     private val navCalibSamples = mutableListOf<Float>()
 
     private var lastNavAnalysisTime = 0L
     private val navAnalysisIntervalMs = 180L         // pinakamabilis na pag-analyze ng frame
-    private val navSendIntervalMs = 250L             // gaano kadalas ipadala ang hint sa ESP32
-    private var navServoSettleUntil = 0L             // hintayin munang tumigil ang servo bago mag-analyze
+    private val navSendIntervalMs = 100L             // tick ng pagpapadala ng hint (maliit para tumpak ang keep-alive)
+    @Volatile private var navServoSettleUntil = 0L   // hintayin munang tumigil ang servo bago mag-analyze
     @Volatile private var navPose = 0                // 0 = tilt A, 1 = tilt B
     private var lastNavPoseSwitch = 0L
     private val navPoseSwitchMs = 1400L
@@ -442,7 +464,7 @@ class MainActivity : ComponentActivity() {
     @Volatile private var pingInFlight = false
     private var lastNavHintName = ""
     private var lastNavHintSentTime = 0L
-    private val navKeepAliveMs = 400L    // ESP32 hint timeout = 700ms, kaya ulitin bago mag-expire
+    private val navKeepAliveMs = 300L    // ESP32 hint timeout = 700ms; 300ms keep-alive = 400ms margin (tick ay 100ms kaya eksakto)
 
     private val navHandler = Handler(android.os.Looper.getMainLooper())
     private val navSendRunnable = object : Runnable {
@@ -450,9 +472,10 @@ class MainActivity : ComponentActivity() {
             if (!navActive) return
             if (!navTestMode) {
                 val age = System.currentTimeMillis() - navLastDecisionTime
-                // Kapag luma na ang huling desisyon (natigil ang analysis), huwag ipagpatuloy ang liko - CLEAR na lang
-                val decision = if (age > 1200L) ObstacleAnalyzer.Decision.CLEAR else navLastDecision
-                sendNavHint(decision)
+                // Kapag luma na ang huling desisyon (natigil ang analysis), HUWAG magpadala ng hint.
+                // Hindi puwedeng "CLEAR" ito (ibig sabihin tuloy-tuloy ang takbo nang bulag) - hayaan
+                // ang ESP32 na mag-timeout ng hint (700ms) at gawin ang sarili niyang safe behavior.
+                if (age <= 1200L) sendNavHint(navLastDecision)
             }
             navHandler.postDelayed(this, navSendIntervalMs)
         }
@@ -2047,19 +2070,22 @@ class MainActivity : ComponentActivity() {
         requestCode: Int, permissions: Array<String>, grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 100) {
-            val grantedMap = permissions.zip(grantResults.toList()).toMap()
+        if (requestCode != 100) return
 
-            if (grantedMap[Manifest.permission.CAMERA] == PackageManager.PERMISSION_GRANTED) {
-                startCamera()
-            } else if (permissions.contains(Manifest.permission.CAMERA)) {
-                statusText.text = tr("Naghahanap ng tao... (TINANGGIHAN ang camera permission)")
-            }
+        // I-check ang AKTWAL na estado ng permission - ang `permissions` array ay naglalaman lang ng
+        // mga hiningi sa dialog. Kung isa lang ang kulang kanina (hal. mic na granted na, camera lang
+        // ang hiningi), hindi sana magsisimula ang isa pa.
+        val camOk = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        val micOk = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
 
-            if (grantedMap[Manifest.permission.RECORD_AUDIO] == PackageManager.PERMISSION_GRANTED) {
-                setupVosk()
-            }
+        if (camOk) {
+            startCamera()
+        } else {
+            statusText.text = tr("Naghahanap ng tao... (TINANGGIHAN ang camera permission)")
         }
+        if (micOk) setupVosk()
     }
 
     private fun processFrame(imageProxy: ImageProxy) {
@@ -2081,7 +2107,13 @@ class MainActivity : ComponentActivity() {
 
         // Camera Nav: kapag naka-MOVING ang robot (o nagte-test/nagca-calibrate), ang frames ay napupunta
         // sa depth analysis at hindi sa face tracking.
-        if (navTestMode && System.currentTimeMillis() > navTestUntil) navTestMode = false
+        if (navTestMode && System.currentTimeMillis() > navTestUntil) {
+            navTestMode = false
+            runOnUi {
+                if (!navActive) showEyesUi()
+                statusText.text = tr("🧪 Nav TEST tapos na (3 min)")
+            }
+        }
         if (navActive || navCalibrating || navTestMode) {
             processNavFrame(imageProxy)
             return
@@ -2399,6 +2431,8 @@ class MainActivity : ComponentActivity() {
     // ---------- Vosk offline voice recognition ----------
 
     private fun setupVosk() {
+        // Iwas dobleng setup (hal. dalawang tawag mula sa permission flow) - isa lang dapat ang mic service
+        if (speechService != null || voskSetupRunning) return
         val modelDir = voskModelDir()
         if (modelDir.exists() && modelDir.list()?.isNotEmpty() == true) {
             loadVoskModel(modelDir.absolutePath)
@@ -2410,56 +2444,88 @@ class MainActivity : ComponentActivity() {
     private fun voskModelDir(): File = File(filesDir, voskModelDirName)
 
     private fun downloadAndExtractVoskModel() {
+        if (voskSetupRunning) return
+        voskSetupRunning = true
         Thread {
+            val zipFile = File(cacheDir, "vosk_model.zip")
+            val tmpRoot = File(filesDir, "vosk_tmp")
             try {
                 runOnUi { statusText.text = tr("⬇️ Dina-download ang Filipino voice model (~320MB, isang beses lang ito)...") }
 
                 val request = Request.Builder().url(voskModelUrl).build()
-                val response = httpClient.newCall(request).execute()
-                if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
-                val body = response.body ?: throw java.io.IOException("Walang response body")
+                httpClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
+                    val body = response.body ?: throw java.io.IOException("Walang response body")
 
-                val zipFile = File(cacheDir, "vosk_model.zip")
-                val totalBytes = body.contentLength()
-                var downloadedBytes = 0L
-                var lastUpdate = 0L
+                    val totalBytes = body.contentLength()
+                    var downloadedBytes = 0L
+                    var lastUpdate = 0L
 
-                body.byteStream().use { input ->
-                    FileOutputStream(zipFile).use { output ->
-                        val buffer = ByteArray(8192)
-                        var bytesRead: Int
-                        while (input.read(buffer).also { bytesRead = it } != -1) {
-                            output.write(buffer, 0, bytesRead)
-                            downloadedBytes += bytesRead
-                            val now = System.currentTimeMillis()
-                            if (totalBytes > 0 && now - lastUpdate > 500) {
-                                lastUpdate = now
-                                val percent = (downloadedBytes * 100 / totalBytes).toInt()
-                                runOnUi { statusText.text = tr("⬇️ Dina-download ang voice model... {0}%", percent) }
+                    body.byteStream().use { input ->
+                        FileOutputStream(zipFile).use { output ->
+                            val buffer = ByteArray(8192)
+                            var bytesRead: Int
+                            while (input.read(buffer).also { bytesRead = it } != -1) {
+                                if (shuttingDown) throw java.io.IOException("Isinara ang app")
+                                output.write(buffer, 0, bytesRead)
+                                downloadedBytes += bytesRead
+                                val now = System.currentTimeMillis()
+                                if (totalBytes > 0 && now - lastUpdate > 500) {
+                                    lastUpdate = now
+                                    val percent = (downloadedBytes * 100 / totalBytes).toInt()
+                                    runOnUi { statusText.text = tr("⬇️ Dina-download ang voice model... {0}%", percent) }
+                                }
                             }
                         }
                     }
+                    // Putol ang download? (may Content-Length pero kulang ang natanggap)
+                    if (totalBytes > 0 && downloadedBytes != totalBytes) {
+                        throw java.io.IOException("Putol ang download ($downloadedBytes / $totalBytes bytes)")
+                    }
                 }
-                response.close()
 
                 runOnUi { statusText.text = tr("📦 Ina-extract ang voice model...") }
-                extractZip(zipFile, filesDir)
+
+                // Mag-extract muna sa TEMP folder at i-rename lang sa final na pangalan kapag KUMPLETO na.
+                // Dati: kapag napatay ang app sa gitna ng extract, naiiwan ang kalahating model folder na
+                // itinuturing pa ring valid ("exists at hindi walang laman") at hindi na nagre-redownload.
+                tmpRoot.deleteRecursively()
+                tmpRoot.mkdirs()
+                extractZip(zipFile, tmpRoot)
+
+                val extracted = File(tmpRoot, voskModelDirName)
+                if (!extracted.isDirectory || extracted.list().isNullOrEmpty()) {
+                    throw java.io.IOException("Walang laman ang na-extract na model")
+                }
+                val finalDir = voskModelDir()
+                finalDir.deleteRecursively()
+                if (!extracted.renameTo(finalDir)) throw java.io.IOException("Hindi mailipat ang model folder")
+                tmpRoot.deleteRecursively()
                 zipFile.delete()
 
-                loadVoskModel(voskModelDir().absolutePath)
+                voskSetupRunning = false
+                if (!shuttingDown) loadVoskModel(finalDir.absolutePath)
             } catch (e: Exception) {
                 e.printStackTrace()
+                zipFile.delete()
+                tmpRoot.deleteRecursively()
+                voskSetupRunning = false
                 runOnUi { statusText.text = tr("❌ Hindi na-download ang voice model: {0}", e.message) }
             }
         }.start()
     }
 
     private fun extractZip(zipFile: File, targetDir: File) {
+        // Zip Slip guard: walang entry na puwedeng lumabas sa targetDir (hal. "../../file")
+        val canonicalTarget = targetDir.canonicalPath + File.separator
         ZipInputStream(BufferedInputStream(FileInputStream(zipFile))).use { zis ->
             var entry = zis.nextEntry
             val buffer = ByteArray(8192)
             while (entry != null) {
                 val outFile = File(targetDir, entry.name)
+                if (!outFile.canonicalPath.startsWith(canonicalTarget)) {
+                    throw SecurityException("Delikadong zip entry: ${entry.name}")
+                }
                 if (entry.isDirectory) {
                     outFile.mkdirs()
                 } else {
@@ -2478,36 +2544,106 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun loadVoskModel(modelPath: String) {
+        if (voskSetupRunning) return
+        voskSetupRunning = true
         Thread {
             try {
                 val model = Model(modelPath)
+                if (shuttingDown) {
+                    model.close()
+                    voskSetupRunning = false
+                    return@Thread
+                }
                 voskModel = model
+                // Marka: minsan nang nag-load nang maayos ang model na ito (kaya hindi ito buburahin
+                // kapag may ibang dahilan ng pagkabigo sa hinaharap, hal. kulang sa memory)
+                try { File(modelPath, ".loaded_ok").writeText("ok") } catch (_: Exception) {}
+                voskSetupRunning = false
                 runOnUi {
+                    if (shuttingDown) return@runOnUi
                     voskReady = true
                     statusText.text = tr("🎤 Handa na makinig (offline)")
                     startVoskListening()
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 e.printStackTrace()
-                runOnUi { statusText.text = tr("❌ Hindi na-load ang voice model: {0}", e.message) }
+                voskSetupRunning = false
+                val neverLoaded = !File(modelPath, ".loaded_ok").exists()
+                if (e is Exception && neverLoaded && !voskRedownloadTried && !shuttingDown) {
+                    // Hindi pa kailanman nag-load ang model na ito = malamang kalahating extract mula sa
+                    // lumang bersyon. Burahin at mag-download ulit (isang beses lang bawat takbo ng app).
+                    voskRedownloadTried = true
+                    File(modelPath).deleteRecursively()
+                    runOnUi { downloadAndExtractVoskModel() }
+                } else {
+                    runOnUi { statusText.text = tr("❌ Hindi na-load ang voice model: {0}", e.message) }
+                }
             }
         }.start()
+    }
+
+    /** Ligtas na pagsasara ng mic service, recognizer at model (native memory ang mga ito). */
+    private fun releaseVosk() {
+        val service = speechService
+        val recognizer = voskRecognizer
+        val model = voskModel
+        speechService = null
+        voskRecognizer = null
+        voskModel = null
+        voskReady = false
+        try { service?.stop() } catch (_: Throwable) {}
+        try { service?.shutdown() } catch (_: Throwable) {}
+        try { recognizer?.close() } catch (_: Throwable) {}   // bago ang model
+        try { model?.close() } catch (_: Throwable) {}
+    }
+
+    // Pag may mic error (ginamit ng ibang app, tawag, atbp.), subukan ulit na may unti-unting tagal
+    private val voskRestartRunnable = Runnable { restartVoskListening() }
+
+    private fun scheduleVoskRestart(reason: String) {
+        if (shuttingDown || voskModel == null) return
+        if (voskRestartAttempts >= 5) {
+            statusText.text = tr("❌ Hindi na bumalik ang mic. I-restart ang app.")
+            return
+        }
+        voskRestartAttempts++
+        addVoiceLogEntry("Mic", "restart #$voskRestartAttempts ($reason)")
+        ttsHandler.removeCallbacks(voskRestartRunnable)
+        ttsHandler.postDelayed(voskRestartRunnable, 1000L * voskRestartAttempts)
+    }
+
+    private fun restartVoskListening() {
+        if (shuttingDown) return
+        val oldService = speechService
+        val oldRecognizer = voskRecognizer
+        speechService = null
+        voskRecognizer = null
+        try { oldService?.stop() } catch (_: Throwable) {}
+        try { oldService?.shutdown() } catch (_: Throwable) {}
+        try { oldRecognizer?.close() } catch (_: Throwable) {}
+        startVoskListening()
     }
 
     private val voskMaxAlternatives = 3
 
     private fun startVoskListening() {
+        if (shuttingDown) return
+        if (speechService != null) return   // iwas dalawang mic service nang sabay
         val model = voskModel ?: return
         try {
             val recognizer = Recognizer(model, 16000.0f)
             recognizer.setWords(true)
             recognizer.setMaxAlternatives(voskMaxAlternatives)
             val service = SpeechService(recognizer, 16000.0f)
+            voskRecognizer = recognizer
             speechService = service
             service.startListening(voskListener)
+            // Kung nagsasalita pa ang robot habang nagre-restart ang mic, manatiling naka-pause
+            if (isSpeaking) service.setPause(true)
         } catch (e: Exception) {
             e.printStackTrace()
             statusText.text = "❌ Mic error: ${e.message}"
+            scheduleVoskRestart("start failed")
         }
     }
 
@@ -2531,9 +2667,13 @@ class MainActivity : ComponentActivity() {
 
             if (candidates.isEmpty()) return
 
+            voskRestartAttempts = 0   // may narinig = gumagana ang mic
             val topText = candidates.first().first
             val topConfidence = candidates.first().second
-            if (topConfidence < micConfidenceThreshold) {
+            // Ang STOP ay HINDI dumadaan sa confidence gate: mahina o maingay na "hinto" ay dapat pa ring
+            // tumigil ang robot (ang maling stop ay harmless; ang hindi-narinig na stop ay hindi).
+            val stopHeard = hasStopWord(candidates.map { it.first })
+            if (!stopHeard && topConfidence < micConfidenceThreshold) {
                 runOnUi {
                     addVoiceLogEntry(topText, "na-ignore (mababa ang confidence: ${(topConfidence * 100).toInt()}%)")
                 }
@@ -2551,6 +2691,9 @@ class MainActivity : ComponentActivity() {
 
         override fun onError(exception: Exception?) {
             exception?.printStackTrace()
+            // Dati: print lang, pero "Handa na makinig" pa rin ang status kahit patay na ang mic.
+            val reason = exception?.message ?: "mic error"
+            runOnUi { scheduleVoskRestart(reason) }
         }
 
         override fun onTimeout() {}
@@ -2566,8 +2709,34 @@ class MainActivity : ComponentActivity() {
         return (sum / resultArray.length()).toFloat()
     }
 
+    // Malawak ang match ng STOP (mas ligtas ang false-positive kaysa sa hindi-narinig). Kasama na ang
+    // "huminto"/"tumigil" na hindi sakop ng "hinto"/"tigil" na substring.
+    private val stopStems = listOf("hinto", "huminto", "tigil", "tumigil", "stop")
+
+    private fun hasStopWord(candidates: List<String>): Boolean =
+        candidates.any { c -> stopStems.any { c.contains(it) } }
+
+    /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
+    private fun doVoiceStop(): String {
+        sendCommandToEsp32("FORCE_STOP")
+        flashCommandEyes()
+        speak(tr("Hihinto na po!"))
+        return "FORCE_STOP"
+    }
+
+    /** Buong salita lang ang tugma (hindi "mata" sa "mataas", hindi "kaliwa" sa "kaliwang kamay"). */
+    private fun hasWord(text: String, vararg words: String): Boolean =
+        words.any { w -> Regex("(?<!\\p{L})" + Regex.escape(w) + "(?!\\p{L})").containsMatchIn(text) }
+
     private fun handleVoiceCommand(candidates: List<String>) {
         val heardText = candidates.firstOrNull() ?: return
+
+        // 0) KALIGTASAN: STOP ang pinakaunang tsine-check sa LAHAT ng alternatives, bago ang Gemini,
+        // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
+        if (hasStopWord(candidates)) {
+            addVoiceLogEntry(heardText, doVoiceStop())
+            return
+        }
 
         val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
             System.currentTimeMillis() >= geminiCooldownUntil &&
@@ -2585,14 +2754,7 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        // 1) KALIGTASAN: STOP ay laging lokal at agad - hindi na dumadaan sa internet.
-        if (candidates.any { it.contains("hinto") || it.contains("stop") || it.contains("tigil") }) {
-            flashCommandEyes()
-            speak(tr("Hihinto na po!"))
-            sendCommandToEsp32("FORCE_STOP")
-            addVoiceLogEntry(heardText, "FORCE_STOP")
-            return
-        }
+        // (Ang STOP ay hawak na sa pinakataas ng function na ito - step 0.)
 
         // 1b) Display switch (camera/mata) - lokal din, hindi kailangan ng Gemini.
         tryHandleDisplayCommand(candidates)?.let { result ->
@@ -2624,6 +2786,11 @@ class MainActivity : ComponentActivity() {
         }
 
         // 3) Lahat ng iba - kay Rustech (Gemini) na.
+        // Masyadong maikli (hal. "ah", "eh" mula sa ingay) - huwag nang gumastos ng Gemini call.
+        if (heardText.trim().length < 4) {
+            addVoiceLogEntry(heardText, "na-ignore (masyadong maikli)")
+            return
+        }
         if (geminiBusy) {
             addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si Rustech)")
             return
@@ -2644,7 +2811,7 @@ class MainActivity : ComponentActivity() {
     private fun tryHandleDisplayCommand(candidates: List<String>): String? {
         for (text in candidates) {
             val mentionsCamera = text.contains("camera") || text.contains("kamera")
-            val mentionsEyes = text.contains("mata") || text.contains("eyes") || text.contains("roboeyes")
+            val mentionsEyes = hasWord(text, "mata", "eyes", "roboeyes")
             val hasSwitchIntent = text.contains("ipakita") || text.contains("ilagay") || text.contains("ilipat") || text.contains("switch") ||
                 text.contains("palitan") || text.contains("lumipat") || text.contains("tignan") ||
                 text.contains("balik")
@@ -2868,6 +3035,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun processVoiceCommand(candidates: List<String>): String {
+        // STOP muna sa lahat ng alternatives - bago ang custom match o kaliwa/kanan (dati per-candidate
+        // ang pagkakasunod, kaya "kaliwa" sa #1 ay nauuna sa "hinto" sa #2)
+        if (hasStopWord(candidates)) return doVoiceStop()
         tryHandleDisplayCommand(candidates)?.let { return it }
         tryHandlePhotoCommand(candidates)?.let { return it }
         for (text in candidates) {
@@ -2882,19 +3052,13 @@ class MainActivity : ComponentActivity() {
             }
 
             when {
-                text.contains("hinto") || text.contains("stop") || text.contains("tigil") -> {
-                    flashCommandEyes()
-                    speak(tr("Hihinto na po!"))
-                    sendCommandToEsp32("FORCE_STOP")
-                    return "FORCE_STOP"
-                }
-                text.contains("kaliwa") || text.contains("left") -> {
+                hasWord(text, "kaliwa", "pakaliwa", "left") -> {
                     flashCommandEyes()
                     speak(tr("Lilikot sa kaliwa."))
                     sendTimedCommand("LEFT", voiceMovementDurationMs)
                     return "LEFT"
                 }
-                text.contains("kanan") || text.contains("right") -> {
+                hasWord(text, "kanan", "pakanan", "right") -> {
                     flashCommandEyes()
                     speak(tr("Lilikot sa kanan."))
                     sendTimedCommand("RIGHT", voiceMovementDurationMs)
@@ -3182,9 +3346,21 @@ class MainActivity : ComponentActivity() {
 
     /** Siguraduhing naka-max ang STREAM_MUSIC volume ng phone bago magsalita, kahit may ibang
      * app o proseso na nagpaliit dito - para gamit ang buong lakas ng volume slider. */
+    private fun isWiredHeadphoneConnected(am: AudioManager): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return false
+        return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { d ->
+            d.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                d.type == android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                d.type == android.media.AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+    }
+
     private fun ensureMaxMediaVolume() {
         try {
             val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+            // Huwag i-max kapag may naka-plug na earphone/headset - delikado sa tenga.
+            // (Bluetooth speaker ay hindi kasama dito; tuloy ang max para sa robot speaker.)
+            if (isWiredHeadphoneConnected(am)) return
             val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
             if (am.getStreamVolume(AudioManager.STREAM_MUSIC) < max) {
                 am.setStreamVolume(AudioManager.STREAM_MUSIC, max, 0)
@@ -3202,6 +3378,7 @@ class MainActivity : ComponentActivity() {
         ttsHandler.removeCallbacks(resumeMicRunnable)
         isSpeaking = true
         speechService?.setPause(true)
+        armMicWatchdog(clean)
 
         val base = "utt_${System.currentTimeMillis()}"
         chunks.forEachIndexed { i, chunk ->
@@ -3221,6 +3398,7 @@ class MainActivity : ComponentActivity() {
         ttsHandler.removeCallbacks(resumeMicRunnable)
         isSpeaking = true
         speechService?.setPause(true)
+        armMicWatchdog(clean, 15_000L)   // + hanggang 15s para sa network
         elevenLabsBusy = true
 
         val json = JSONObject().apply {
@@ -3239,7 +3417,7 @@ class MainActivity : ComponentActivity() {
             .post(body)
             .build()
 
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+        ttsClient.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
                 runOnUi {
                     elevenLabsBusy = false
@@ -3285,6 +3463,7 @@ class MainActivity : ComponentActivity() {
 
     private fun playElevenLabsAudio(audioBytes: ByteArray, fallbackText: String) {
         try {
+            armMicWatchdog(fallbackText)   // dumating na ang audio - tantiyahin na ang haba ng pagsasalita
             val tempFile = File(cacheDir, "elevenlabs_${System.currentTimeMillis()}.mp3")
             FileOutputStream(tempFile).use { it.write(audioBytes) }
 
@@ -3712,7 +3891,7 @@ class MainActivity : ComponentActivity() {
         handler.post(runnable)
     }
 
-    private fun sendCommandToEsp32(command: String, servoAngle: Int? = null) {
+    private fun sendCommandToEsp32(command: String, servoAngle: Int? = null, attempt: Int = 0) {
         var url = "$esp32BaseUrl/command?dir=$command"
         if (servoAngle != null) {
             url += "&servo=$servoAngle"
@@ -3722,8 +3901,17 @@ class MainActivity : ComponentActivity() {
         val isAuto = command.equals("AUTO", ignoreCase = true)
         val isForceStop = command.equals("FORCE_STOP", ignoreCase = true)
 
-        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+        // Kritikal na utos (AUTO / FORCE_STOP): gamitin ang navClient - maikli ang timeout at hiwalay na
+        // dispatcher, para hindi maiipit sa mga naka-hang na movement/DFPlayer request ng httpClient.
+        val client = if (isAuto || isForceStop) navClient else httpClient
+
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                // Ang FORCE_STOP ay hindi puwedeng mawala nang tahimik - subukan ulit (hanggang 3 beses)
+                if (isForceStop && attempt < 2 && !shuttingDown) {
+                    pingHandler.postDelayed({ sendCommandToEsp32(command, servoAngle, attempt + 1) }, 300L)
+                }
+            }
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
                 if (!isAuto && !isForceStop) {
                     response.close()
@@ -3932,6 +4120,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onNavResult(r: ObstacleAnalyzer.Result) {
+        // Huling result na dumating pagkatapos lumabas sa nav/test/calibrate - huwag i-overwrite ang status
+        if (!navActive && !navCalibrating && !navTestMode) return
         val now = System.currentTimeMillis()
 
         val label = when (r.decision) {
@@ -4101,8 +4291,13 @@ class MainActivity : ComponentActivity() {
                         downloadDepthModel(modelFile)
                     }
                 }
-                obstacleAnalyzer = ObstacleAnalyzer(modelFile)
-                runOnUi { statusText.text = tr("🧭 Depth model handa (camera obstacle avoidance)") }
+                val analyzer = ObstacleAnalyzer(modelFile)
+                if (shuttingDown) {
+                    analyzer.close()   // na-destroy na ang activity habang naglo-load - huwag mag-leak
+                } else {
+                    obstacleAnalyzer = analyzer
+                    runOnUi { statusText.text = tr("🧭 Depth model handa (camera obstacle avoidance)") }
+                }
             } catch (e: Throwable) {
                 e.printStackTrace()
                 runOnUi { statusText.text = "❌ Depth model: ${e.javaClass.simpleName}: ${e.message}" }
@@ -4805,23 +5000,47 @@ class MainActivity : ComponentActivity() {
             .showImmersive()
     }
 
+    // Sa Android 11+ puwedeng tahimik na tumigil ang mic kapag nasa background ang app. Ipo-pause natin
+    // nang malinaw at ibabalik pagbalik, imbes na manatiling "Handa na makinig" na patay na pala.
+    override fun onStart() {
+        super.onStart()
+        if (!isSpeaking) speechService?.setPause(false)
+    }
+
+    override fun onStop() {
+        speechService?.setPause(true)
+        super.onStop()
+    }
+
     override fun onDestroy() {
+        shuttingDown = true
         super.onDestroy()
         pingHandler.removeCallbacksAndMessages(null)
         navHandler.removeCallbacksAndMessages(null)
         headScanActive = false
         headScanHandler.removeCallbacksAndMessages(null)
+        ttsHandler.removeCallbacksAndMessages(null)   // kasama na ang mic watchdog at mic restart
+
+        // Kanselahin ang mga naka-ere pang HTTP request (ang dfThenClient ay kapareho ng dispatcher ng httpClient)
+        httpClient.dispatcher.cancelAll()
+        navClient.dispatcher.cancelAll()
+
+        // Single-thread ang cameraExecutor: ang mga close() ay papasok sa pila PAGKATAPOS ng kasalukuyang
+        // frame, kaya hindi na sinasara ang detector habang ginagamit pa (native crash).
+        val analyzer = obstacleAnalyzer
+        obstacleAnalyzer = null
+        cameraExecutor.execute {
+            try { faceDetector.close() } catch (_: Throwable) {}
+            try { yoloDetector.close() } catch (_: Throwable) {}
+            try { faceEmbedder.close() } catch (_: Throwable) {}
+            try { analyzer?.close() } catch (_: Throwable) {}
+        }
         cameraExecutor.shutdown()
-        faceDetector.close()
-        yoloDetector.close()
-        faceEmbedder.close()
-        obstacleAnalyzer?.close()
-        ttsHandler.removeCallbacksAndMessages(null)
+
         tts?.stop()
         tts?.shutdown()
         elevenLabsLoudnessEnhancer?.release()
         elevenLabsPlayer?.release()
-        speechService?.stop()
-        speechService?.shutdown()
+        releaseVosk()
     }
 }
