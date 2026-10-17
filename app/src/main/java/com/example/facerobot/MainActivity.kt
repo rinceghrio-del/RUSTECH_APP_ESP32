@@ -1629,6 +1629,7 @@ class MainActivity : ComponentActivity() {
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
+            makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
             makeCard("🏠", "Smart Home", "RM mini 3 + Lasco") { smartHomeUi.show() },
             makeCard("📦", "Export / Import", tr("Settings backup")) { settingsBackupUi.show() },
@@ -4002,13 +4003,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Baligtad ang ikot ng robot sa voice commands ("kaliwa" -> kanan ang liko), kaya default ay ON.
+    // Isang daanan lang ito ng LAHAT ng voice movement (local "kaliwa/kanan", Gemini action, at custom
+    // command na LEFT/RIGHT). HINDI apektado ang face tracking at Camera Nav - may kanya-kanya silang logic.
+    private var voiceInvertTurn: Boolean
+        get() = prefs.getBoolean("voice_invert_turn", true)
+        set(value) { prefs.edit().putBoolean("voice_invert_turn", value).apply() }
+
     private fun sendTimedCommand(command: String, durationMs: Long) {
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
         val endTime = System.currentTimeMillis() + durationMs
+        val dir = if (voiceInvertTurn) {
+            when (command.uppercase()) {
+                "LEFT" -> "RIGHT"
+                "RIGHT" -> "LEFT"
+                else -> command
+            }
+        } else command
         val runnable = object : Runnable {
             override fun run() {
-                sendCommandToEsp32(command)
+                sendCommandToEsp32(dir)
                 if (System.currentTimeMillis() < endTime) {
                     handler.postDelayed(this, 300)
                 } else {
@@ -4881,6 +4896,30 @@ class MainActivity : ComponentActivity() {
                 farFaceWidthRatio = 0.23f
                 tooFarFaceWidthRatio = 0.15f
                 statusText.text = tr("Na-reset sa default ang distance settings")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
+    private fun showVoiceTurnDialog() {
+        val invertSwitch = Switch(this).apply {
+            text = tr("↔️  I-baliktad ang kaliwa/kanan ng voice commands")
+            isChecked = voiceInvertTurn
+            setPadding(0, 16, 0, 16)
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+        }
+        box.addView(invertSwitch)
+
+        ModernDialog()
+            .setTitle(tr("🔄 Ikot (Voice)"))
+            .setMessage(tr("Para sa mga utos na \"kaliwa\" / \"kanan\" (kasama ang galing kay Gemini at ang custom commands na LEFT/RIGHT). Kung mali pa rin ang ikot ng robot, i-toggle ito. Hindi naaapektuhan ang face tracking at Camera Nav (may sariling invert ang Camera Nav)."))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                voiceInvertTurn = invertSwitch.isChecked
+                statusText.text = if (voiceInvertTurn) tr("🔄 Baligtad na ang kaliwa/kanan ng voice") else tr("🔄 Normal na ang kaliwa/kanan ng voice")
             }
             .setNegativeButton("Cancel", null)
             .showImmersive()
