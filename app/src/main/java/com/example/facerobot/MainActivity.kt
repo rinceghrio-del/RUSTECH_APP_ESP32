@@ -290,6 +290,12 @@ class MainActivity : ComponentActivity() {
     private val resumeMicRunnable = Runnable {
         isSpeaking = false
         speechService?.setPause(false)
+        // Nagsalita ang robot habang gising (may wake window): bigyan ng follow-up window pagkatapos
+        // magsalita, para hindi mag-expire habang humahaba ang sagot ni Rustech
+        if (extendWakeOnResume) {
+            extendWakeOnResume = false
+            awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + wakeFollowUpMs)
+        }
     }
 
     // Safety net: kung hindi dumating ang onDone/onCompletion (nag-crash ang TTS engine, nawala ang
@@ -1622,6 +1628,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎙️", tr("Mga Greeting"), tr("I-edit ang bati")) { showGreetingTracksDialog() },
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
+            makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
             makeCard("🏠", "Smart Home", "RM mini 3 + Lasco") { smartHomeUi.show() },
             makeCard("📦", "Export / Import", tr("Settings backup")) { settingsBackupUi.show() },
@@ -2673,7 +2680,12 @@ class MainActivity : ComponentActivity() {
             // Ang STOP ay HINDI dumadaan sa confidence gate: mahina o maingay na "hinto" ay dapat pa ring
             // tumigil ang robot (ang maling stop ay harmless; ang hindi-narinig na stop ay hindi).
             val stopHeard = hasStopWord(candidates.map { it.first })
-            if (!stopHeard && topConfidence < micConfidenceThreshold) {
+            // Ang wake word ay madalas mahina o mali ang dinig (brand name na wala sa vocabulary ng Vosk),
+            // kaya mas mababang bar - pero kapag natutulog lang ang robot. Kapag gising na, normal na threshold.
+            val wakeHeard = wakeEnabled && System.currentTimeMillis() >= awakeUntil &&
+                candidates.any { stripWakeWord(it.first) != null }
+            val threshold = if (wakeHeard) micConfidenceThreshold * 0.6f else micConfidenceThreshold
+            if (!stopHeard && topConfidence < threshold) {
                 runOnUi {
                     addVoiceLogEntry(topText, "na-ignore (mababa ang confidence: ${(topConfidence * 100).toInt()}%)")
                 }
@@ -2728,15 +2740,129 @@ class MainActivity : ComponentActivity() {
     private fun hasWord(text: String, vararg words: String): Boolean =
         words.any { w -> Regex("(?<!\\p{L})" + Regex.escape(w) + "(?!\\p{L})").containsMatchIn(text) }
 
-    private fun handleVoiceCommand(candidates: List<String>) {
-        val heardText = candidates.firstOrNull() ?: return
+    // ===================== WAKE WORD =====================
+    // Hindi kilala ng Vosk (Filipino model) ang "Rustech", kaya naririnig niya ito bilang "roasted",
+    // "prostate", "plastic", "class tech", atbp. Solusyon: listahan ng mga ALIAS (editable sa Settings,
+    // at madaling dagdagan mula sa Voice Log) + fuzzy match (malapit sa "rustech"). Dapat nasa UNANG
+    // salita (o pangalawa kung may "hey/okay" bago ito) para hindi mag-trigger sa gitna ng usapan.
+    private val defaultWakeAliases =
+        "rustech, rustek, rastek, rostek, rastech, rustic, roasted, prostate, plastic, class tech, class tek, rus tek"
+
+    private var wakeEnabled: Boolean
+        get() = prefs.getBoolean("wake_enabled", true)
+        set(value) { prefs.edit().putBoolean("wake_enabled", value).apply() }
+
+    private var wakeAliasesRaw: String
+        get() = prefs.getString("wake_aliases", null)?.takeIf { it.isNotBlank() } ?: defaultWakeAliases
+        set(value) { prefs.edit().putString("wake_aliases", value).apply() }
+
+    private var wakeWindowSec: Int
+        get() = prefs.getInt("wake_window_sec", 15).coerceIn(5, 120)
+        set(value) { prefs.edit().putInt("wake_window_sec", value.coerceIn(5, 120)).apply() }
+
+    @Volatile private var awakeUntil = 0L              // hanggang kailan "gising" ang robot
+    @Volatile private var extendWakeOnResume = false
+    private val wakeFollowUpMs = 8000L                 // follow-up window pagkatapos magsalita ang robot
+    private val wakeFillers = setOf("hey", "hay", "hi", "uy", "oy", "hoy", "ok", "okay", "sige")
+    private val wakeReplies = listOf("Po?", "Opo?", "Andito po.", "Ano po 'yun?")
+
+    private fun normWake(s: String): String = s.lowercase().filter { it.isLetter() }
+
+    private fun wakeAliasSet(): Set<String> =
+        (wakeAliasesRaw.split(',', ';', '\n').map { normWake(it) }.filter { it.length >= 3 } + "rustech").toSet()
+
+    private fun levenshtein(a: String, b: String): Int {
+        if (a == b) return 0
+        val dp = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var prev = dp[0]
+            dp[0] = i
+            for (j in 1..b.length) {
+                val tmp = dp[j]
+                dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + if (a[i - 1] == b[j - 1]) 0 else 1)
+                prev = tmp
+            }
+        }
+        return dp[b.length]
+    }
+
+    private fun isWakeToken(joined: String, aliases: Set<String>): Boolean {
+        if (joined.length < 3) return false
+        if (joined in aliases) return true
+        // Malapit sa "rustech" (hal. rastek, rustic): hanggang 2 pagkakamali, para sa mga salitang 5+ letra
+        if (joined.length >= 5 && levenshtein(joined, "rustech") <= 2) return true
+        // Malapit sa mahabang alias (hal. "prostat" ~ "prostate"): 1 pagkakamali lang
+        return aliases.any { it.length >= 7 && levenshtein(joined, it) <= 1 }
+    }
+
+    /**
+     * Hinahanap ang wake word sa unang salita (o pangalawa kung "hey/okay" ang una; kasama ang
+     * dalawang magkatabing salita gaya ng "class tech"). Ibinabalik ang NATITIRANG teksto pagkatapos
+     * nito ("" kung wake word lang), o null kung walang wake word.
+     */
+    private fun stripWakeWord(text: String): String? {
+        val tokens = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (tokens.isEmpty()) return null
+        val aliases = wakeAliasSet()
+        val maxStart = if (tokens[0].lowercase() in wakeFillers) 1 else 0
+        for (start in 0..maxStart) {
+            for (n in 2 downTo 1) {
+                if (start + n > tokens.size) continue
+                val joined = normWake(tokens.subList(start, start + n).joinToString(""))
+                if (isWakeToken(joined, aliases)) {
+                    return tokens.drop(start + n).joinToString(" ")
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Ibinabalik ang mga alternative na ipoproseso (wala nang wake word), o null kung wala nang gagawin
+     * (wake word lang ang sinabi, o natutulog ang robot at walang wake word).
+     */
+    private fun applyWakeGate(rawCandidates: List<String>, rawHeard: String): List<String>? {
+        if (!wakeEnabled) return rawCandidates
+        val now = System.currentTimeMillis()
+        val windowMs = wakeWindowSec * 1000L
+
+        val rests = rawCandidates.map { stripWakeWord(it) }
+        if (rests.any { it != null }) {
+            awakeUntil = now + windowMs
+            val remainders = rests.filterNotNull().filter { it.isNotBlank() }
+            if (remainders.isEmpty()) {
+                // "Rustech" lang - gising na, hintayin ang utos
+                statusText.text = tr("🔔 Gising - sabihin ang utos")
+                flashCommandEyes()
+                speak(wakeReplies.random())
+                addVoiceLogEntry(rawHeard, "🔔 wake word")
+                return null
+            }
+            return remainders
+        }
+        if (now < awakeUntil) {
+            awakeUntil = now + windowMs   // bawat tinanggap na utos ay nagpapahaba ng window
+            return rawCandidates
+        }
+        addVoiceLogEntry(rawHeard, "na-ignore (walang wake word)")
+        return null
+    }
+
+    private fun handleVoiceCommand(rawCandidates: List<String>) {
+        val rawHeard = rawCandidates.firstOrNull() ?: return
 
         // 0) KALIGTASAN: STOP ang pinakaunang tsine-check sa LAHAT ng alternatives, bago ang Gemini,
         // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
-        if (hasStopWord(candidates)) {
-            addVoiceLogEntry(heardText, doVoiceStop())
+        // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
+        if (hasStopWord(rawCandidates)) {
+            addVoiceLogEntry(rawHeard, doVoiceStop())
+            if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
         }
+
+        // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
+        val candidates = applyWakeGate(rawCandidates, rawHeard) ?: return
+        val heardText = candidates.firstOrNull() ?: return
 
         val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
             System.currentTimeMillis() >= geminiCooldownUntil &&
@@ -3334,6 +3460,9 @@ class MainActivity : ComponentActivity() {
         if (!appTtsEnabled) return
         val clean = cleanForSpeech(phrase)
         if (clean.isEmpty()) return
+
+        // Nagsasalita habang gising? Ibalik ang follow-up window pagkatapos (tingnan ang resumeMicRunnable)
+        if (wakeEnabled && System.currentTimeMillis() < awakeUntil) extendWakeOnResume = true
 
         ensureMaxMediaVolume()
 
@@ -4752,6 +4881,83 @@ class MainActivity : ComponentActivity() {
                 farFaceWidthRatio = 0.23f
                 tooFarFaceWidthRatio = 0.15f
                 statusText.text = tr("Na-reset sa default ang distance settings")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
+    private fun showWakeWordDialog() {
+        val enabledSwitch = Switch(this).apply {
+            text = tr("🔔  Gamitin ang wake word (kailangang sabihin muna ang \"Rustech\")")
+            isChecked = wakeEnabled
+            setPadding(0, 16, 0, 16)
+        }
+        val aliasInput = EditText(this).apply {
+            hint = "rustech, roasted, prostate, plastic, class tech"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 3
+            setText(wakeAliasesRaw)
+        }
+        val addHeardButton = Button(this).apply {
+            text = tr("➕  Idagdag ang mga huling na-ignore (i-review bago i-save)")
+            isAllCaps = false
+            setOnClickListener {
+                val known = wakeAliasSet()
+                val extra = voiceLog
+                    .filter { it.third.startsWith("na-ignore (walang wake word)") }
+                    .take(10)
+                    .mapNotNull { entry -> entry.second.trim().split(Regex("\\s+")).firstOrNull() }
+                    .map { normWake(it) }
+                    .filter { it.length >= 3 && it !in known }
+                    .distinct()
+                if (extra.isEmpty()) {
+                    statusText.text = tr("Wala pang bagong maidadagdag mula sa Voice Log")
+                } else {
+                    val current = aliasInput.text.toString().trim().trimEnd(',')
+                    aliasInput.setText((if (current.isEmpty()) "" else "$current, ") + extra.joinToString(", "))
+                }
+            }
+        }
+        val windowInput = EditText(this).apply {
+            hint = tr("Segundo (5-120), default 15")
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(wakeWindowSec.toString())
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+        }
+        box.addView(enabledSwitch)
+        box.addView(TextView(this).apply {
+            text = tr("Mga salitang tatanggapin bilang \"Rustech\" (pinaghihiwalay ng kuwit):")
+            setPadding(0, 24, 0, 0)
+        })
+        box.addView(aliasInput)
+        box.addView(addHeardButton)
+        box.addView(TextView(this).apply {
+            text = tr("Gaano katagal gising pagkatapos ng wake word / sagot ng robot (segundo):")
+            setPadding(0, 24, 0, 0)
+        })
+        box.addView(windowInput)
+
+        ModernDialog()
+            .setTitle("🔔 Wake Word")
+            .setMessage(tr("Hindi kilala ni Vosk ang \"Rustech\", kaya naririnig niya ito bilang ibang salita. Idagdag dito ang mga naririnig niya (makikita sa Voice Log bilang \"walang wake word\"). Ang \"hinto/stop\" ay gumagana PALAGI kahit walang wake word."))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                wakeEnabled = enabledSwitch.isChecked
+                val aliases = aliasInput.text.toString().trim()
+                wakeAliasesRaw = if (aliases.isBlank()) defaultWakeAliases else aliases
+                val sec = windowInput.text.toString().toIntOrNull()
+                if (sec != null && sec in 5..120) wakeWindowSec = sec
+                awakeUntil = 0L
+                statusText.text = if (wakeEnabled) tr("🔔 Wake word naka-on") else tr("Wake word naka-off")
+            }
+            .setNeutralButton(tr("I-reset ang listahan")) { _, _ ->
+                wakeAliasesRaw = defaultWakeAliases
+                statusText.text = tr("Na-reset ang listahan ng wake word")
             }
             .setNegativeButton("Cancel", null)
             .showImmersive()
