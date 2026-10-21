@@ -417,6 +417,295 @@ class MainActivity : ComponentActivity() {
     private val movementActions = setOf("FORWARD", "BACKWARD", "LEFT", "RIGHT")
     private var voiceOverrideActive = false
 
+    // ======================= HANAPIN ANG TAO =======================
+    // Kapag tinawag mo ang robot ("Rustech") pero WALA siyang nakikitang tao (hal. nakatalikod siya sa 'yo),
+    // iikot siya nang paisa-isang hakbang: ikot sandali -> HINTO -> tingin ng camera -> ulit. (Step-and-settle,
+    // kasi nasa robot mismo ang camera, kaya malabo at huli ang frame habang umiikot.)
+    // Pagkakita ng tao (YOLO) hihinto siya, tapos ang dating face tracking (handleFaceFound) na ang
+    // magse-center ng mukha. Kapag nakagitna na ang mukha nang ilang sunod na frame = "naka-lock".
+    // STOP / ibang utos / nav mode = kanselado agad ang paghahanap.
+    private enum class PersonSearchPhase { SWEEP, LOCKING }
+
+    private var personSearchEnabled: Boolean
+        get() = prefs.getBoolean("person_search_enabled", true)
+        set(value) { prefs.edit().putBoolean("person_search_enabled", value).apply() }
+
+    @Volatile private var personSearchActive = false
+    @Volatile private var personSearchPhase = PersonSearchPhase.SWEEP
+    @Volatile private var personSearchCenteredFrames = 0
+    @Volatile private var personSearchLastFaceTime = 0L
+    @Volatile private var personSearchYoloHit = false
+    @Volatile private var lastTrackTurnCmd: String? = null   // huling LEFT/RIGHT na ipinadala ng face tracking
+    @Volatile private var lastTrackTurnTime = 0L
+    private var personSearchTurnCmd = "RIGHT"
+    private var personSearchStartTime = 0L
+    private var personSearchLockStart = 0L
+    private val personSearchHandler = Handler(android.os.Looper.getMainLooper())
+
+    // --- I-TUNE ITO KUNG KAILANGAN (depende sa bilis ng ikot ng robot mo) ---
+    // Raw na ESP32 direction (kapareho ng ginagamit ng face tracking). Kung baliktad ang gusto mong unang ikot, palitan ng "LEFT".
+    private val personSearchDefaultTurnCmd = "RIGHT"
+    private val personSearchMaxMs = 25_000L        // pinakamahabang paghahanap bago sumuko
+    private val personSearchBurstMs = 600L         // gaano katagal umiikot bawat hakbang
+    private val personSearchSettleMs = 900L        // hinto para makakuha ng malinaw na frame
+    private val personSearchLockWaitMs = 4_500L    // gaano katagal maghihintay ng mukha pagkakita ng "tao"
+    private val personSearchFreshMs = 2_500L       // kung may nakita sa loob nito, hindi na maghahanap
+    private val personSearchLockFrames = 3         // ilang sunod na frame na nakagitna ang mukha = lock
+    private val personSearchTiltPeriodMs = 9_000L  // palit ng taas/baba ng ulo bawat ganitong tagal
+    private val personSearchTilts = intArrayOf(55, 72, 38)  // servo angles (0-110, mas mataas = pataas ang tingin)
+
+    private val personSearchBlockVisible = "may nakikita nang tao"
+    private val personSearchFoundLines: List<String> get() = listOf(
+        tr("Ayan, nakita na kita!"),
+        tr("Aha! Nakita kita!"),
+        tr("Andyan ka pala!")
+    )
+    private val findPersonPhrases = listOf(
+        "hanapin mo ako", "hanapin mo ko", "hanap ka ng tao", "hanapin mo ang tao",
+        "humarap ka", "harap ka sa akin", "find me", "look for me"
+    )
+
+    private fun requiredPersonDetections(): Int =
+        if (personSearchActive) 1 else requiredConsecutiveDetections
+
+    private fun personSearchBlockedReason(): String? = when {
+        !personSearchEnabled -> "naka-off sa settings"
+        navActive || navCalibrating || navTestMode -> "naka-AUTO/nav mode"
+        personSearchActive -> "naghahanap na"
+        System.currentTimeMillis() - lastPersonSeenTime < personSearchFreshMs -> personSearchBlockVisible
+        else -> null
+    }
+
+    /** Sinisimulan ang paghahanap. Ibinabalik ang true kung nagsimula talaga. */
+    private fun startPersonSearch(source: String): Boolean {
+        val blocked = personSearchBlockedReason()
+        if (blocked != null) {
+            if (blocked != personSearchBlockVisible) addVoiceLogEntry(source, "hanap-tao: hindi sinimulan ($blocked)")
+            return false
+        }
+        val now = System.currentTimeMillis()
+        personSearchActive = true
+        personSearchPhase = PersonSearchPhase.SWEEP
+        personSearchStartTime = now
+        personSearchCenteredFrames = 0
+        personSearchLastFaceTime = 0L
+        personSearchYoloHit = false
+        headScanActive = false          // itigil ang idle head-scan kung tumatakbo
+        consecutivePersonDetections = 0
+
+        // Kung kakakita lang ng tao kanina (nawala sa gilid), ituloy ang parehong direksyon ng ikot
+        val lastTurn = lastTrackTurnCmd
+        personSearchTurnCmd = if (lastTurn != null && now - lastTrackTurnTime < 60_000L) lastTurn
+            else personSearchDefaultTurnCmd
+
+        val tilt = personSearchTilts[0]
+        outputServoAngle = tilt.toFloat()
+        smoothedServoAngle = tilt.toFloat()
+        sendCommandToEsp32("STOP", tilt)
+
+        statusText.text = tr("🔍 Hinahanap ka...")
+        roboEyesView.flashMood(RoboEyesView.Mood.SEARCHING, personSearchMaxMs)
+        addVoiceLogEntry(source, "hanap-tao: nagsimula (ikot $personSearchTurnCmd)")
+        personSearchHandler.removeCallbacksAndMessages(null)
+        personSearchHandler.postDelayed(personSearchStepRunnable, 500L)
+        return true
+    }
+
+    private val personSearchStepRunnable = object : Runnable {
+        override fun run() {
+            if (!personSearchActive || shuttingDown) return
+            val now = System.currentTimeMillis()
+            if (navActive || navCalibrating || navTestMode) {
+                cancelPersonSearch()
+                return
+            }
+            if (now - personSearchStartTime > personSearchMaxMs) {
+                // Kung may mukhang nakikita pa at gumagana ang tracking, ituring na nahanap na
+                finishPersonSearch(found = now - personSearchLastFaceTime < 1500L, why = "timeout")
+                return
+            }
+            when (personSearchPhase) {
+                PersonSearchPhase.SWEEP -> {
+                    val idx = ((now - personSearchStartTime) / personSearchTiltPeriodMs).toInt() % personSearchTilts.size
+                    val tilt = personSearchTilts[idx]
+                    val cmd = personSearchTurnCmd
+                    // Ang ESP32 ay inuulit-ulit ang utos tuwing ~300ms (gaya ng sendTimedCommand), kaya ganito rin dito
+                    sendCommandToEsp32(cmd, tilt)
+                    personSearchHandler.postDelayed({
+                        if (personSearchActive && personSearchPhase == PersonSearchPhase.SWEEP) sendCommandToEsp32(cmd, tilt)
+                    }, 300L)
+                    personSearchHandler.postDelayed({
+                        if (personSearchActive && personSearchPhase == PersonSearchPhase.SWEEP) sendCommandToEsp32("STOP", tilt)
+                    }, personSearchBurstMs)
+                    personSearchHandler.postDelayed(this, personSearchBurstMs + personSearchSettleMs)
+                }
+                PersonSearchPhase.LOCKING -> {
+                    val lastActivity = maxOf(personSearchLockStart, personSearchLastFaceTime)
+                    if (now - lastActivity > personSearchLockWaitMs) {
+                        if (personSearchYoloHit && personSearchLastFaceTime == 0L) {
+                            // May "tao" na nakita pero walang mukha - malamang nakatalikod pa rin
+                            finishPersonSearch(
+                                found = false, why = "may tao pero walang mukha",
+                                line = tr("Nakikita kita pero hindi ko makita ang mukha mo. Humarap ka naman sa akin.")
+                            )
+                            return
+                        }
+                        // Maling detect o nawala ang mukha - ituloy ang pag-ikot
+                        personSearchPhase = PersonSearchPhase.SWEEP
+                        personSearchYoloHit = false
+                        personSearchCenteredFrames = 0
+                        personSearchHandler.post(this)
+                    } else {
+                        personSearchHandler.postDelayed(this, 300L)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun enterPersonSearchLocking() {
+        if (!personSearchActive || personSearchPhase == PersonSearchPhase.LOCKING) return
+        personSearchPhase = PersonSearchPhase.LOCKING
+        personSearchLockStart = System.currentTimeMillis()
+        personSearchCenteredFrames = 0
+        sendCommandToEsp32("STOP")
+        roboEyesView.clearFlash()
+        statusText.text = tr("🔍 May nakita! Nilo-lock ang mukha...")
+        personSearchHandler.removeCallbacks(personSearchStepRunnable)
+        personSearchHandler.postDelayed(personSearchStepRunnable, 300L)
+    }
+
+    /** Tinatawag (main thread) kapag may "person" na nakita ng YOLO habang naghahanap. */
+    private fun personSearchOnYoloPerson() {
+        if (!personSearchActive) return
+        personSearchYoloHit = true
+        enterPersonSearchLocking()
+    }
+
+    /** Tinatawag (main thread) tuwing may mukhang nakita ng ML Kit; command = LEFT/RIGHT/FORWARD/BACKWARD/STOP. */
+    private fun personSearchOnFace(command: String) {
+        if (!personSearchActive) return
+        personSearchLastFaceTime = System.currentTimeMillis()
+        enterPersonSearchLocking()
+        if (command == "LEFT" || command == "RIGHT") {
+            personSearchCenteredFrames = 0
+            return
+        }
+        personSearchCenteredFrames++
+        if (personSearchCenteredFrames >= personSearchLockFrames) {
+            finishPersonSearch(found = true, why = "naka-lock ang mukha")
+        }
+    }
+
+    private fun finishPersonSearch(found: Boolean, why: String, line: String? = null) {
+        if (!personSearchActive) return
+        personSearchActive = false
+        personSearchHandler.removeCallbacksAndMessages(null)
+        roboEyesView.clearFlash()
+        if (found) {
+            // Tuloy na ang normal na face tracking (handleFaceFound) - hindi na kailangang mag-STOP dito
+            roboEyesView.flashMood(RoboEyesView.Mood.HAPPY, 2500L)
+            statusText.text = tr("✅ Nakita ka na at naka-lock ang mukha")
+            if (wakeEnabled) awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + wakeWindowSec * 1000L)
+            speak(line ?: personSearchFoundLines.random())
+        } else {
+            sendCommandToEsp32("STOP")
+            statusText.text = tr("🔍 Hindi kita nahanap")
+            speak(line ?: tr("Hindi kita makita. Lumapit ka naman o humarap sa camera ko."))
+        }
+        addVoiceLogEntry("hanap-tao", "$why (${if (found) "nakita" else "hindi nakita"})")
+    }
+
+    /** Tahimik na kanselasyon (STOP, ibang utos, nav mode). */
+    private fun cancelPersonSearch() {
+        if (!personSearchActive) return
+        personSearchActive = false
+        personSearchHandler.removeCallbacksAndMessages(null)
+        roboEyesView.clearFlash()
+        addVoiceLogEntry("hanap-tao", "kinansela")
+    }
+
+    /** "hanapin mo ako" / "humarap ka" - lokal, hindi kailangan ng Gemini. */
+    private fun tryHandleFindPersonCommand(candidates: List<String>): String? {
+        if (candidates.none { t -> findPersonPhrases.any { t.contains(it) } }) return null
+        flashCommandEyes()
+        return when (val blocked = personSearchBlockedReason()) {
+            null -> {
+                startPersonSearch("voice")
+                speak(tr("Sige, hahanapin kita."))
+                "hanap-tao"
+            }
+            personSearchBlockVisible -> {
+                speak(tr("Nakikita na kita, andito ka lang pala!"))
+                "hanap-tao: may tao na"
+            }
+            else -> "hanap-tao: hindi pwede ngayon ($blocked)"
+        }
+    }
+
+    // ======================= USAPAN NI GEMINI: pila, maikling sagot, sitwasyon =======================
+    // Dati, kapag busy pa si Gemini o masyadong mabilis ang sunod na sinabi, NAIWAWALA ang sinabi mo
+    // ("na-ignore"). Ngayon ang PINAKAHULING sinabi ay inilalagay sa pila at ipapadala pagkatapos ng sagot.
+    private var queuedGeminiCandidates: List<String>? = null
+    private var queuedGeminiAt = 0L
+    private val geminiQueueHandler = Handler(android.os.Looper.getMainLooper())
+    private val drainGeminiQueueRunnable = Runnable { drainGeminiQueue() }
+
+    // Sinabi ng robot kamakailan? Kung oo, tatanggapin ang maiikling sagot ("oo", "hindi", "sige") bilang follow-up.
+    @Volatile private var lastRobotReplyTime = 0L
+    private val shortReplyWords = setOf(
+        "oo", "opo", "po", "hindi", "ayaw", "sige", "ok", "okay", "ayos", "bakit", "ano", "sino", "saan",
+        "paano", "talaga", "weh", "ha", "yes", "no", "yep", "nope", "ayun", "wag", "huwag", "tama", "mali", "ulit"
+    )
+
+    private fun isAcceptableShortReply(text: String): Boolean {
+        val t = text.trim().lowercase()
+        if (t.length >= 4) return true
+        val recentlySpoke = System.currentTimeMillis() - lastRobotReplyTime < 12_000L
+        return recentlySpoke && t in shortReplyWords
+    }
+
+    private fun queueGeminiUtterance(candidates: List<String>, heardText: String, why: String) {
+        queuedGeminiCandidates = candidates
+        queuedGeminiAt = System.currentTimeMillis()
+        addVoiceLogEntry(heardText, "naka-pila ($why)")
+        geminiQueueHandler.removeCallbacks(drainGeminiQueueRunnable)
+        geminiQueueHandler.postDelayed(drainGeminiQueueRunnable, 600L)
+    }
+
+    private fun drainGeminiQueue() {
+        val c = queuedGeminiCandidates ?: return
+        val now = System.currentTimeMillis()
+        if (now - queuedGeminiAt > 15_000L) {      // luma na, huwag nang sagutin
+            queuedGeminiCandidates = null
+            addVoiceLogEntry(c.first(), "na-ignore (naluma sa pila)")
+            return
+        }
+        if (geminiBusy || isSpeaking || now - lastGeminiRequestTime < geminiMinIntervalMs) {
+            geminiQueueHandler.postDelayed(drainGeminiQueueRunnable, 500L)
+            return
+        }
+        queuedGeminiCandidates = null
+        val canUse = geminiEnabled && geminiApiKey.isNotBlank() &&
+            now >= geminiCooldownUntil && geminiUsedToday() < geminiDailyLimit
+        if (canUse) askGemini(c) else addVoiceLogEntry(c.first(), processVoiceCommand(c))
+    }
+
+    /** Dagdag na konteksto para kay Gemini: nakikita ba niya ang tao, naghahanap ba, atbp. */
+    private fun buildGeminiSituation(): GeminiBrain.Situation {
+        val now = System.currentTimeMillis()
+        val seenAgoSec = (now - lastPersonSeenTime) / 1000
+        val parts = mutableListOf<String>()
+        parts += when {
+            personSearchActive -> "kasalukuyan kang umiikot at naghahanap ng tao gamit ang camera"
+            seenAgoSec < 3 -> "may nakikita kang tao sa camera ngayon"
+            seenAgoSec < 600 -> "walang nakikitang tao sa camera ngayon (huling nakita ${seenAgoSec} segundo na ang nakalipas)"
+            else -> "matagal nang walang nakikitang tao sa camera"
+        }
+        if (navActive) parts += "naka-AUTO ka (gumagala mag-isa)"
+        return GeminiBrain.Situation(currentRecognizedName, commandStore.all(), parts.joinToString("; "))
+    }
+
     private val faceDetectorOptions = FaceDetectorOptions.Builder()
         .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
         .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
@@ -2135,7 +2424,7 @@ class MainActivity : ComponentActivity() {
 
     private fun processEyesFrame(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
-        if (!yoloDetector.isReady || now - lastYoloCheckTime < yoloIntervalMs) {
+        if (!yoloDetector.isReady || now - lastYoloCheckTime < (if (personSearchActive) 250L else yoloIntervalMs)) {
             imageProxy.close()
             return
         }
@@ -2152,6 +2441,7 @@ class MainActivity : ComponentActivity() {
 
             if (personDetections.isNotEmpty()) {
                 consecutivePersonDetections++
+                if (personSearchActive) runOnUi { personSearchOnYoloPerson() }
             } else {
                 consecutivePersonDetections = 0
             }
@@ -2172,9 +2462,9 @@ class MainActivity : ComponentActivity() {
                 lastPetLabelSeen = null
             }
 
-            if (consecutivePersonDetections >= requiredConsecutiveDetections) {
+            if (consecutivePersonDetections >= requiredPersonDetections()) {
                 rootLayout.postDelayed({
-                    if (appState == AppState.EYES && consecutivePersonDetections >= requiredConsecutiveDetections) {
+                    if (appState == AppState.EYES && consecutivePersonDetections >= requiredPersonDetections()) {
                         showCameraUi()
                     }
                 }, 350)
@@ -2227,6 +2517,11 @@ class MainActivity : ComponentActivity() {
         }
 
         val command = computeCommand(box, frameWidth)
+        if (command == "LEFT" || command == "RIGHT") {
+            lastTrackTurnCmd = command
+            lastTrackTurnTime = System.currentTimeMillis()
+        }
+        if (personSearchActive) runOnUi { personSearchOnFace(command) }
         // Ang box ng ML Kit ay nasa UPRIGHT (naka-rotate) na coordinates, kaya para sa 90/270 ay
         // kabaligtaran ang tunay na taas ng frame (width ng raw image). Dati raw height ang ginamit -> sablay ang "gitna".
         val uprightFrameHeight = if (rotation == 90 || rotation == 270) frameWidth else frameHeight
@@ -2732,6 +3027,8 @@ class MainActivity : ComponentActivity() {
     /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
     private fun doVoiceStop(): String {
         sendCommandToEsp32("FORCE_STOP")
+        cancelPersonSearch()
+        queuedGeminiCandidates = null
         flashCommandEyes()
         speak(tr("Hihinto na po!"))
         return "FORCE_STOP"
@@ -2835,7 +3132,9 @@ class MainActivity : ComponentActivity() {
                 // "Rustech" lang - gising na, hintayin ang utos
                 statusText.text = tr("🔔 Gising - sabihin ang utos")
                 flashCommandEyes()
-                speak(wakeReplies.random())
+                // Walang nakikitang tao (hal. nakatalikod ang robot)? Hanapin muna ang tumatawag.
+                val searching = startPersonSearch(rawHeard)
+                speak(if (searching) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
                 addVoiceLogEntry(rawHeard, "🔔 wake word")
                 return null
             }
@@ -2864,6 +3163,12 @@ class MainActivity : ComponentActivity() {
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
         val candidates = applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
+
+        // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
+        tryHandleFindPersonCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
 
         val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
             System.currentTimeMillis() >= geminiCooldownUntil &&
@@ -2914,17 +3219,17 @@ class MainActivity : ComponentActivity() {
 
         // 3) Lahat ng iba - kay Rustech (Gemini) na.
         // Masyadong maikli (hal. "ah", "eh" mula sa ingay) - huwag nang gumastos ng Gemini call.
-        if (heardText.trim().length < 4) {
+        if (!isAcceptableShortReply(heardText)) {
             addVoiceLogEntry(heardText, "na-ignore (masyadong maikli)")
             return
         }
         if (geminiBusy) {
-            addVoiceLogEntry(heardText, "na-ignore (nag-iisip pa si Rustech)")
+            queueGeminiUtterance(candidates, heardText, "nag-iisip pa si Rustech")
             return
         }
         val now = System.currentTimeMillis()
         if (now - lastGeminiRequestTime < geminiMinIntervalMs) {
-            addVoiceLogEntry(heardText, "na-ignore (masyadong mabilis)")
+            queueGeminiUtterance(candidates, heardText, "masyadong mabilis")
             return
         }
         askGemini(candidates)
@@ -2984,7 +3289,7 @@ class MainActivity : ComponentActivity() {
             apiKey = geminiApiKey,
             model = geminiModel,
             heard = candidates.take(3),
-            situation = GeminiBrain.Situation(currentRecognizedName, commandStore.all())
+            situation = buildGeminiSituation()
         ) { result ->
             runOnUi {
                 geminiBusy = false
@@ -3035,7 +3340,7 @@ class MainActivity : ComponentActivity() {
                 model = geminiModel,
                 imageBase64 = imageBase64,
                 question = question,
-                situation = GeminiBrain.Situation(currentRecognizedName, commandStore.all())
+                situation = buildGeminiSituation()
             ) { result ->
                 runOnUi {
                     geminiBusy = false
@@ -3110,10 +3415,18 @@ class MainActivity : ComponentActivity() {
         }
 
         statusText.text = "🤖 Rustech: $text"
-        if (text.isNotEmpty()) speak(text)
+        if (text.isNotEmpty()) {
+            lastRobotReplyTime = System.currentTimeMillis()
+            speak(text)
+            // Ang sagot sa vision ("ano nakikita mo") ay hiwalay na call - isulat din sa history para
+            // makapag-follow-up ka ("ano pa?", "anong kulay niya?").
+            if (!allowAction) geminiBrain.noteExchange("[tumingin ka sa camera] $heardText", text)
+        }
+        if (allowAction && action == "FIND_PERSON") startPersonSearch(heardText)
 
         val espAction = when (action) {
             "NONE" -> null
+            "FIND_PERSON" -> null
             "STOP" -> "FORCE_STOP"
             else -> when {
                 action in GeminiBrain.ALLOWED_ACTIONS -> action
@@ -3646,7 +3959,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleNoFace() {
-        sendCommandThrottled("STOP")
+        // Habang umiikot sa paghahanap (SWEEP), ang search loop ang may hawak ng motor - huwag i-STOP dito
+        if (!(personSearchActive && personSearchPhase == PersonSearchPhase.SWEEP)) {
+            sendCommandThrottled("STOP")
+        }
         val now = System.currentTimeMillis()
         if (now - lastPersonSeenTime > personTimeoutMs) {
             runOnUi { showEyesUi() }
@@ -3855,7 +4171,7 @@ class MainActivity : ComponentActivity() {
             val cooldownPassed = now - lastHeadScanEndTime > personMissingScanThresholdMs
             val eligible = idleTooLong && cooldownPassed && appState == AppState.EYES && showRoboEyes &&
                 !navActive && !navCalibrating && !navTestMode &&
-                !pendingPhotoCapture && pendingVisionCapture == null
+                !pendingPhotoCapture && pendingVisionCapture == null && !personSearchActive
 
             if (eligible && !headScanActive) {
                 headScanActive = true
@@ -4011,6 +4327,7 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putBoolean("voice_invert_turn", value).apply() }
 
     private fun sendTimedCommand(command: String, durationMs: Long) {
+        cancelPersonSearch()
         voiceOverrideActive = true
         val handler = Handler(mainLooper)
         val endTime = System.currentTimeMillis() + durationMs
@@ -4980,6 +5297,12 @@ class MainActivity : ComponentActivity() {
             setPadding(0, 24, 0, 0)
         })
         box.addView(windowInput)
+        val personSearchSwitch = Switch(this).apply {
+            text = tr("🔍  Hanapin ang tao kapag tinawag (iikot ang robot kung wala siyang nakikita)")
+            isChecked = personSearchEnabled
+            setPadding(0, 32, 0, 16)
+        }
+        box.addView(personSearchSwitch)
 
         ModernDialog()
             .setTitle("🔔 Wake Word")
@@ -4987,6 +5310,7 @@ class MainActivity : ComponentActivity() {
             .setView(box)
             .setPositiveButton(tr("I-save")) { _, _ ->
                 wakeEnabled = enabledSwitch.isChecked
+                personSearchEnabled = personSearchSwitch.isChecked
                 val aliases = aliasInput.text.toString().trim()
                 wakeAliasesRaw = if (aliases.isBlank()) defaultWakeAliases else aliases
                 val sec = windowInput.text.toString().toIntOrNull()
@@ -5265,6 +5589,8 @@ class MainActivity : ComponentActivity() {
         headScanActive = false
         headScanHandler.removeCallbacksAndMessages(null)
         ttsHandler.removeCallbacksAndMessages(null)   // kasama na ang mic watchdog at mic restart
+        personSearchHandler.removeCallbacksAndMessages(null)
+        geminiQueueHandler.removeCallbacksAndMessages(null)
 
         // Kanselahin ang mga naka-ere pang HTTP request (ang dfThenClient ay kapareho ng dispatcher ng httpClient)
         httpClient.dispatcher.cancelAll()
