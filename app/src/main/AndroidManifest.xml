@@ -7,6 +7,14 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-feature android:name="android.hardware.camera" android:required="true" />
 
+    <!-- Android 11+: kailangan ito para makita ng app ang speech recognition service ng phone
+         (Voice Engine -> Android Speech Recognizer). -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
  <application
     android:allowBackup="true"
     android:label="FaceRobot"
