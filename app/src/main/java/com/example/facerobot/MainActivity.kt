@@ -449,7 +449,11 @@ class MainActivity : ComponentActivity() {
     // Raw na ESP32 direction (kapareho ng ginagamit ng face tracking). Kung baliktad ang gusto mong unang ikot, palitan ng "LEFT".
     private val personSearchDefaultTurnCmd = "RIGHT"
     private val personSearchMaxMs = 25_000L        // pinakamahabang paghahanap bago sumuko
-    private val personSearchBurstMs = 600L         // gaano katagal umiikot bawat hakbang
+    // TRUE = tuloy-tuloy ang ikot hanggang makakita ng tao (hihinto lang pag may nakita).
+    // FALSE = dating step-and-settle (ikot ng Burst, hinto ng Settle, ulit) - mas malinaw ang frame pero putol-putol.
+    private val personSearchContinuous = true
+    private val personSearchResendMs = 250L        // gaano kadalas ulitin ang utos na ikot (tuloy-tuloy na mode)
+    private val personSearchBurstMs = 600L         // (step mode) gaano katagal umiikot bawat hakbang
     private val personSearchSettleMs = 900L        // hinto para makakuha ng malinaw na frame
     private val personSearchLockWaitMs = 4_500L    // gaano katagal maghihintay ng mukha pagkakita ng "tao"
     private val personSearchFreshMs = 2_500L       // kung may nakita sa loob nito, hindi na maghahanap
@@ -532,6 +536,13 @@ class MainActivity : ComponentActivity() {
                     val idx = ((now - personSearchStartTime) / personSearchTiltPeriodMs).toInt() % personSearchTilts.size
                     val tilt = personSearchTilts[idx]
                     val cmd = personSearchTurnCmd
+                    if (personSearchContinuous) {
+                        // Tuloy-tuloy na ikot: inuulit lang ang utos (para hindi mag-timeout ang ESP32) hanggang
+                        // may makita ang YOLO/face detector. Ang paghinto ay ginagawa ng enterPersonSearchLocking().
+                        sendCommandToEsp32(cmd, tilt)
+                        personSearchHandler.postDelayed(this, personSearchResendMs)
+                        return
+                    }
                     // Ang ESP32 ay inuulit-ulit ang utos tuwing ~300ms (gaya ng sendTimedCommand), kaya ganito rin dito
                     sendCommandToEsp32(cmd, tilt)
                     personSearchHandler.postDelayed({
