@@ -116,7 +116,7 @@ class MainActivity : ComponentActivity() {
     // ---------- TAKE A PICTURE ----------
     @Volatile private var pendingPhotoCapture = false
     private val photoTriggerPhrases = listOf(
-        "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato",
+        "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato", "picture mo ko",
         "kunan mo ako ng picture", "kuha ng picture", "magpicture",
         "take a picture", "take picture", "picture mo ako", "kunan ng picture"
     )
@@ -604,7 +604,7 @@ class MainActivity : ComponentActivity() {
         roboEyesView.clearFlash()
         if (found) {
             // Tuloy na ang normal na face tracking (handleFaceFound) - hindi na kailangang mag-STOP dito
-            roboEyesView.flashMood(RoboEyesView.Mood.HAPPY, 2500L)
+            roboEyesView.flashMood(RoboEyesView.Mood.fromKey("HAPPY") ?: RoboEyesView.Mood.ALERT, 2500L)
             statusText.text = tr("✅ Nakita ka na at naka-lock ang mukha")
             if (wakeEnabled) awakeUntil = maxOf(awakeUntil, System.currentTimeMillis() + wakeWindowSec * 1000L)
             speak(line ?: personSearchFoundLines.random())
