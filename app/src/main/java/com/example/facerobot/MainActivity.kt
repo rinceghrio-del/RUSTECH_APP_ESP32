@@ -2,6 +2,7 @@ package com.example.facerobot
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -26,6 +27,8 @@ import android.os.Bundle
 import android.os.Build
 import android.os.Handler
 import android.provider.MediaStore
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.speech.tts.Voice
@@ -116,7 +119,7 @@ class MainActivity : ComponentActivity() {
     // ---------- TAKE A PICTURE ----------
     @Volatile private var pendingPhotoCapture = false
     private val photoTriggerPhrases = listOf(
-        "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato", "picture mo ko",
+        "kuha ng litrato", "kunan mo ako", "kunan mo ako ng litrato",
         "kunan mo ako ng picture", "kuha ng picture", "magpicture",
         "take a picture", "take picture", "picture mo ako", "kunan ng picture"
     )
@@ -289,7 +292,7 @@ class MainActivity : ComponentActivity() {
     private val ttsHandler = Handler(android.os.Looper.getMainLooper())
     private val resumeMicRunnable = Runnable {
         isSpeaking = false
-        speechService?.setPause(false)
+        setMicPaused(false)
         // Nagsalita ang robot habang gising (may wake window): bigyan ng follow-up window pagkatapos
         // magsalita, para hindi mag-expire habang humahaba ang sagot ni Rustech
         if (extendWakeOnResume) {
@@ -844,7 +847,7 @@ class MainActivity : ComponentActivity() {
 
         if (missingPermissions.isEmpty()) {
             startCamera()
-            setupVosk()
+            startMicEngine()
         } else {
             statusText.text = tr("Naghahanap ng tao... (hinihintay permissions...)")
             ActivityCompat.requestPermissions(this, missingPermissions.toTypedArray(), 100)
@@ -1917,6 +1920,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎙️", tr("Mga Greeting"), tr("I-edit ang bati")) { showGreetingTracksDialog() },
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
+            makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
@@ -2382,7 +2386,7 @@ class MainActivity : ComponentActivity() {
         } else {
             statusText.text = tr("Naghahanap ng tao... (TINANGGIHAN ang camera permission)")
         }
-        if (micOk) setupVosk()
+        if (micOk) startMicEngine()
     }
 
     private fun processFrame(imageProxy: ImageProxy) {
@@ -2864,6 +2868,7 @@ class MainActivity : ComponentActivity() {
                 voskSetupRunning = false
                 runOnUi {
                     if (shuttingDown) return@runOnUi
+                    if (micEngineAndroid) { releaseVosk(); return@runOnUi }   // lumipat na sa Android recognizer
                     voskReady = true
                     statusText.text = tr("🎤 Handa na makinig (offline)")
                     startVoskListening()
@@ -2971,28 +2976,7 @@ class MainActivity : ComponentActivity() {
             if (candidates.isEmpty()) return
 
             voskRestartAttempts = 0   // may narinig = gumagana ang mic
-            val topText = candidates.first().first
-            val topConfidence = candidates.first().second
-            // Ang STOP ay HINDI dumadaan sa confidence gate: mahina o maingay na "hinto" ay dapat pa ring
-            // tumigil ang robot (ang maling stop ay harmless; ang hindi-narinig na stop ay hindi).
-            val stopHeard = hasStopWord(candidates.map { it.first })
-            // Ang wake word ay madalas mahina o mali ang dinig (brand name na wala sa vocabulary ng Vosk),
-            // kaya mas mababang bar - pero kapag natutulog lang ang robot. Kapag gising na, normal na threshold.
-            val wakeHeard = wakeEnabled && System.currentTimeMillis() >= awakeUntil &&
-                candidates.any { stripWakeWord(it.first) != null }
-            val threshold = if (wakeHeard) micConfidenceThreshold * 0.6f else micConfidenceThreshold
-            if (!stopHeard && topConfidence < threshold) {
-                runOnUi {
-                    addVoiceLogEntry(topText, "na-ignore (mababa ang confidence: ${(topConfidence * 100).toInt()}%)")
-                }
-                return
-            }
-
-            val candidateTexts = candidates.map { it.first }
-            runOnUi {
-                statusText.text = tr("[MIC] Narinig: {0}", topText)
-                handleVoiceCommand(candidateTexts)
-            }
+            handleRecognizedCandidates(candidates)
         }
 
         override fun onFinalResult(hypothesis: String?) {}
@@ -3005,6 +2989,314 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onTimeout() {}
+    }
+
+    // ======================= VOICE ENGINE: Vosk (offline) o Android SpeechRecognizer (Google) =======================
+    // Dalawa ang pagpipilian sa Menu -> Voice Engine. Parehong dumadaan sa handleRecognizedCandidates()
+    // (confidence gate -> STOP -> wake word -> utos), kaya pareho ang takbo ng robot kahit alin ang gamitin.
+    //  - Vosk: offline, Filipino model sa loob ng app (dati pa).
+    //  - Android: built-in na SpeechRecognizer ng phone (Google). Mas tumpak sa Taglish at walang malaking model,
+    //    pero karaniwang kailangan ng internet. Isang pangungusap lang ang kaya ng bawat "session", kaya inuulit
+    //    ito nang tuloy-tuloy (restart loop) para laging nakikinig.
+    private var micEngineAndroid: Boolean
+        get() = prefs.getBoolean("mic_engine_android", false)
+        set(value) { prefs.edit().putBoolean("mic_engine_android", value).apply() }
+
+    // Ang Android recognizer ay may "beep" tuwing nagsisimula/natatapos ang pakikinig (ilang segundo bawat isa).
+    // Kapag ON, pansamantalang imu-mute ang notification/system stream HABANG nakikinig lang, at ibabalik pagkatapos.
+    private var androidMuteBeep: Boolean
+        get() = prefs.getBoolean("android_mic_mute_beep", true)
+        set(value) { prefs.edit().putBoolean("android_mic_mute_beep", value).apply() }
+
+    private var androidRecognizer: SpeechRecognizer? = null
+    private var androidListening = false
+    private var androidMicPaused = false
+    private var androidErrorStreak = 0
+    private var androidBeepMuted = false
+    private var lastPartialStopTime = 0L
+    private val androidMicHandler = Handler(android.os.Looper.getMainLooper())
+    private val androidRestartRunnable = Runnable { startAndroidListening() }
+
+    /** Isang daanan ng lahat ng engine: confidence gate -> STOP -> wake word -> handleVoiceCommand. */
+    private fun handleRecognizedCandidates(candidates: List<Pair<String, Float>>) {
+        if (candidates.isEmpty()) return
+        val topText = candidates.first().first
+        val topConfidence = candidates.first().second
+        // Ang STOP ay HINDI dumadaan sa confidence gate: mahina o maingay na "hinto" ay dapat pa ring
+        // tumigil ang robot (ang maling stop ay harmless; ang hindi-narinig na stop ay hindi).
+        val stopHeard = hasStopWord(candidates.map { it.first })
+        // Ang wake word ay madalas mahina o mali ang dinig (brand name na wala sa vocabulary ng Vosk),
+        // kaya mas mababang bar - pero kapag natutulog lang ang robot. Kapag gising na, normal na threshold.
+        val wakeHeard = wakeEnabled && System.currentTimeMillis() >= awakeUntil &&
+            candidates.any { stripWakeWord(it.first) != null }
+        val threshold = if (wakeHeard) micConfidenceThreshold * 0.6f else micConfidenceThreshold
+        if (!stopHeard && topConfidence < threshold) {
+            runOnUi {
+                addVoiceLogEntry(topText, "na-ignore (mababa ang confidence: ${(topConfidence * 100).toInt()}%)")
+            }
+            return
+        }
+
+        val candidateTexts = candidates.map { it.first }
+        runOnUi {
+            statusText.text = tr("[MIC] Narinig: {0}", topText)
+            handleVoiceCommand(candidateTexts)
+        }
+    }
+
+    /** Pause/resume ng mic ng KASALUKUYANG engine (habang nagsasalita ang robot, o nasa background ang app). */
+    private fun setMicPaused(paused: Boolean) {
+        if (android.os.Looper.myLooper() != android.os.Looper.getMainLooper()) {
+            runOnUi { setMicPaused(paused) }
+            return
+        }
+        speechService?.setPause(paused)
+        androidMicPaused = paused
+        if (micEngineAndroid) {
+            if (paused) stopAndroidListening() else startAndroidListening()
+        }
+    }
+
+    /** Sinisimulan ang tamang engine at pinapatay ang isa pa. Ito ang tinatawag ng startup at ng toggle. */
+    private fun startMicEngine() {
+        if (shuttingDown) return
+        // Kung na-crash ang app habang naka-mute ang beep dati, ibalik muna ang tunog
+        if (prefs.getBoolean("beep_muted_by_app", false) && !androidBeepMuted) {
+            applyAndroidBeepMute(false, force = true)
+        }
+        if (micEngineAndroid) {
+            releaseVosk()   // hindi kailangan ang Vosk model - palayain ang memory
+            androidMicPaused = isSpeaking
+            androidErrorStreak = 0
+            statusText.text = tr("🎤 Handa na makinig (Android)")
+            addVoiceLogEntry("Mic", "engine: Android SpeechRecognizer (${androidSpeechLang()})")
+            startAndroidListening()
+        } else {
+            releaseAndroidRecognizer()
+            addVoiceLogEntry("Mic", "engine: Vosk (offline)")
+            setupVosk()
+        }
+    }
+
+    private fun androidSpeechLang(): String = if (appLanguage == "en") "en-US" else "fil-PH"
+
+    /** Google ay nagbabalik ng may malalaking letra at bantas ("Rustech, abante.") - gawing kapareho ng Vosk. */
+    private fun normalizeAndroidText(raw: String): String =
+        raw.replace('’', '\'').lowercase()
+            .filter { it.isLetterOrDigit() || it.isWhitespace() || it == '\'' || it == '-' }
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun createAndroidRecognizer(): SpeechRecognizer? {
+        return try {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                // Sa Android 11+ kailangan ng <queries> para sa RecognitionService sa AndroidManifest.xml
+                addVoiceLogEntry("Mic", "Android recognizer: walang nakitang speech service (kulang ba ang <queries> sa manifest, o walang Google app?)")
+            }
+            SpeechRecognizer.createSpeechRecognizer(this).also {
+                it.setRecognitionListener(androidRecognitionListener)
+                androidRecognizer = it
+            }
+        } catch (e: Throwable) {
+            statusText.text = "❌ Android mic error: ${e.message}"
+            null
+        }
+    }
+
+    private fun startAndroidListening() {
+        if (shuttingDown || !micEngineAndroid || androidMicPaused || androidListening) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) return
+        val rec = androidRecognizer ?: createAndroidRecognizer() ?: return
+        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, androidSpeechLang())
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)   // para mabilis mahuli ang "hinto"
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+        }
+        applyAndroidBeepMute(true)
+        androidListening = true
+        try {
+            rec.startListening(intent)
+        } catch (e: Throwable) {
+            androidListening = false
+            addVoiceLogEntry("Mic", "Android startListening failed: ${e.message}")
+            scheduleAndroidRestart(1000L, recreate = true)
+        }
+    }
+
+    private fun stopAndroidListening() {
+        androidMicHandler.removeCallbacks(androidRestartRunnable)
+        androidListening = false
+        try { androidRecognizer?.cancel() } catch (_: Throwable) {}
+        applyAndroidBeepMute(false)
+    }
+
+    private fun scheduleAndroidRestart(delayMs: Long, recreate: Boolean = false) {
+        if (shuttingDown || !micEngineAndroid) return
+        androidMicHandler.removeCallbacks(androidRestartRunnable)
+        if (recreate) destroyAndroidRecognizer()
+        androidMicHandler.postDelayed(androidRestartRunnable, delayMs)
+    }
+
+    private fun destroyAndroidRecognizer() {
+        val r = androidRecognizer
+        androidRecognizer = null
+        androidListening = false
+        try { r?.cancel() } catch (_: Throwable) {}
+        try { r?.destroy() } catch (_: Throwable) {}
+    }
+
+    private fun releaseAndroidRecognizer() {
+        androidMicHandler.removeCallbacksAndMessages(null)
+        destroyAndroidRecognizer()
+        applyAndroidBeepMute(false)
+    }
+
+    /** I-mute/ibalik ang notification + system stream (doon lumalabas ang beep ng recognizer). */
+    private fun applyAndroidBeepMute(mute: Boolean, force: Boolean = false) {
+        if (mute && !androidMuteBeep) return
+        if (!force && mute == androidBeepMuted) return
+        try {
+            val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+            val dir = if (mute) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE
+            am.adjustStreamVolume(AudioManager.STREAM_NOTIFICATION, dir, 0)
+            am.adjustStreamVolume(AudioManager.STREAM_SYSTEM, dir, 0)
+        } catch (_: Throwable) {
+            // may phone na ayaw payagan (Do Not Disturb) - hindi kritikal, may beep lang
+        }
+        androidBeepMuted = mute
+        prefs.edit().putBoolean("beep_muted_by_app", mute).apply()
+    }
+
+    private val androidRecognitionListener = object : android.speech.RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+
+        // Ang "hinto" ay agad hinuhuli habang sinasabi pa lang (hindi na hinihintay ang katapusan ng pangungusap)
+        override fun onPartialResults(partialResults: Bundle?) {
+            val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+            val texts = list.map { normalizeAndroidText(it) }.filter { it.isNotEmpty() }
+            if (texts.isEmpty() || !hasStopWord(texts)) return
+            val now = System.currentTimeMillis()
+            if (now - lastPartialStopTime < 3000L) return
+            lastPartialStopTime = now
+            runOnUi { handleVoiceCommand(texts) }
+        }
+
+        override fun onResults(results: Bundle?) {
+            androidListening = false
+            androidErrorStreak = 0
+            val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
+            val scores = results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
+            // Maraming phone ang walang (o puro 0) na confidence - kapag ganon, ituring na pasado (1.0)
+            val scoresUsable = scores != null && scores.size == list.size && scores.any { it > 0f }
+            val pairs = list.mapIndexedNotNull { i, raw ->
+                val t = normalizeAndroidText(raw)
+                if (t.isEmpty()) null
+                else t to (scores?.takeIf { scoresUsable }?.getOrNull(i)?.takeIf { it >= 0f } ?: 1f)
+            }
+            if (pairs.isNotEmpty()) {
+                val stopAlreadyHandled = hasStopWord(pairs.map { it.first }) &&
+                    System.currentTimeMillis() - lastPartialStopTime < 3000L
+                if (!stopAlreadyHandled) handleRecognizedCandidates(pairs)
+            }
+            // Kung nagsalita ang robot habang pinoproseso (naka-pause na), ang resume na ang magsisimula ulit
+            if (!androidMicPaused) scheduleAndroidRestart(150L)
+        }
+
+        override fun onError(error: Int) {
+            androidListening = false
+            if (shuttingDown || !micEngineAndroid || androidMicPaused) return
+            when (error) {
+                SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                    // Normal lang ito kapag tahimik - ulit lang
+                    androidErrorStreak = 0
+                    scheduleAndroidRestart(300L)
+                }
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    statusText.text = tr("❌ Walang mic permission ang Android recognizer")
+                }
+                12, 13 -> {   // ERROR_LANGUAGE_NOT_SUPPORTED / ERROR_LANGUAGE_UNAVAILABLE (Android 12+)
+                    statusText.text = tr("❌ Hindi suportado ng Android recognizer ang wika ({0}). Subukan ang Vosk sa Menu.", androidSpeechLang())
+                    addVoiceLogEntry("Mic", "Android recognizer language error $error")
+                }
+                else -> {
+                    androidErrorStreak++
+                    addVoiceLogEntry("Mic", "Android recognizer error $error (#$androidErrorStreak)")
+                    if (androidErrorStreak >= 8) {
+                        statusText.text = tr("⚠️ Hindi makarinig ang Android recognizer (walang internet?). Subukan ang Vosk (offline) sa Menu > Voice Engine.")
+                    }
+                    val wait = if (androidErrorStreak >= 8) 10_000L else minOf(androidErrorStreak * 1000L, 5000L)
+                    scheduleAndroidRestart(
+                        wait,
+                        recreate = error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                    )
+                }
+            }
+        }
+    }
+
+    private fun switchMicEngine() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            statusText.text = tr("Kailangan muna ang mic permission")
+            return
+        }
+        startMicEngine()
+    }
+
+    private fun showMicEngineDialog() {
+        val engineSwitch = Switch(this).apply {
+            text = tr("🌐 Gamitin ang Android Speech Recognizer (Google)")
+            isChecked = micEngineAndroid
+            setPadding(0, 16, 0, 8)
+        }
+        val engineNote = TextView(this).apply {
+            text = tr("OFF = Vosk (offline, Filipino model sa loob ng app). ON = built-in na speech recognizer ng phone: karaniwang mas tumpak sa Taglish at hindi na kailangan ng malaking model, pero kailangan ng internet at may maliit na pagitan sa bawat pakikinig.")
+            textSize = 12f
+            setPadding(0, 0, 0, 24)
+        }
+        val beepSwitch = Switch(this).apply {
+            text = tr("🔇 I-mute ang beep ng Android mic")
+            isChecked = androidMuteBeep
+            setPadding(0, 8, 0, 8)
+        }
+        val beepNote = TextView(this).apply {
+            text = tr("Pansamantalang imu-mute ang notification/system sounds HABANG nakikinig lang ang mic, at ibabalik agad pagkatapos. Kung may phone na ayaw payagan nito, i-OFF ito.")
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(engineSwitch)
+            addView(engineNote)
+            addView(beepSwitch)
+            addView(beepNote)
+        }
+
+        ModernDialog()
+            .setTitle("🎙️ Voice Engine")
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                val engineChanged = engineSwitch.isChecked != micEngineAndroid
+                androidMuteBeep = beepSwitch.isChecked
+                if (!androidMuteBeep) applyAndroidBeepMute(false)
+                micEngineAndroid = engineSwitch.isChecked
+                if (engineChanged) {
+                    switchMicEngine()
+                } else {
+                    statusText.text = tr("Na-save ang Voice Engine settings")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
     }
 
     private fun averageConfidence(json: JSONObject?): Float {
@@ -3820,7 +4112,7 @@ class MainActivity : ComponentActivity() {
 
         ttsHandler.removeCallbacks(resumeMicRunnable)
         isSpeaking = true
-        speechService?.setPause(true)
+        setMicPaused(true)
         armMicWatchdog(clean)
 
         val base = "utt_${System.currentTimeMillis()}"
@@ -3840,7 +4132,7 @@ class MainActivity : ComponentActivity() {
     private fun speakWithElevenLabs(clean: String) {
         ttsHandler.removeCallbacks(resumeMicRunnable)
         isSpeaking = true
-        speechService?.setPause(true)
+        setMicPaused(true)
         armMicWatchdog(clean, 15_000L)   // + hanggang 15s para sa network
         elevenLabsBusy = true
 
@@ -5573,11 +5865,11 @@ class MainActivity : ComponentActivity() {
     // nang malinaw at ibabalik pagbalik, imbes na manatiling "Handa na makinig" na patay na pala.
     override fun onStart() {
         super.onStart()
-        if (!isSpeaking) speechService?.setPause(false)
+        if (!isSpeaking) setMicPaused(false)
     }
 
     override fun onStop() {
-        speechService?.setPause(true)
+        setMicPaused(true)
         super.onStop()
     }
 
@@ -5613,5 +5905,6 @@ class MainActivity : ComponentActivity() {
         elevenLabsLoudnessEnhancer?.release()
         elevenLabsPlayer?.release()
         releaseVosk()
+        releaseAndroidRecognizer()
     }
 }
