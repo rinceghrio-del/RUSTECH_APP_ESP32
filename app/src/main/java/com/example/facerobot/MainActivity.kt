@@ -514,7 +514,7 @@ class MainActivity : ComponentActivity() {
         if (flashSearchEyes) roboEyesView.flashMood(RoboEyesView.Mood.SEARCHING, personSearchMaxMs)
         addVoiceLogEntry(source, "hanap-tao: nagsimula (ikot $personSearchTurnCmd)")
         personSearchHandler.removeCallbacksAndMessages(null)
-        personSearchHandler.postDelayed(personSearchStepRunnable, 500L)
+        personSearchHandler.postDelayed(personSearchStepRunnable, 150L)
         return true
     }
 
@@ -2967,9 +2967,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private val voskListener = object : VoskListener {
-        override fun onPartialResult(hypothesis: String?) {}
+        override fun onPartialResult(hypothesis: String?) {
+            if (!wakeEnabled) return
+            val partial = try { JSONObject(hypothesis ?: "").optString("partial", "") } catch (e: Exception) { "" }
+            runOnUi { onPartialWakeCandidate(partial) }
+        }
 
         override fun onResult(hypothesis: String?) {
+            runOnUi { resetPartialWake() }   // dumating na ang final - hindi na kailangan ang maagang wake timer
             val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null } ?: return
 
             val alternativesArray = json.optJSONArray("alternatives")
@@ -3071,6 +3076,7 @@ class MainActivity : ComponentActivity() {
     /** Sinisimulan ang tamang engine at pinapatay ang isa pa. Ito ang tinatawag ng startup at ng toggle. */
     private fun startMicEngine() {
         if (shuttingDown) return
+        prefetchElevenLabsPhrases()
         // Kung na-crash ang app habang naka-mute ang beep dati, ibalik muna ang tunog
         if (prefs.getBoolean("beep_muted_by_app", false) && !androidBeepMuted) {
             applyAndroidBeepMute(false, force = true)
@@ -3124,8 +3130,8 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)   // para mabilis mahuli ang "hinto"
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
         }
         applyAndroidBeepMute(true)
         androidListening = true
@@ -3194,7 +3200,9 @@ class MainActivity : ComponentActivity() {
         override fun onPartialResults(partialResults: Bundle?) {
             val list = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
             val texts = list.map { normalizeAndroidText(it) }.filter { it.isNotEmpty() }
-            if (texts.isEmpty() || !hasStopWord(texts)) return
+            if (texts.isEmpty()) return
+            onPartialWakeCandidate(texts.first())   // maagang wake response (hindi na hintayin ang final)
+            if (!hasStopWord(texts)) return
             val now = System.currentTimeMillis()
             if (now - lastPartialStopTime < 3000L) return
             lastPartialStopTime = now
@@ -3202,6 +3210,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onResults(results: Bundle?) {
+            resetPartialWake()
             androidListening = false
             androidErrorStreak = 0
             val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
@@ -3223,6 +3232,7 @@ class MainActivity : ComponentActivity() {
         }
 
         override fun onError(error: Int) {
+            resetPartialWake()
             androidListening = false
             if (shuttingDown || !micEngineAndroid || androidMicPaused) return
             when (error) {
@@ -3389,6 +3399,96 @@ class MainActivity : ComponentActivity() {
         roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
     }
 
+    // ======================= MABILIS NA WAKE RESPONSE =======================
+    // Dating delay: (1) hinihintay pa ng recognizer ang BUONG katahimikan bago ibigay ang final result,
+    // (2) sunod-sunod ang ESP32 requests (STOP muna bago ang DFPlayer track) sa iisang pila, (3) ElevenLabs ay
+    // may network round-trip kahit "Po?" lang, (4) may 500ms na hintay bago umikot.
+    // Ngayon: kapag "Rustech" lang ang nasa PARTIAL result at hindi nagbabago nang ~0.3s, sasagot na AGAD
+    // (hindi na hihintayin ang final result). Kapag dumating ang final at wake word lang pa rin, hindi na uulitin.
+    @Volatile private var earlyAckPending = false
+    private var earlyAckTime = 0L
+    private var partialWakeText: String? = null
+    private var partialWakeSeq = 0
+    private val partialWakeStableMs = 300L
+    private val earlyWakeHandler = Handler(android.os.Looper.getMainLooper())
+
+    /** I-cancel ang naghihintay na maagang wake (dumating na ang final result / nagbago ang sinasabi). */
+    private fun resetPartialWake() {
+        partialWakeText = null
+        partialWakeSeq++
+    }
+
+    /** Tinatawag sa main thread sa bawat partial result ng kahit anong engine. */
+    private fun onPartialWakeCandidate(rawPartial: String) {
+        if (!wakeEnabled || isSpeaking || shuttingDown) return
+        val text = rawPartial.trim()
+        val wakeOnly = text.isNotEmpty() && stripWakeWord(text) == ""   // may wake word at WALANG kasunod
+        if (!wakeOnly) {
+            if (partialWakeText != null) resetPartialWake()   // nagpatuloy sa pagsasalita - hintayin ang final
+            return
+        }
+        if (text == partialWakeText) return                   // hindi nagbago - tuloy lang ang naghihintay na timer
+        partialWakeText = text
+        val seq = ++partialWakeSeq
+        earlyWakeHandler.postDelayed({
+            if (seq != partialWakeSeq || shuttingDown || isSpeaking) return@postDelayed
+            val now = System.currentTimeMillis()
+            earlyAckPending = true
+            earlyAckTime = now
+            awakeUntil = now + wakeWindowSec * 1000L
+            performWakeAck(text, early = true)
+        }, partialWakeStableMs)
+    }
+
+    /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
+    private fun performWakeAck(rawHeard: String, early: Boolean) {
+        statusText.text = tr("🔔 Gising - sabihin ang utos")
+        flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
+        // Walang nakikitang tao (hal. nakatalikod ang robot)? Hanapin muna ang tumatawag.
+        val canSearch = personSearchBlockedReason() == null
+        // UNA ang tunog/boses, BAGO ang anumang ibang request sa ESP32 (STOP/servo/ikot) - para hindi maghintay sa pila.
+        val wakeTracks = wakeTrackList()
+        if (wakeTracks.isNotEmpty() && !geminiEnabled) {
+            // OFFLINE mode: ang DFPlayer track ng robot ang sasagot (hindi na magsasalita ang phone)
+            sendWakeTrackPriority(wakeTracks.random())
+        } else {
+            speak(if (canSearch) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
+        }
+        // (Hindi pinapalitan ng "SEARCHING" ang eyes mood na pinili mo para sa wake word.)
+        if (canSearch) startPersonSearch(rawHeard, flashSearchEyes = false)
+        addVoiceLogEntry(rawHeard, if (early) "🔔 wake word (agad)" else "🔔 wake word")
+    }
+
+    // Sariling client/dispatcher para sa wake track: hindi maiipit sa mga movement/tracking request ng httpClient
+    // (na maaaring puno kapag mabagal ang ESP32), at maikli ang timeout.
+    private val wakeTrackClient: OkHttpClient by lazy {
+        httpClient.newBuilder()
+            .connectTimeout(1500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .readTimeout(2000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .callTimeout(3000, java.util.concurrent.TimeUnit.MILLISECONDS)
+            .retryOnConnectionFailure(false)
+            .dispatcher(okhttp3.Dispatcher().apply { maxRequestsPerHost = 2 })
+            .build()
+    }
+
+    private fun sendWakeTrackPriority(track: Int) {
+        if (geminiEnabled) return
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP FAILED: ${e.message}") }
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP ${response.code}") }
+                }
+                response.close()
+            }
+        })
+    }
+
     private fun normWake(s: String): String = s.lowercase().filter { it.isLetter() }
 
     private fun wakeAliasSet(): Set<String> =
@@ -3452,22 +3552,17 @@ class MainActivity : ComponentActivity() {
         val rests = rawCandidates.map { stripWakeWord(it) }
         if (rests.any { it != null }) {
             awakeUntil = now + windowMs
+            // Nasagot na ba agad (mula sa partial result) ang wake word na ito?
+            val ackedEarly = earlyAckPending && now - earlyAckTime < 5000L
+            earlyAckPending = false
             val remainders = rests.filterNotNull().filter { it.isNotBlank() }
             if (remainders.isEmpty()) {
                 // "Rustech" lang - gising na, hintayin ang utos
-                statusText.text = tr("🔔 Gising - sabihin ang utos")
-                flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
-                // Walang nakikitang tao (hal. nakatalikod ang robot)? Hanapin muna ang tumatawag.
-                // (Hindi pinapalitan ng "SEARCHING" ang eyes mood na pinili mo para sa wake word.)
-                val searching = startPersonSearch(rawHeard, flashSearchEyes = false)
-                val wakeTracks = wakeTrackList()
-                if (wakeTracks.isNotEmpty() && !geminiEnabled) {
-                    // OFFLINE mode: ang DFPlayer track ng robot ang sasagot (hindi na magsasalita ang phone)
-                    sendPlayTrack(wakeTracks.random())
+                if (ackedEarly) {
+                    addVoiceLogEntry(rawHeard, "🔔 wake word (nasagot na agad)")
                 } else {
-                    speak(if (searching) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
+                    performWakeAck(rawHeard, early = false)
                 }
-                addVoiceLogEntry(rawHeard, "🔔 wake word")
                 return null
             }
             return remainders
@@ -4176,6 +4271,13 @@ class MainActivity : ComponentActivity() {
         armMicWatchdog(clean, 15_000L)   // + hanggang 15s para sa network
         elevenLabsBusy = true
 
+        // Maiikling linya ("Po?", "Opo?") ay naka-cache na sa phone - walang network round-trip
+        val cached = readElevenCache(clean)
+        if (cached != null) {
+            runOnUi { playElevenLabsAudio(cached, clean) }
+            return
+        }
+
         val json = JSONObject().apply {
             put("text", clean)
             put("model_id", "eleven_multilingual_v2")
@@ -4231,7 +4333,74 @@ class MainActivity : ComponentActivity() {
                     return
                 }
 
+                writeElevenCache(clean, audioBytes)
                 runOnUi { playElevenLabsAudio(audioBytes, clean) }
+            }
+        })
+    }
+
+    // ---------- ElevenLabs cache para sa maiikling linya (wake replies, atbp.) ----------
+    private val elevenCacheDir: File
+        get() = File(filesDir, "tts_cache").also { it.mkdirs() }
+
+    private fun elevenCacheFile(text: String): File {
+        val md = java.security.MessageDigest.getInstance("MD5")
+        val key = md.digest("$elevenLabsVoiceId|eleven_multilingual_v2|$text".toByteArray())
+            .joinToString("") { "%02x".format(it) }
+        return File(elevenCacheDir, "el_$key.mp3")
+    }
+
+    private fun readElevenCache(text: String): ByteArray? = try {
+        elevenCacheFile(text).takeIf { it.exists() && it.length() > 0 }?.readBytes()
+    } catch (_: Exception) { null }
+
+    private fun writeElevenCache(text: String, bytes: ByteArray) {
+        if (text.length > 60 || bytes.isEmpty()) return
+        try {
+            elevenCacheFile(text).writeBytes(bytes)
+            val files = elevenCacheDir.listFiles()?.sortedBy { it.lastModified() } ?: return
+            if (files.size > 80) files.take(files.size - 80).forEach { it.delete() }   // limitahan ang dami
+        } catch (_: Exception) {}
+    }
+
+    @Volatile private var elevenPrefetchDone = false
+
+    /** Kunin na nang maaga ang mga fixed na sagot sa wake word, para instant na ang unang "Po?". */
+    private fun prefetchElevenLabsPhrases() {
+        if (elevenPrefetchDone || !elevenLabsEnabled || elevenLabsApiKey.isBlank()) return
+        elevenPrefetchDone = true
+        val phrases = (wakeReplies + tr("Po? Sandali, hahanapin kita."))
+            .map { cleanForSpeech(it) }
+            .filter { it.isNotEmpty() && readElevenCache(it) == null }
+        phrases.forEachIndexed { i, phrase ->
+            // pahinto-hinto (hindi sabay-sabay) para hindi mabigla ang ElevenLabs/network
+            ttsHandler.postDelayed({ fetchElevenLabsToCache(phrase) }, 2000L * (i + 1))
+        }
+    }
+
+    private fun fetchElevenLabsToCache(phrase: String) {
+        if (shuttingDown || !elevenLabsEnabled || elevenLabsApiKey.isBlank()) return
+        val json = JSONObject().apply {
+            put("text", phrase)
+            put("model_id", "eleven_multilingual_v2")
+            put("voice_settings", JSONObject().apply {
+                put("stability", 0.5)
+                put("similarity_boost", 0.75)
+            })
+        }
+        val body = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
+        val request = Request.Builder()
+            .url("https://api.elevenlabs.io/v1/text-to-speech/$elevenLabsVoiceId")
+            .addHeader("xi-api-key", elevenLabsApiKey)
+            .addHeader("Accept", "audio/mpeg")
+            .post(body)
+            .build()
+        ttsClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                val bytes = try { if (response.isSuccessful) response.body?.bytes() else null } catch (e: Exception) { null }
+                response.close()
+                if (bytes != null) writeElevenCache(phrase, bytes)
             }
         })
     }
@@ -5959,6 +6128,7 @@ class MainActivity : ComponentActivity() {
         ttsHandler.removeCallbacksAndMessages(null)   // kasama na ang mic watchdog at mic restart
         personSearchHandler.removeCallbacksAndMessages(null)
         geminiQueueHandler.removeCallbacksAndMessages(null)
+        earlyWakeHandler.removeCallbacksAndMessages(null)
 
         // Kanselahin ang mga naka-ere pang HTTP request (ang dfThenClient ay kapareho ng dispatcher ng httpClient)
         httpClient.dispatcher.cancelAll()
