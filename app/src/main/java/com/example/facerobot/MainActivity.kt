@@ -717,6 +717,10 @@ class MainActivity : ComponentActivity() {
             else -> "matagal nang walang nakikitang tao sa camera"
         }
         if (navActive) parts += "naka-AUTO ka (gumagala mag-isa)"
+        // Ang huling kusang komento niya (para masagot kung tanungin: "ano yung sinabi mo kanina?")
+        recentObservations.lastOrNull()?.let { last ->
+            if (now - lastObserveCallTime < 180_000L) parts += "kusa kang nagkomento kanina sa nakikita mo: \"$last\""
+        }
         return GeminiBrain.Situation(currentRecognizedName, commandStore.all(), parts.joinToString("; "))
     }
 
@@ -845,6 +849,7 @@ class MainActivity : ComponentActivity() {
         startEspHeartbeat()
         setupDepthModel()
         headScanHandler.post(headScanWatcherRunnable)
+        observeHandler.postDelayed(observeTickRunnable, 8000L)
 
         initTts(preferredTtsEngine)
 
@@ -1931,6 +1936,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎙️", tr("Mga Greeting"), tr("I-edit ang bati")) { showGreetingTracksDialog() },
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
+            makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
@@ -3399,6 +3405,246 @@ class MainActivity : ComponentActivity() {
         roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
     }
 
+    // ======================= KUSANG PANINGIN (auto-komento sa nakikita) =======================
+    // Kusang nagkukuwento si Rustech sa nakikita ng camera: ang taong nasa harap at ang ginagawa nila, mga bagay,
+    // at mga pagbabago. Para hindi maubos ang Gemini quota at hindi maging maingay:
+    //  - kukuha lang ng frame kapag tahimik ang lahat (walang kausap, hindi nagsasalita/gumagalaw ang robot)
+    //  - tatawag lang kay Gemini kapag NAGBAGO ang eksena (o 90s na may tao pero walang bagong sinabi)
+    //  - bibigyan si Gemini ng mga huling sinabi niya para hindi umulit; blangko ang sagot = tahimik
+    //  - titigil kapag 70% na ng daily limit ang nagamit, para may natira sa totoong usapan
+    private var observeEnabled: Boolean
+        get() = prefs.getBoolean("observe_enabled", true)
+        set(value) { prefs.edit().putBoolean("observe_enabled", value).apply() }
+    private var observeIntervalSec: Int
+        get() = prefs.getInt("observe_interval_sec", 25).coerceIn(8, 600)
+        set(value) { prefs.edit().putInt("observe_interval_sec", value.coerceIn(8, 600)).apply() }
+
+    private val observeHandler = Handler(android.os.Looper.getMainLooper())
+    @Volatile private var observeInFlight = false
+    private var observeInFlightSince = 0L
+    private var lastObserveCallTime = 0L
+    private var lastObserveSignature: IntArray? = null     // ng huling frame na ipinadala kay Gemini
+    private val recentObservations = ArrayList<String>()   // huling mga sinabi niya (para di umulit)
+    @Volatile private var lastMotionTime = 0L              // huling galaw ng robot (ikot/abante/sayaw)
+    private val observeCheckMs = 4000L                     // gaano kadalas sumilip kung may nagbago
+    private val observeChangeThreshold = 0.05f             // ITAAS kung masyadong madalas; BABAAN kung hindi nakakapansin
+    private val observeHeartbeatMs = 90_000L               // may tao pero walang nagbago: magkomento pa rin tuwing ganito katagal
+    private val observeDailyBudgetFraction = 0.7f
+    private val observeCaptureCallback: (Bitmap) -> Unit = { bitmap -> onObserveFrame(bitmap) }
+
+    private val observeTickRunnable = object : Runnable {
+        override fun run() {
+            if (shuttingDown) return
+            try { observeTick() } catch (_: Throwable) { /* hindi dapat mag-crash ang app dahil dito */ }
+            observeHandler.postDelayed(this, observeCheckMs)
+        }
+    }
+
+    private fun observeTick() {
+        val now = System.currentTimeMillis()
+        // Nag-hang ang paghihintay ng frame? Bitawan.
+        if (observeInFlight && now - observeInFlightSince > 15_000L) {
+            observeInFlight = false
+            if (pendingVisionCapture === observeCaptureCallback) pendingVisionCapture = null
+        }
+        if (!observeEnabled || !geminiEnabled || geminiApiKey.isBlank()) return
+        if (observeInFlight || geminiBusy || isSpeaking || elevenLabsBusy) return
+        if (pendingVisionCapture != null || pendingPhotoCapture) return
+        if (personSearchActive || navActive || navCalibrating || navTestMode || voiceOverrideActive) return
+        if (wakeEnabled && now < awakeUntil) return                 // may kausap - wag sumabat
+        if (now - lastMotionTime < 4000L) return                    // gumagalaw ang robot - malabo at iba ang eksena
+        if (now - lastObserveCallTime < observeIntervalSec * 1000L) return
+        if (now - lastGeminiRequestTime < geminiMinIntervalMs + 1000L) return
+        if (now < geminiCooldownUntil) return
+        if (geminiUsedToday() >= (geminiDailyLimit * observeDailyBudgetFraction).toInt()) return
+
+        observeInFlight = true
+        observeInFlightSince = now
+        pendingVisionCapture = observeCaptureCallback   // ang susunod na frame ng camera (kahit anong mode)
+    }
+
+    /** main thread: nakuha na ang frame - nagbago ba ang eksena? kung oo, tanungin si Gemini. */
+    private fun onObserveFrame(bitmap: Bitmap) {
+        observeInFlight = false
+        val now = System.currentTimeMillis()
+        // Maaaring nagbago na ang kalagayan habang naghihintay ng frame
+        if (!observeEnabled || !geminiEnabled || geminiBusy || isSpeaking || personSearchActive ||
+            (wakeEnabled && now < awakeUntil)) return
+
+        val sig = frameSignature(bitmap)
+        val prev = lastObserveSignature
+        val change = if (prev == null) 1f else signatureDiff(prev, sig)
+        val personRecent = now - lastPersonSeenTime < 6000L
+        val heartbeat = personRecent && now - lastObserveCallTime >= observeHeartbeatMs
+        if (change < observeChangeThreshold && !heartbeat) return   // walang bago - hindi na tatawag
+
+        geminiBusy = true
+        lastGeminiRequestTime = now
+        lastObserveCallTime = now
+        lastObserveSignature = sig
+        bumpGeminiCount()
+
+        val recent = recentObservations.toList()
+        val situation = buildGeminiSituation()
+        val apiKey = geminiApiKey
+        val model = geminiModel
+        // I-compress sa background thread para hindi mabara ang UI
+        cameraExecutor.execute {
+            val b64 = try { bitmapToBase64Jpeg(scaleForVision(bitmap)) } catch (_: Throwable) { "" }
+            geminiBrain.observe(
+                apiKey = apiKey,
+                model = model,
+                imageBase64 = b64,
+                recentComments = recent,
+                situation = situation
+            ) { result ->
+                runOnUi {
+                    geminiBusy = false
+                    when (result) {
+                        is GeminiBrain.Result.Ok -> {
+                            val text = result.reply.text.trim()
+                            val t = System.currentTimeMillis()
+                            val stillQuiet = !isSpeaking && !personSearchActive && !(wakeEnabled && t < awakeUntil)
+                            if (text.isNotEmpty() && stillQuiet && !isNearDuplicateObservation(text)) {
+                                recentObservations.add(text)
+                                while (recentObservations.size > 5) recentObservations.removeAt(0)
+                                statusText.text = "👁️ Rustech: $text"
+                                addVoiceLogEntry("👁️ kusang komento", text)
+                                lastRobotReplyTime = t
+                                speak(text)
+                            }
+                        }
+                        is GeminiBrain.Result.Fail -> {
+                            if (result.kind == GeminiBrain.FailKind.RATE_LIMIT) {
+                                geminiCooldownUntil = System.currentTimeMillis() + 60_000L
+                            }
+                            // Tahimik lang - hindi ito dapat mag-ingay ng error
+                            addVoiceLogEntry("👁️ kusang komento", "failed [${result.kind}] ${result.detail}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun scaleForVision(src: Bitmap, maxSide: Int = 768): Bitmap {
+        val longSide = maxOf(src.width, src.height)
+        if (longSide <= maxSide) return src
+        val ratio = maxSide.toFloat() / longSide
+        return Bitmap.createScaledBitmap(src, (src.width * ratio).toInt(), (src.height * ratio).toInt(), true)
+    }
+
+    /** Maliit (16x12) na grayscale na "fingerprint" ng frame para malaman kung nagbago ang eksena. */
+    private fun frameSignature(bmp: Bitmap): IntArray {
+        val w = 16
+        val h = 12
+        val small = Bitmap.createScaledBitmap(bmp, w, h, true)
+        val out = IntArray(w * h)
+        for (y in 0 until h) for (x in 0 until w) {
+            val c = small.getPixel(x, y)
+            out[y * w + x] = (Color.red(c) * 299 + Color.green(c) * 587 + Color.blue(c) * 114) / 1000
+        }
+        if (small !== bmp) small.recycle()
+        return out
+    }
+
+    /** 0..1: gaano nagbago ang eksena (ibinabawas ang pagbabago ng liwanag para hindi malinlang ng auto-exposure). */
+    private fun signatureDiff(a: IntArray, b: IntArray): Float {
+        if (a.size != b.size) return 1f
+        val ma = a.average()
+        val mb = b.average()
+        var sum = 0.0
+        for (i in a.indices) sum += Math.abs((a[i] - ma) - (b[i] - mb))
+        return (sum / a.size / 255.0).toFloat()
+    }
+
+    private fun isNearDuplicateObservation(text: String): Boolean {
+        fun words(s: String) = s.lowercase().filter { it.isLetterOrDigit() || it.isWhitespace() }
+            .split(Regex("\\s+")).filter { it.length > 2 }.toSet()
+        val w = words(text)
+        if (w.isEmpty()) return true
+        return recentObservations.any { old ->
+            val o = words(old)
+            val inter = w.intersect(o).size
+            val union = w.union(o).size
+            union > 0 && inter.toFloat() / union >= 0.7f
+        }
+    }
+
+    // Mga utos na boses para i-on/i-off (lokal, hindi dumadaan kay Gemini)
+    private val observeOnPhrases = listOf(
+        "ikuwento mo ang nakikita mo", "ikwento mo ang nakikita mo", "ikuwento mo lahat ng nakikita mo",
+        "ikwento mo lahat ng nakikita mo", "sabihin mo lahat ng nakikita mo", "sabihin mo ang lahat ng nakikita mo",
+        "magkomento ka sa nakikita mo", "magkuwento ka ng nakikita mo", "magkwento ka ng nakikita mo"
+    )
+    private val observeOffPhrases = listOf(
+        "huwag ka nang magkomento", "wag ka nang magkomento", "huwag mo nang ikuwento", "wag mo nang ikwento",
+        "wag mo nang ikuwento", "tigil komento", "tama na ang komento", "tumigil ka sa pagkokomento",
+        "huwag kang magkomento", "wag kang magkomento"
+    )
+
+    private fun tryHandleObserveToggleCommand(candidates: List<String>): String? {
+        val on = candidates.any { t -> observeOnPhrases.any { t.contains(it) } }
+        val off = candidates.any { t -> observeOffPhrases.any { t.contains(it) } }
+        if (!on && !off) return null
+        if (off) {
+            observeEnabled = false
+            speak(tr("Sige, tatahimik na ako sa mga nakikita ko."))
+            return "kusang paningin: OFF"
+        }
+        if (!geminiEnabled || geminiApiKey.isBlank()) {
+            speak(tr("Kailangan munang naka-ON ang Gemini para makapagkuwento ako."))
+            return "kusang paningin: kailangan ng Gemini"
+        }
+        observeEnabled = true
+        lastObserveCallTime = 0L
+        lastObserveSignature = null   // magkomento agad sa susunod na silip
+        speak(tr("Sige, ikukuwento ko ang lahat ng nakikita ko."))
+        return "kusang paningin: ON"
+    }
+
+    private fun showObserveDialog() {
+        val sw = Switch(this).apply {
+            text = tr("👁️  Kusang ikuwento ang nakikita (tao at ginagawa nila, mga bagay)")
+            isChecked = observeEnabled
+            setPadding(0, 16, 0, 16)
+        }
+        val note = TextView(this).apply {
+            text = tr("Gumagamit ng Gemini + camera. Magkokomento lang kapag may BAGONG nakita (may pumasok, may ginagawa, may bagong bagay), hindi uulit-ulitin ang sinabi na, at tatahimik kapag may kausap o gumagalaw ang robot. Bawat komento ay 1 Gemini request (kasama sa daily limit; titigil sa 70% para may matira sa usapan). Boses: \"ikuwento mo ang nakikita mo\" / \"wag ka nang magkomento\".")
+            textSize = 12f
+            setPadding(0, 0, 0, 24)
+        }
+        val intervalLabel = TextView(this).apply {
+            text = tr("Pinakamaikling pagitan ng mga komento (segundo, 8-600):")
+        }
+        val intervalInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(observeIntervalSec.toString())
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(sw)
+            addView(note)
+            addView(intervalLabel)
+            addView(intervalInput)
+        }
+        ModernDialog()
+            .setTitle(tr("👁️ Kusang Paningin"))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                observeEnabled = sw.isChecked
+                intervalInput.text.toString().toIntOrNull()?.let { observeIntervalSec = it }
+                if (observeEnabled) {
+                    lastObserveCallTime = 0L
+                    lastObserveSignature = null
+                }
+                statusText.text = if (observeEnabled) tr("👁️ Kusang paningin: naka-on") else tr("👁️ Kusang paningin: naka-off")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
     // ======================= MABILIS NA WAKE RESPONSE =======================
     // Dating delay: (1) hinihintay pa ng recognizer ang BUONG katahimikan bago ibigay ang final result,
     // (2) sunod-sunod ang ESP32 requests (STOP muna bago ang DFPlayer track) sa iisang pila, (3) ElevenLabs ay
@@ -3593,6 +3839,12 @@ class MainActivity : ComponentActivity() {
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
         tryHandleFindPersonCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
+        // "ikuwento mo ang nakikita mo" / "wag ka nang magkomento" - i-on/i-off ang kusang paningin
+        tryHandleObserveToggleCommand(candidates)?.let { result ->
             addVoiceLogEntry(heardText, result)
             return
         }
@@ -4854,6 +5106,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendCommandToEsp32(command: String, servoAngle: Int? = null, attempt: Int = 0) {
+        command.uppercase().let { c ->
+            if (c in movementActions || c == "DANCE" || c == "SHAKING") lastMotionTime = System.currentTimeMillis()
+        }
         var url = "$esp32BaseUrl/command?dir=$command"
         if (servoAngle != null) {
             url += "&servo=$servoAngle"
@@ -6129,6 +6384,7 @@ class MainActivity : ComponentActivity() {
         personSearchHandler.removeCallbacksAndMessages(null)
         geminiQueueHandler.removeCallbacksAndMessages(null)
         earlyWakeHandler.removeCallbacksAndMessages(null)
+        observeHandler.removeCallbacksAndMessages(null)
 
         // Kanselahin ang mga naka-ere pang HTTP request (ang dfThenClient ay kapareho ng dispatcher ng httpClient)
         httpClient.dispatcher.cancelAll()
