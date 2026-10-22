@@ -249,6 +249,8 @@ class GeminiBrain(baseClient: OkHttpClient) {
         imageBase64: String,
         question: String,
         situation: Situation,
+        systemPromptOverride: String? = null,
+        temperature: Double = 0.6,
         onResult: (Result) -> Unit
     ) {
         if (apiKey.isBlank()) {
@@ -263,7 +265,7 @@ class GeminiBrain(baseClient: OkHttpClient) {
         val body = JSONObject().apply {
             put(
                 "systemInstruction",
-                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", buildVisionSystemPrompt(situation))))
+                JSONObject().put("parts", JSONArray().put(JSONObject().put("text", systemPromptOverride ?: buildVisionSystemPrompt(situation))))
             )
             put("contents", JSONArray().put(
                 JSONObject().put("role", "user").put("parts", JSONArray().apply {
@@ -275,7 +277,7 @@ class GeminiBrain(baseClient: OkHttpClient) {
                 })
             ))
             put("generationConfig", JSONObject().apply {
-                put("temperature", 0.6)
+                put("temperature", temperature)
                 put("maxOutputTokens", 512)
                 put("responseMimeType", "application/json")
                 put("responseSchema", JSONObject().apply {
@@ -309,6 +311,65 @@ class GeminiBrain(baseClient: OkHttpClient) {
                 onResult(result)
             }
         })
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // KUSANG OBSERBASYON: kusang nagkokomento si Rustech sa nakikita ng camera niya (tao at ang ginagawa
+    // nila, mga bagay, pagbabago sa paligid) - hindi na kailangang tanungin. Hindi ito idinadagdag sa
+    // conversation history (para hindi maitulak palabas ang totoong usapan). Ang blangkong "reply" ay
+    // nangangahulugang walang bago/kapansin-pansin - tahimik lang.
+
+    fun observe(
+        apiKey: String,
+        model: String,
+        imageBase64: String,
+        recentComments: List<String>,
+        situation: Situation,
+        onResult: (Result) -> Unit
+    ) {
+        val already = if (recentComments.isEmpty()) "Wala ka pang nasasabi."
+            else "Ito ang mga huling sinabi mo (wag ulitin o halos ulitin):\n" +
+                recentComments.mapIndexed { i, c -> "${i + 1}. $c" }.joinToString("\n")
+        val question = "$already\n\nAno ang nakikita mo NGAYON na bago o kapansin-pansin? " +
+            "Kung wala, ibalik ang reply bilang blangko (\"\")."
+        see(
+            apiKey = apiKey,
+            model = model,
+            imageBase64 = imageBase64,
+            question = question,
+            situation = situation,
+            systemPromptOverride = buildObserveSystemPrompt(situation),
+            temperature = 0.8,
+            onResult = onResult
+        )
+    }
+
+    private fun buildObserveSystemPrompt(s: Situation): String {
+        val who = s.recognizedName?.takeIf { it.isNotBlank() }?.let { "Kilala mo ang taong nasa harap mo: si $it." }
+            ?: "Hindi mo kilala ang taong nasa harap mo (kung may tao man)."
+        val around = s.extra.takeIf { it.isNotBlank() }?.let { "NASA PALIGID MO NGAYON: $it." } ?: ""
+        return """
+Ikaw si Rustech - isang maliit na robot na may camera at laging nakatingin sa paligid. Ang larawan ay ang AKTWAL na nakikita ng camera mo NGAYON. Trabaho mo: kusang magkomento, parang kaibigang nakatingin sa tabi, tungkol sa nakikita mo.
+
+$who
+$around
+
+ANO ANG IKUKUWENTO:
+- Ang taong nasa harap mo at ang GINAGAWA niya: postura, galaw, ekspresyon, suot, hawak - hal. nagpa-phone, umiinom, kumakain, nagsusulat, nagbabasa, kumakaway, nakangiti, nakatayo, nakaupo, may bitbit.
+- Ang mga bagay at gamit na kapansin-pansin: tukuyin nang TAMA kung ano (cellphone, tasa, libro, laptop, bote, bag, remote, atbp.), mga alagang hayop, at ang mga pagbabago sa paligid (may pumasok, may lumabas, may inilapag, may bagong bagay).
+- Kung walang tao, magkomento sa mga bagay na nakikita mo kung bago o kapansin-pansin.
+
+MGA TUNTUNIN:
+- TOTOO LANG: ilarawan lang ang aktwal na makikita. Wag mag-imbento. Kung madilim, malabo, malayo, o walang laman ang frame, ibalik ang reply bilang "" (blangko).
+- WAG ULITIN ang mga nasabi mo na (bibigyan ka ng listahan). Kung wala namang bago o kapansin-pansin kumpara doon, ibalik ang reply bilang "" (blangko). Mas mabuti ang tahimik kaysa paulit-ulit.
+- Maikli: 1 pangungusap lang (2 kung kailangan). Boses ang labas: walang markdown, emoji, bullet, o asterisk.
+- Natural na Tagalog/Taglish; masayahin at medyo pilyo, parang nagkukuwento sa katabi. Kung kilala mo ang tao, pwede mo siyang tawagin sa pangalan paminsan-minsan lang.
+- Wag banggitin ang "larawan", "image", o "photo" - parang mata mo mismo ang nakikita.
+- Ilarawan ang ginagawa at suot lang; wag manlait o magbigay ng hatol sa itsura, katawan, o mukha ng tao.
+- action: palaging "NONE".
+
+Laging JSON ang sagot: {"reply": "...", "action": "NONE"}
+        """.trimIndent() + languageRule()
     }
 
     // ---------------------------------------------------------------------------------------
