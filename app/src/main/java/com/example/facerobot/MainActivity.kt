@@ -1938,6 +1938,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
+            makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
             makeCard("💬", tr("Mga Utos"), "Voice commands") { showManageCommandsDialog() },
@@ -4424,6 +4425,75 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ======================= BIGKAS NG MGA PANGALAN =======================
+    // Ang TTS (phone o ElevenLabs) ang bumibigkas, hindi si Gemini - kaya ang solusyon ay palitan ang pagkaka-SPELL
+    // ng salita bago ito basahin ng TTS ("Shantal" -> "Shan-tal"). Ang nakikita sa screen ay hindi nagbabago.
+    // Isang linya bawat isa: Salita=Paano-bigkasin. Naka-edit sa Menu > Bigkas ng Pangalan.
+    private val defaultPronunciations = "Shantal=Shan-tal"
+    private var pronunciationsRaw: String
+        get() = prefs.getString("tts_pronunciations", null) ?: defaultPronunciations
+        set(value) { prefs.edit().putString("tts_pronunciations", value).apply() }
+
+    private fun pronunciationPairs(): List<Pair<String, String>> =
+        pronunciationsRaw.lines().mapNotNull { line ->
+            val i = line.indexOf('=')
+            if (i <= 0) null else line.substring(0, i).trim() to line.substring(i + 1).trim()
+        }.filter { it.first.isNotEmpty() && it.second.isNotEmpty() }
+
+    private fun applyPronunciations(text: String): String {
+        var out = text
+        for ((word, say) in pronunciationPairs()) {
+            // buong salita lang, hindi sensitibo sa laki ng letra (kasama ang "Shantal's", "shantal!")
+            out = Regex("(?<![\\p{L}\\p{N}])" + Regex.escape(word) + "(?![\\p{L}\\p{N}])", RegexOption.IGNORE_CASE)
+                .replace(out, Regex.escapeReplacement(say))
+        }
+        return out
+    }
+
+    private fun showPronunciationDialog() {
+        val note = TextView(this).apply {
+            text = tr("Isang linya bawat pangalan: Salita=Paano-bigkasin. Halimbawa kung \"shantol\" ang bigkas ng robot sa Shantal, subukan ang Shan-tal, Shantahl, Shantaal, o Shan tal hanggang tumama. Hindi nagbabago ang nakasulat sa screen, ang boses lang.")
+            textSize = 12f
+            setPadding(0, 0, 0, 16)
+        }
+        val input = EditText(this).apply {
+            hint = "Shantal=Shan-tal"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or
+                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            minLines = 4
+            setText(pronunciationsRaw)
+        }
+        val testButton = Button(this).apply {
+            text = tr("▶  Subukan ang unang linya")
+            isAllCaps = false
+            setOnClickListener {
+                pronunciationsRaw = input.text.toString()   // isinasave na para marinig agad ang bago
+                val word = pronunciationPairs().firstOrNull()?.first
+                if (word == null) {
+                    statusText.text = tr("Maglagay muna ng linya, hal. Shantal=Shan-tal")
+                } else {
+                    speak("Kumusta, $word!")
+                }
+            }
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(note)
+            addView(input)
+            addView(testButton)
+        }
+        ModernDialog()
+            .setTitle(tr("🗣️ Bigkas ng Pangalan"))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                pronunciationsRaw = input.text.toString()
+                statusText.text = tr("Na-save ang bigkas ng mga pangalan")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
     private fun cleanForSpeech(raw: String): String {
         return raw
             .replace(Regex("[\\x{1F000}-\\x{1FFFF}\\x{2600}-\\x{27BF}\\x{FE0F}]"), "")
@@ -4451,7 +4521,7 @@ class MainActivity : ComponentActivity() {
 
     private fun speak(phrase: String) {
         if (!appTtsEnabled) return
-        val clean = cleanForSpeech(phrase)
+        val clean = applyPronunciations(cleanForSpeech(phrase))
         if (clean.isEmpty()) return
 
         // Nagsasalita habang gising? Ibalik ang follow-up window pagkatapos (tingnan ang resumeMicRunnable)
@@ -4622,7 +4692,7 @@ class MainActivity : ComponentActivity() {
         if (elevenPrefetchDone || !elevenLabsEnabled || elevenLabsApiKey.isBlank()) return
         elevenPrefetchDone = true
         val phrases = (wakeReplies + tr("Po? Sandali, hahanapin kita."))
-            .map { cleanForSpeech(it) }
+            .map { applyPronunciations(cleanForSpeech(it)) }
             .filter { it.isNotEmpty() && readElevenCache(it) == null }
         phrases.forEachIndexed { i, phrase ->
             // pahinto-hinto (hindi sabay-sabay) para hindi mabigla ang ElevenLabs/network
