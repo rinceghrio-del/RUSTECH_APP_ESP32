@@ -45,6 +45,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.ComponentActivity
@@ -1938,6 +1939,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
+            makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
@@ -4394,8 +4396,8 @@ class MainActivity : ComponentActivity() {
         val engine = tts ?: return
 
         val filipinoOk = applyTtsLanguage()
-        engine.setSpeechRate(1.0f)
-        engine.setPitch(1.0f)
+        engine.setSpeechRate(ttsRate)
+        engine.setPitch(ttsPitch)
 
         engine.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {}
@@ -4423,6 +4425,119 @@ class MainActivity : ComponentActivity() {
             ttsHandler.removeCallbacks(resumeMicRunnable)
             ttsHandler.postDelayed(resumeMicRunnable, 300L)
         }
+    }
+
+    // ======================= BOSES NG ROBOT (pitch at bilis ng TTS ng phone) =======================
+    // Taasan ang pitch at bilisan nang kaunti = mas cute/cartoon na boses (parang maliit na robot).
+    // Para sa boses ng PHONE lang (Google TTS). Ang ElevenLabs ay may sarili nitong boses/voice ID.
+    private var ttsPitch: Float
+        get() = prefs.getFloat("tts_pitch", 1.0f).coerceIn(0.5f, 2.0f)
+        set(value) { prefs.edit().putFloat("tts_pitch", value.coerceIn(0.5f, 2.0f)).apply() }
+    private var ttsRate: Float
+        get() = prefs.getFloat("tts_rate", 1.0f).coerceIn(0.5f, 2.0f)
+        set(value) { prefs.edit().putFloat("tts_rate", value.coerceIn(0.5f, 2.0f)).apply() }
+
+    private fun applyTtsVoiceParams() {
+        tts?.setPitch(ttsPitch)
+        tts?.setSpeechRate(ttsRate)
+    }
+
+    private fun showRobotVoiceDialog() {
+        val oldPitch = ttsPitch
+        val oldRate = ttsRate
+
+        fun toProgress(v: Float) = ((v - 0.5f) * 100f).toInt().coerceIn(0, 150)
+        fun fromProgress(p: Int) = 0.5f + p / 100f
+
+        val pitchLabel = TextView(this).apply { setPadding(0, 16, 0, 0) }
+        val rateLabel = TextView(this).apply { setPadding(0, 16, 0, 0) }
+        fun refreshLabels(pitch: Float, rate: Float) {
+            pitchLabel.text = tr("Pitch (taas ng boses): {0}", String.format("%.2f", pitch))
+            rateLabel.text = tr("Bilis: {0}", String.format("%.2f", rate))
+        }
+
+        val pitchBar = SeekBar(this).apply { max = 150; progress = toProgress(oldPitch) }
+        val rateBar = SeekBar(this).apply { max = 150; progress = toProgress(oldRate) }
+        val listener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                refreshLabels(fromProgress(pitchBar.progress), fromProgress(rateBar.progress))
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        }
+        pitchBar.setOnSeekBarChangeListener(listener)
+        rateBar.setOnSeekBarChangeListener(listener)
+        refreshLabels(oldPitch, oldRate)
+
+        fun preset(label: String, pitch: Float, rate: Float) = Button(this).apply {
+            text = label
+            isAllCaps = false
+            setOnClickListener {
+                pitchBar.progress = toProgress(pitch)
+                rateBar.progress = toProgress(rate)
+            }
+        }
+        val presetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(preset(tr("Normal"), 1.0f, 1.0f), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("🤖 Cute"), 1.5f, 1.1f), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("🐿️ Sobrang cute"), 1.8f, 1.2f), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("Malalim"), 0.7f, 0.95f), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        val testButton = Button(this).apply {
+            text = tr("▶  Subukan ang boses")
+            isAllCaps = false
+            setOnClickListener {
+                ttsPitch = fromProgress(pitchBar.progress)   // isinasave na para marinig agad (ibabalik kung Cancel)
+                ttsRate = fromProgress(rateBar.progress)
+                applyTtsVoiceParams()
+                // Laging boses ng phone ang test, kahit naka-ON ang ElevenLabs
+                ensureMaxMediaVolume()
+                speakWithLocalTts(applyPronunciations(cleanForSpeech(tr("Kumusta! Ako si Rustech, ang robot mo."))))
+            }
+        }
+
+        val elevenNote = TextView(this).apply {
+            text = tr("⚠️ Naka-ON ang ElevenLabs, kaya iyon ang boses sa normal na usapan; ang boses ng phone ay gagamitin lang kapag nag-fail ito. Para laging marinig ang setting na ito, i-OFF ang ElevenLabs. Ang ▶ Subukan ay laging boses ng phone.")
+            textSize = 12f
+            setPadding(0, 16, 0, 0)
+            visibility = if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) View.VISIBLE else View.GONE
+        }
+        val hint = TextView(this).apply {
+            text = tr("Taasan ang pitch (mga 1.5) at bilisan nang kaunti para sa cute na boses ng maliit na robot.")
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(hint)
+            addView(presetRow)
+            addView(pitchLabel)
+            addView(pitchBar)
+            addView(rateLabel)
+            addView(rateBar)
+            addView(testButton)
+            addView(elevenNote)
+        }
+
+        ModernDialog()
+            .setTitle(tr("🎚️ Boses ng Robot"))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                ttsPitch = fromProgress(pitchBar.progress)
+                ttsRate = fromProgress(rateBar.progress)
+                applyTtsVoiceParams()
+                statusText.text = tr("Na-save ang boses ng robot")
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                ttsPitch = oldPitch      // ibalik ang dati kung na-test lang
+                ttsRate = oldRate
+                applyTtsVoiceParams()
+            }
+            .showImmersive()
     }
 
     // ======================= BIGKAS NG MGA PANGALAN =======================
@@ -4564,6 +4679,7 @@ class MainActivity : ComponentActivity() {
 
     private fun speakWithLocalTts(clean: String) {
         if (!ttsReady) return
+        applyTtsVoiceParams()
         val chunks = splitForSpeech(clean)
         if (chunks.isEmpty()) return
 
