@@ -851,6 +851,7 @@ class MainActivity : ComponentActivity() {
         setupDepthModel()
         headScanHandler.post(headScanWatcherRunnable)
         observeHandler.postDelayed(observeTickRunnable, 8000L)
+        pitHandler.postDelayed(pitPollRunnable, 3000L)
 
         initTts(preferredTtsEngine)
 
@@ -891,7 +892,7 @@ class MainActivity : ComponentActivity() {
         // Kapag ang TTS ng phone ang boses (naka-ON ang TTS switch), PATAY ang DFPlayer output ng
         // utos - para hindi sabay magsalita ang phone at ang robot. Tuloy pa rin ang movement/HOME.
         val ttsIsVoice = appTtsEnabled
-        val dfTracks = if (ttsIsVoice) emptyList()
+        val dfTracks = if (!dfPlayerAllowed()) emptyList()
             else parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.toIntOrNull() }
         val otherParts = parts
             .filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
@@ -989,11 +990,17 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /**
+     * ISANG PATAKARAN SA LAHAT ng boses ng robot: gagana LANG ang DFPlayer (ESP32 voice) kapag
+     * NAKA-OFF ang Gemini AT NAKA-OFF ang app TTS. Kapag may naka-ON sa dalawa, ang TTS ng phone lang ang
+     * magsasalita (o tahimik kung OFF din) - para hindi kailanman magsabay ang mga salita ng phone at ng DFPlayer.
+     * (Ang ▶ Subukan ng track sa settings ay hiwalay - laging tumutugtog.)
+     */
+    private fun dfPlayerAllowed(): Boolean = !geminiEnabled && !appTtsEnabled
+
     private fun sendPlayTrack(track: Int) {
-        // Kapag naka-ON ang Gemini AI mode, app TTS na lang ang tanging boses - hindi na
-        // pinapatugtog ang DFPlayer/ESP32 voice dito para hindi magsabay/magkagulo ang dalawang
-        // audio habang nakikipag-usap kay Gemini.
-        if (geminiEnabled) return
+        // Tignan ang dfPlayerAllowed(): DFPlayer lang kapag OFF ang Gemini at OFF ang app TTS.
+        if (!dfPlayerAllowed()) return
 
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
@@ -1022,7 +1029,7 @@ class MainActivity : ComponentActivity() {
         // Pareho ng sendPlayTrack(): naka-mute ang DFPlayer voice habang naka-ON ang Gemini AI
         // mode. Tuloy pa rin agad ang onDone() para gumana pa rin ang kasunod na movement sa
         // isang "||"-combo action kahit naka-skip ang bahaging dfplayer.
-        if (geminiEnabled) {
+        if (!dfPlayerAllowed()) {
             onDone()
             return
         }
@@ -1940,6 +1947,7 @@ class MainActivity : ComponentActivity() {
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
+            makeCard("🕳️", tr("Pit Sensor"), if (pitEnabled) tr("Naka-on") else tr("Naka-off")) { showPitDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
@@ -2689,7 +2697,7 @@ class MainActivity : ComponentActivity() {
         if (speakCustomGreeting(name, name)) return
 
         val tracks = greetingTracksFor(name)
-        if (tracks.isNotEmpty() && !geminiEnabled) {
+        if (tracks.isNotEmpty() && dfPlayerAllowed()) {
             sendPlayTrack(tracks.random())
         } else if (geminiEnabled) {
             // Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - subukang gawing
@@ -2698,6 +2706,9 @@ class MainActivity : ComponentActivity() {
                 "May nakita kang kilalang kaibigan/kasama na si $name sa harap mo ngayon - batiin mo siya nang maikli at natural, parang kakakita mo lang talaga sa kanya.",
                 tr("Kumusta, {0}!", name)
             )
+        } else if (ttsReady) {
+            // OFF ang Gemini pero naka-ON ang app TTS (o walang track): TTS lang ang bumabati, hindi DFPlayer
+            speak(tr("Kumusta, {0}!", name))
         }
     }
 
@@ -2710,7 +2721,7 @@ class MainActivity : ComponentActivity() {
         if (speakCustomGreeting(greetUnknownKey, "")) return
 
         val tracks = unknownGreetingTrackList()
-        if (tracks.isNotEmpty() && !geminiEnabled) {
+        if (tracks.isNotEmpty() && dfPlayerAllowed()) {
             sendPlayTrack(tracks.random())
         } else if (geminiEnabled) {
             sayDynamicOrFallback(
@@ -2736,7 +2747,7 @@ class MainActivity : ComponentActivity() {
         // Tracks dialog gamit "aso" o "pusa" bilang pangalan, gagana na agad ito dito.
         // (Naka-mute ang DFPlayer habang naka-ON ang Gemini AI mode - tuloy sa TTS fallback.)
         val tracks = greetingTracksFor(label)
-        if (tracks.isNotEmpty() && !geminiEnabled) {
+        if (tracks.isNotEmpty() && dfPlayerAllowed()) {
             sendPlayTrack(tracks.random())
             return
         }
@@ -3408,6 +3419,218 @@ class MainActivity : ComponentActivity() {
         roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
     }
 
+    // ======================= PIT SENSOR (IR_SENSOR_LEFT=19, IR_SENSOR_RIGHT=16 sa ESP32) =======================
+    // Kapag na-trigger ang pit/cliff sensor: titingin sa baba, nagugulat ang mata, sasabihin ang "Ay nako,
+    // mahuhulog pala ako dito!" (TTS) o tutugtog ang DFPlayer track (default 75) kapag naka-OFF ang app TTS,
+    // tapos babalik sa pagtingin sa mukha.
+    // PAANO NALALAMAN NG APP: ang ESP32 firmware ay dapat magdagdag ng "|PIT=<L|R|LR|0>" sa sagot ng /ping,
+    // hal. "PONG|MOVING|PIT=L" (tingnan ang pit_sensor_patch.ino). Mabilis na hiwalay na poll (400ms) ang
+    // ginagamit dito para hindi maghintay ng buong segundo; ang rising edge lang (walang pit -> may pit) ang magti-trigger.
+    // Ang ESP32 pa rin ang may hawak ng mismong pag-iwas (preno/atras) - ang app ay "palabas" lang, at hindi
+    // gagalaw papunta sa pit habang nagre-react (naka-pause ang face-tracking motor commands).
+    private var pitEnabled: Boolean
+        get() = prefs.getBoolean("pit_enabled", true)
+        set(value) { prefs.edit().putBoolean("pit_enabled", value).apply() }
+    private var pitTrack: Int
+        get() = prefs.getInt("pit_track", 75)
+        set(value) { prefs.edit().putInt("pit_track", value.coerceAtLeast(0)).apply() }
+    private var pitPhrase: String
+        get() = prefs.getString("pit_phrase", "Ay nako, mahuhulog pala ako dito!") ?: "Ay nako, mahuhulog pala ako dito!"
+        set(value) { prefs.edit().putString("pit_phrase", value.trim().ifEmpty { "Ay nako, mahuhulog pala ako dito!" }).apply() }
+
+    private val pitHandler = Handler(android.os.Looper.getMainLooper())
+    @Volatile private var pitPollInFlight = false
+    private var pitActiveLast = false
+    private var lastPitReactionTime = 0L
+    @Volatile private var pitReactionUntil = 0L        // habang naka-set, walang tracking motor/servo command
+    private val pitPollMs = 400L
+    private val pitCooldownMs = 6000L                  // pinakamaikling pagitan ng dalawang reaksyon
+    private val pitReactionMinMs = 3500L               // pinakamaikling tagal bago bumalik sa mukha
+    private val pitLookDownAngle = 15                  // servo: mas malapit sa 0 = mas pababa (kapareho ng head scan down)
+
+    private val pitPollRunnable = object : Runnable {
+        override fun run() {
+            if (shuttingDown) return
+            try { if (pitEnabled) pollPit() } catch (_: Throwable) { }
+            pitHandler.postDelayed(this, pitPollMs)
+        }
+    }
+
+    private fun pollPit() {
+        if (pitPollInFlight) return
+        pitPollInFlight = true
+        val request = Request.Builder().url("$esp32BaseUrl/ping").build()
+        navClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                pitPollInFlight = false
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                val body = try { response.use { it.body?.string() } } catch (e: Exception) { null }
+                pitPollInFlight = false
+                runOnUi { onPitPollResult(body) }
+            }
+        })
+    }
+
+    /** "PONG|MOVING|PIT=L" -> "L"; walang PIT field (lumang firmware) -> null; "PIT=0" -> "0". */
+    private fun parsePitField(body: String?): String? =
+        body?.split("|")?.firstOrNull { it.trim().startsWith("PIT=") }?.substringAfter("=")?.trim()
+
+    private fun onPitPollResult(body: String?) {
+        val pit = parsePitField(body)
+        val active = pit != null && pit.isNotEmpty() && pit != "0"
+        if (active && !pitActiveLast) onPitDetected(pit ?: "")
+        pitActiveLast = active
+    }
+
+    private fun onPitDetected(side: String, force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (!force && (!pitEnabled || now - lastPitReactionTime < pitCooldownMs)) return
+        lastPitReactionTime = now
+        pitReactionUntil = now + 9000L   // pangkaligtasan; ang finishPitReaction ang magbubukas ulit
+        cancelPersonSearch()
+        headScanActive = false
+
+        val prevServo = outputServoAngle
+
+        // 1) Huminto + tumingin sa baba
+        outputServoAngle = pitLookDownAngle.toFloat()
+        smoothedServoAngle = pitLookDownAngle.toFloat()
+        // SERVO = camera tilt LANG sa anumang state ng firmware (walang galaw ng motor, hindi nakikialam
+        // sa preno/atras ng firmware). Dati STOP+servo, na IGNORED kapag MOVING/AVOIDING ang robot.
+        sendServoOnly(pitLookDownAngle)
+
+        // 2) Nagulat ang mata
+        val surprised = RoboEyesView.Mood.fromKey("SURPRISED") ?: RoboEyesView.Mood.ALERT
+        roboEyesView.flashMood(surprised, pitReactionMinMs + 1500L)
+        val sideLabel = when (side.uppercase().replace("TEST", "").filter { it == 'L' || it == 'R' }) {
+            "L" -> tr("kaliwa")
+            "R" -> tr("kanan")
+            "" -> ""
+            else -> tr("harap")
+        }
+        statusText.text = tr("⚠️ May butas/bangin sa {0}!", sideLabel)
+        addVoiceLogEntry("pit sensor", "na-trigger ($side)")
+
+        // 3) Boses: DFPlayer track LANG kapag OFF ang Gemini at OFF ang app TTS; kung hindi, TTS ng app
+        //    (tahimik kung OFF din ang TTS) - para hindi magsabay ang phone at DFPlayer.
+        if (dfPlayerAllowed()) {
+            if (pitTrack > 0) sendTrackDirect(pitTrack)
+        } else {
+            speak(pitPhrase)
+        }
+
+        // 4) Pagkatapos, balik sa pagtingin sa mukha
+        pitHandler.removeCallbacksAndMessages(null)
+        pitHandler.postDelayed({ finishPitReaction(prevServo, now) }, pitReactionMinMs)
+        // buhayin ulit ang poll (nabura ng removeCallbacksAndMessages)
+        pitHandler.postDelayed(pitPollRunnable, pitPollMs)
+    }
+
+    private fun finishPitReaction(prevServo: Float, startedAt: Long) {
+        val now = System.currentTimeMillis()
+        // Hintayin munang matapos ang pagsasalita (hanggang 7s) bago bumalik
+        if (isSpeaking && now - startedAt < 7000L) {
+            pitHandler.postDelayed({ finishPitReaction(prevServo, startedAt) }, 300L)
+            return
+        }
+        pitReactionUntil = 0L
+        roboEyesView.clearFlash()
+        // -1 = wala pang naitakdang servo angle dati; gamitin ang gitnang tingin
+        val restore = if (prevServo >= 0f) prevServo else personSearchTilts[0].toFloat()
+        outputServoAngle = restore
+        smoothedServoAngle = restore
+        sendServoOnly(restore.toInt())   // itaas ulit ang camera; ang tracking na ang bahala sa mukha
+    }
+
+    /** Camera tilt LANG (firmware V5.4.0 SERVO): gumagana sa anumang state at hindi gumagalaw ang motor. */
+    private fun sendServoOnly(angle: Int) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=SERVO&servo=$angle")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) { response.close() }
+        })
+    }
+
+    /** Patugtugin agad ang DFPlayer track (hiwalay na client para hindi maiipit sa tracking requests). Tignan ang dfPlayerAllowed() sa tumatawag. */
+    private fun sendTrackDirect(track: Int) {
+        // SAY (firmware V5.4.0): tumutugtog sa ANUMANG state; ang PLAY ay IGNORED kapag hindi STATE_BOOT_WAIT
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=SAY&track=$track")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP FAILED: ${e.message}") }
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    runOnUi { addVoiceLogEntry("DFPlayer track $track", "HTTP ${response.code}") }
+                }
+                response.close()
+            }
+        })
+    }
+
+    private fun showPitDialog() {
+        val sw = Switch(this).apply {
+            text = tr("🕳️  Pit sensor: magulat at magsalita kapag may bangin")
+            isChecked = pitEnabled
+            setPadding(0, 16, 0, 16)
+        }
+        val note = TextView(this).apply {
+            text = tr("Kapag na-trigger ang IR_SENSOR_LEFT (19) o IR_SENSOR_RIGHT (16): titingin sa baba, nagugulat ang mata, magsasalita (TTS), o tutugtog ang DFPlayer track kapag OFF ang Gemini AT OFF ang app TTS, tapos babalik sa mukha. Kailangan ng firmware V5.4.0 (main.cpp) para ipaalam ng ESP32 ang pit sa /ping at para tumanggap ng SAY/SERVO.")
+            textSize = 12f
+            setPadding(0, 0, 0, 16)
+        }
+        val phraseLabel = TextView(this).apply { text = tr("Sasabihin (kapag TTS ng app ang boses):") }
+        val phraseInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(pitPhrase)
+        }
+        val trackLabel = TextView(this).apply {
+            text = tr("DFPlayer track (kapag OFF ang Gemini at OFF ang app TTS):")
+            setPadding(0, 16, 0, 0)
+        }
+        val trackInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(pitTrack.toString())
+        }
+        val testButton = Button(this).apply {
+            text = tr("▶  Subukan ang reaksyon")
+            isAllCaps = false
+            setOnClickListener {
+                // isinasave muna ang tina-type para marinig agad
+                pitPhrase = phraseInput.text.toString()
+                trackInput.text.toString().toIntOrNull()?.let { pitTrack = it }
+                onPitDetected("TEST", force = true)
+            }
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(sw)
+            addView(note)
+            addView(phraseLabel)
+            addView(phraseInput)
+            addView(trackLabel)
+            addView(trackInput)
+            addView(testButton)
+        }
+        ModernDialog()
+            .setTitle(tr("🕳️ Pit Sensor"))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                pitEnabled = sw.isChecked
+                pitPhrase = phraseInput.text.toString()
+                trackInput.text.toString().toIntOrNull()?.let { pitTrack = it }
+                statusText.text = if (pitEnabled) tr("🕳️ Pit sensor: naka-on") else tr("🕳️ Pit sensor: naka-off")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
     // ======================= KUSANG PANINGIN (auto-komento sa nakikita) =======================
     // Kusang nagkukuwento si Rustech sa nakikita ng camera: ang taong nasa harap at ang ginagawa nila, mga bagay,
     // at mga pagbabago. Para hindi maubos ang Gemini quota at hindi maging maingay:
@@ -3455,6 +3678,7 @@ class MainActivity : ComponentActivity() {
         if (pendingVisionCapture != null || pendingPhotoCapture) return
         if (personSearchActive || navActive || navCalibrating || navTestMode || voiceOverrideActive) return
         if (wakeEnabled && now < awakeUntil) return                 // may kausap - wag sumabat
+        if (now < pitReactionUntil) return                          // nagre-react sa pit
         if (now - lastMotionTime < 4000L) return                    // gumagalaw ang robot - malabo at iba ang eksena
         if (now - lastObserveCallTime < observeIntervalSec * 1000L) return
         if (now - lastGeminiRequestTime < geminiMinIntervalMs + 1000L) return
@@ -3697,8 +3921,8 @@ class MainActivity : ComponentActivity() {
         val canSearch = personSearchBlockedReason() == null
         // UNA ang tunog/boses, BAGO ang anumang ibang request sa ESP32 (STOP/servo/ikot) - para hindi maghintay sa pila.
         val wakeTracks = wakeTrackList()
-        if (wakeTracks.isNotEmpty() && !geminiEnabled) {
-            // OFFLINE mode: ang DFPlayer track ng robot ang sasagot (hindi na magsasalita ang phone)
+        if (wakeTracks.isNotEmpty() && dfPlayerAllowed()) {
+            // DFPlayer mode (OFF ang Gemini at OFF ang app TTS): ang track ng robot ang sasagot
             sendWakeTrackPriority(wakeTracks.random())
         } else {
             speak(if (canSearch) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
@@ -3721,7 +3945,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun sendWakeTrackPriority(track: Int) {
-        if (geminiEnabled) return
+        if (!dfPlayerAllowed()) return
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
             .build()
@@ -5079,6 +5303,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
         val now = System.currentTimeMillis()
+        if (now < pitReactionUntil) return   // nagre-react sa pit: huwag gumalaw/ibalik ang servo hanggang matapos
         if (now - lastSendTime < sendIntervalMs) return
         lastSendTime = now
         sendCommandToEsp32(command, servoAngle)
@@ -5235,7 +5460,8 @@ class MainActivity : ComponentActivity() {
         pingFailCount = 0
         autoFindBackoffMs = 60_000L // nakakonekta - i-reset ang paghihintay
 
-        val state = if (body.startsWith("PONG|")) body.substringAfter("|").trim() else ""
+        // "PONG|MOVING" o "PONG|MOVING|PIT=L" - ang STATE lang ang kukunin
+        val state = if (body.startsWith("PONG|")) body.substringAfter("|").substringBefore("|").trim() else ""
         val inNavState = state == "MOVING" || state.startsWith("AVOIDING")
 
         if (inNavState) {
@@ -6571,6 +6797,7 @@ class MainActivity : ComponentActivity() {
         geminiQueueHandler.removeCallbacksAndMessages(null)
         earlyWakeHandler.removeCallbacksAndMessages(null)
         observeHandler.removeCallbacksAndMessages(null)
+        pitHandler.removeCallbacksAndMessages(null)
 
         // Kanselahin ang mga naka-ere pang HTTP request (ang dfThenClient ay kapareho ng dispatcher ng httpClient)
         httpClient.dispatcher.cancelAll()
