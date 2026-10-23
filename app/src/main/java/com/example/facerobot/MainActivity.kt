@@ -1940,6 +1940,7 @@ class MainActivity : ComponentActivity() {
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
+            makeCard("☁️", "Azure TTS", if (azureActive()) tr("Naka-on") else tr("Naka-off")) { showAzureTtsDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
@@ -4499,10 +4500,10 @@ class MainActivity : ComponentActivity() {
         }
 
         val elevenNote = TextView(this).apply {
-            text = tr("⚠️ Naka-ON ang ElevenLabs, kaya iyon ang boses sa normal na usapan; ang boses ng phone ay gagamitin lang kapag nag-fail ito. Para laging marinig ang setting na ito, i-OFF ang ElevenLabs. Ang ▶ Subukan ay laging boses ng phone.")
+            text = tr("⚠️ Naka-ON ang Azure o ElevenLabs, kaya iyon ang boses sa normal na usapan; ang boses ng phone ay gagamitin lang kapag nag-fail ito. Para laging marinig ang setting na ito, i-OFF sila. Ang ▶ Subukan ay laging boses ng phone.")
             textSize = 12f
             setPadding(0, 16, 0, 0)
-            visibility = if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) View.VISIBLE else View.GONE
+            visibility = if ((elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) || azureActive()) View.VISIBLE else View.GONE
         }
         val hint = TextView(this).apply {
             text = tr("Taasan ang pitch (mga 1.5) at bilisan nang kaunti para sa cute na boses ng maliit na robot.")
@@ -4644,7 +4645,9 @@ class MainActivity : ComponentActivity() {
 
         ensureMaxMediaVolume()
 
-        if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) {
+        if (azureActive()) {
+            speakWithAzure(clean)
+        } else if (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()) {
             speakWithElevenLabs(clean)
         } else {
             speakWithLocalTts(clean)
@@ -4777,13 +4780,279 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    // ======================= AZURE TTS (Microsoft neural voices, may Filipino) =======================
+    // Mas natural na Filipino na boses (fil-PH Blessica / Angelo) at may kontrol sa pitch at bilis (SSML <prosody>).
+    // May free (F0) tier ang Azure Speech para sa neural voices (tingnan ang pricing page ng Azure para sa kasalukuyang limit).
+    // Priority: Azure > ElevenLabs > boses ng phone. Kapag nag-fail ang Azure, babagsak sa boses ng phone.
+    private var azureEnabled: Boolean
+        get() = prefs.getBoolean("azure_tts_enabled", false)
+        set(value) { prefs.edit().putBoolean("azure_tts_enabled", value).apply() }
+    private var azureKey: String
+        get() = prefs.getString("azure_tts_key", "") ?: ""
+        set(value) { prefs.edit().putString("azure_tts_key", value.trim()).apply() }
+    private var azureRegion: String
+        get() = prefs.getString("azure_tts_region", "southeastasia") ?: "southeastasia"
+        set(value) { prefs.edit().putString("azure_tts_region", value.trim().lowercase().ifEmpty { "southeastasia" }).apply() }
+    private var azureVoice: String
+        get() = prefs.getString("azure_tts_voice", "fil-PH-BlessicaNeural") ?: "fil-PH-BlessicaNeural"
+        set(value) { prefs.edit().putString("azure_tts_voice", value.trim().ifEmpty { "fil-PH-BlessicaNeural" }).apply() }
+    // Relative na porsyento (-50..+100) para sa <prosody pitch/rate>
+    private var azurePitchPct: Int
+        get() = prefs.getInt("azure_tts_pitch_pct", 0).coerceIn(-50, 100)
+        set(value) { prefs.edit().putInt("azure_tts_pitch_pct", value.coerceIn(-50, 100)).apply() }
+    private var azureRatePct: Int
+        get() = prefs.getInt("azure_tts_rate_pct", 0).coerceIn(-50, 100)
+        set(value) { prefs.edit().putInt("azure_tts_rate_pct", value.coerceIn(-50, 100)).apply() }
+
+    private fun azureActive(): Boolean =
+        azureEnabled && azureKey.isNotBlank() && azureRegion.isNotBlank()
+
+    /** Para hindi maghalo sa cache ang magkaibang engine/boses/pitch/bilis. */
+    private fun ttsCacheTag(): String =
+        if (azureActive()) "azure|$azureVoice|$azurePitchPct|$azureRatePct"
+        else "$elevenLabsVoiceId|eleven_multilingual_v2"
+
+    private fun xmlEscape(t: String): String = t
+        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("\"", "&quot;").replace("'", "&apos;")
+
+    private fun buildAzureSsml(text: String): String {
+        val voice = azureVoice
+        val lang = voice.split("-").take(2).joinToString("-").ifEmpty { "fil-PH" }
+        val pitch = String.format(Locale.US, "%+d%%", azurePitchPct)
+        val rate = String.format(Locale.US, "%+d%%", azureRatePct)
+        return "<speak version='1.0' xml:lang='$lang' xmlns='http://www.w3.org/2001/10/synthesis'>" +
+            "<voice name='$voice'><prosody pitch='$pitch' rate='$rate'>${xmlEscape(text)}</prosody></voice></speak>"
+    }
+
+    private fun buildAzureRequest(text: String): Request =
+        Request.Builder()
+            .url("https://${azureRegion.trim().lowercase()}.tts.speech.microsoft.com/cognitiveservices/v1")
+            .addHeader("Ocp-Apim-Subscription-Key", azureKey)
+            .addHeader("X-Microsoft-OutputFormat", "audio-16khz-64kbitrate-mono-mp3")
+            .addHeader("User-Agent", "RustechRobot")
+            .post(buildAzureSsml(text).toRequestBody("application/ssml+xml; charset=utf-8".toMediaType()))
+            .build()
+
+    private fun speakWithAzure(clean: String) {
+        ttsHandler.removeCallbacks(resumeMicRunnable)
+        isSpeaking = true
+        setMicPaused(true)
+        armMicWatchdog(clean, 15_000L)   // + hanggang 15s para sa network
+        elevenLabsBusy = true
+
+        // Maiikling linya ay naka-cache na - walang network round-trip
+        val cached = readElevenCache(clean)
+        if (cached != null) {
+            runOnUi { playElevenLabsAudio(cached, clean) }
+            return
+        }
+
+        ttsClient.newCall(buildAzureRequest(clean)).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi {
+                    elevenLabsBusy = false
+                    addVoiceLogEntry("Azure TTS", "HTTP FAILED: ${e.message} - fallback sa lokal na TTS")
+                    speakWithLocalTts(clean)
+                }
+            }
+
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                if (!response.isSuccessful) {
+                    // 401/403 = mali ang key o ang region; 429 = naubos/sobrang bilis ng request
+                    val code = response.code
+                    response.close()
+                    runOnUi {
+                        elevenLabsBusy = false
+                        addVoiceLogEntry("Azure TTS", "HTTP $code - fallback sa lokal na TTS")
+                        statusText.text = tr("⚠️ Azure TTS error ({0}) - gamit muna lokal na TTS", code)
+                        speakWithLocalTts(clean)
+                    }
+                    return
+                }
+                val audioBytes = try { response.body?.bytes() } catch (e: Exception) { null } finally { response.close() }
+                if (audioBytes == null || audioBytes.isEmpty()) {
+                    runOnUi {
+                        elevenLabsBusy = false
+                        addVoiceLogEntry("Azure TTS", "Walang laman ang sagot - fallback sa lokal na TTS")
+                        speakWithLocalTts(clean)
+                    }
+                    return
+                }
+                writeElevenCache(clean, audioBytes)
+                runOnUi { playElevenLabsAudio(audioBytes, clean) }
+            }
+        })
+    }
+
+    private fun fetchAzureToCache(phrase: String) {
+        if (shuttingDown || !azureActive()) return
+        ttsClient.newCall(buildAzureRequest(phrase)).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                val bytes = try { if (response.isSuccessful) response.body?.bytes() else null } catch (e: Exception) { null }
+                response.close()
+                if (bytes != null) writeElevenCache(phrase, bytes)
+            }
+        })
+    }
+
+    private fun showAzureTtsDialog() {
+        val oldEnabled = azureEnabled
+        val oldKey = azureKey
+        val oldRegion = azureRegion
+        val oldVoice = azureVoice
+        val oldPitch = azurePitchPct
+        val oldRate = azureRatePct
+
+        val enabledSwitch = Switch(this).apply {
+            text = tr("☁️  Gamitin ang Azure TTS (una sa ElevenLabs at boses ng phone)")
+            isChecked = azureEnabled
+            setPadding(0, 16, 0, 8)
+        }
+        val note = TextView(this).apply {
+            text = tr("Kailangan ng Azure Speech resource (may free F0 tier para sa neural voices) at internet. Ilagay ang Key at Region ng resource mo (hal. southeastasia). Kapag nag-fail ang Azure, babagsak sa boses ng phone.")
+            textSize = 12f
+            setPadding(0, 0, 0, 16)
+        }
+        val keyInput = EditText(this).apply {
+            hint = "Azure Speech Key"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            setText(oldKey)
+        }
+        val regionInput = EditText(this).apply {
+            hint = "Region (hal. southeastasia, eastus)"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(oldRegion)
+        }
+        val voiceLabel = TextView(this).apply {
+            text = tr("Boses (pumili sa baba o i-type ang voice name):")
+            setPadding(0, 16, 0, 0)
+        }
+        val voiceInput = EditText(this).apply {
+            hint = "fil-PH-BlessicaNeural"
+            inputType = InputType.TYPE_CLASS_TEXT
+            setText(oldVoice)
+        }
+        fun voiceButton(label: String, name: String) = Button(this).apply {
+            text = label
+            textSize = 11f
+            isAllCaps = false
+            setOnClickListener { voiceInput.setText(name) }
+        }
+        val voiceRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(voiceButton("Blessica ♀", "fil-PH-BlessicaNeural"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(voiceButton("Angelo ♂", "fil-PH-AngeloNeural"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(voiceButton("Rosa ♀ EN", "en-PH-RosaNeural"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(voiceButton("James ♂ EN", "en-PH-JamesNeural"), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        // Pitch at bilis: -50% .. +100% (progress 0..150)
+        val pitchLabel = TextView(this).apply { setPadding(0, 16, 0, 0) }
+        val rateLabel = TextView(this).apply { setPadding(0, 16, 0, 0) }
+        fun pct(v: Int) = String.format(Locale.US, "%+d%%", v)
+        fun refreshLabels(pitch: Int, rate: Int) {
+            pitchLabel.text = tr("Pitch (taas ng boses): {0}", pct(pitch))
+            rateLabel.text = tr("Bilis: {0}", pct(rate))
+        }
+        val pitchBar = SeekBar(this).apply { max = 150; progress = oldPitch + 50 }
+        val rateBar = SeekBar(this).apply { max = 150; progress = oldRate + 50 }
+        val barListener = object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                refreshLabels(pitchBar.progress - 50, rateBar.progress - 50)
+            }
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {}
+        }
+        pitchBar.setOnSeekBarChangeListener(barListener)
+        rateBar.setOnSeekBarChangeListener(barListener)
+        refreshLabels(oldPitch, oldRate)
+
+        fun preset(label: String, pitch: Int, rate: Int) = Button(this).apply {
+            text = label
+            isAllCaps = false
+            setOnClickListener {
+                pitchBar.progress = pitch + 50
+                rateBar.progress = rate + 50
+            }
+        }
+        val presetRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(preset(tr("Normal"), 0, 0), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("🤖 Cute"), 30, 10), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("🐿️ Sobrang cute"), 60, 15), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(preset(tr("Malalim"), -25, -5), LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        fun saveFields() {
+            azureKey = keyInput.text.toString()
+            azureRegion = regionInput.text.toString()
+            azureVoice = voiceInput.text.toString()
+            azurePitchPct = pitchBar.progress - 50
+            azureRatePct = rateBar.progress - 50
+        }
+
+        val testButton = Button(this).apply {
+            text = tr("▶  Subukan ang Azure boses")
+            isAllCaps = false
+            setOnClickListener {
+                saveFields()   // isinasave na para marinig agad (ibabalik kung Cancel)
+                if (azureKey.isBlank()) {
+                    statusText.text = tr("Ilagay muna ang Azure Key")
+                } else {
+                    ensureMaxMediaVolume()
+                    speakWithAzure(applyPronunciations(cleanForSpeech(tr("Kumusta! Ako si Rustech, ang robot mo."))))
+                }
+            }
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(enabledSwitch)
+            addView(note)
+            addView(keyInput)
+            addView(regionInput)
+            addView(voiceLabel)
+            addView(voiceInput)
+            addView(voiceRow)
+            addView(presetRow)
+            addView(pitchLabel)
+            addView(pitchBar)
+            addView(rateLabel)
+            addView(rateBar)
+            addView(testButton)
+        }
+
+        ModernDialog()
+            .setTitle("☁️ Azure TTS")
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                saveFields()
+                azureEnabled = enabledSwitch.isChecked
+                elevenPrefetchDone = false      // bagong boses/pitch = bagong cache
+                prefetchElevenLabsPhrases()
+                statusText.text = if (azureActive()) tr("☁️ Azure TTS: naka-on") else tr("☁️ Azure TTS: naka-off")
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                azureEnabled = oldEnabled        // ibalik ang dati kung na-test lang
+                azureKey = oldKey
+                azureRegion = oldRegion
+                azureVoice = oldVoice
+                azurePitchPct = oldPitch
+                azureRatePct = oldRate
+            }
+            .showImmersive()
+    }
+
     // ---------- ElevenLabs cache para sa maiikling linya (wake replies, atbp.) ----------
     private val elevenCacheDir: File
         get() = File(filesDir, "tts_cache").also { it.mkdirs() }
 
     private fun elevenCacheFile(text: String): File {
         val md = java.security.MessageDigest.getInstance("MD5")
-        val key = md.digest("$elevenLabsVoiceId|eleven_multilingual_v2|$text".toByteArray())
+        val key = md.digest("${ttsCacheTag()}|$text".toByteArray())
             .joinToString("") { "%02x".format(it) }
         return File(elevenCacheDir, "el_$key.mp3")
     }
@@ -4805,7 +5074,7 @@ class MainActivity : ComponentActivity() {
 
     /** Kunin na nang maaga ang mga fixed na sagot sa wake word, para instant na ang unang "Po?". */
     private fun prefetchElevenLabsPhrases() {
-        if (elevenPrefetchDone || !elevenLabsEnabled || elevenLabsApiKey.isBlank()) return
+        if (elevenPrefetchDone || !(azureActive() || (elevenLabsEnabled && elevenLabsApiKey.isNotBlank()))) return
         elevenPrefetchDone = true
         val phrases = (wakeReplies + tr("Po? Sandali, hahanapin kita."))
             .map { applyPronunciations(cleanForSpeech(it)) }
@@ -4817,6 +5086,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun fetchElevenLabsToCache(phrase: String) {
+        if (azureActive()) { fetchAzureToCache(phrase); return }
         if (shuttingDown || !elevenLabsEnabled || elevenLabsApiKey.isBlank()) return
         val json = JSONObject().apply {
             put("text", phrase)
