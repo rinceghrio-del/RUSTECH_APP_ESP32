@@ -2681,6 +2681,11 @@ class MainActivity : ComponentActivity() {
     private fun speakCustomGreeting(subject: String, name: String): Boolean {
         val lines = greetingLinesFor(subject)
         if (lines.isEmpty()) return false
+        // Ang "Mga bati" ay para sa TTS ng phone. Dati, kapag may nakasulat dito, laging "nagagamit" ito
+        // (return true) kahit OFF ang app TTS - kaya tahimik ang robot at hindi na umaabot sa DFPlayer tracks.
+        // Ngayon: kapag OFF ang TTS at pwede ang DFPlayer (OFF din ang Gemini), HINDI gagamitin ang text -
+        // ipapasa sa DFPlayer tracks. (OFF ang TTS pero ON ang Gemini = tahimik na mode, walang gagawin.)
+        if (!appTtsEnabled) return !dfPlayerAllowed()
         speak(lines.random().replace("{name}", name))
         return true
     }
