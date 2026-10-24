@@ -2,6 +2,8 @@ package com.example.facerobot
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.Context
+import android.animation.ValueAnimator
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -39,6 +41,7 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.animation.DecelerateInterpolator
+import android.view.animation.LinearInterpolator
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -112,6 +115,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var rootLayout: FrameLayout
     private lateinit var previewView: PreviewView
     private lateinit var roboEyesView: RoboEyesView
+    private lateinit var zzzView: ZzzView
     private lateinit var capturedPhotoView: ImageView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
@@ -852,6 +856,7 @@ class MainActivity : ComponentActivity() {
         headScanHandler.post(headScanWatcherRunnable)
         observeHandler.postDelayed(observeTickRunnable, 8000L)
         pitHandler.postDelayed(pitPollRunnable, 3000L)
+        autoSleepHandler.postDelayed(autoSleepRunnable, 15_000L)
 
         initTts(preferredTtsEngine)
 
@@ -1077,6 +1082,7 @@ class MainActivity : ComponentActivity() {
         rootLayout = FrameLayout(this)
         previewView = PreviewView(this)
         roboEyesView = RoboEyesView(this)
+        zzzView = ZzzView(this).apply { visibility = View.GONE }
         capturedPhotoView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             setBackgroundColor(0xFF000000.toInt())
@@ -1181,6 +1187,15 @@ class MainActivity : ComponentActivity() {
         rootLayout.addView(
             roboEyesView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
+        // "zzz" ng sleep mode: nasa kanang-taas ng mata. I-TUNE ang margin/laki dito kung kailangan.
+        rootLayout.addView(
+            zzzView,
+            FrameLayout.LayoutParams(dpPx(170), dpPx(150)).apply {
+                gravity = Gravity.TOP or Gravity.END
+                topMargin = (resources.displayMetrics.heightPixels * 0.12f).toInt()
+                rightMargin = (resources.displayMetrics.widthPixels * 0.12f).toInt()
+            }
         )
         // Nasa ibabaw ng lahat (roboEyesView/previewView) - dito ipinapakita ang nakuhang
         // litrato pagkatapos mag-"take a picture". GONE by default.
@@ -1947,6 +1962,7 @@ class MainActivity : ComponentActivity() {
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
+            makeCard("😴", tr("Sleep Mode"), if (sleepIdleMinutes > 0) tr("Auto: {0} min", sleepIdleMinutes.toString()) else tr("Mano-mano")) { showSleepDialog() },
             makeCard("🕳️", tr("Pit Sensor"), if (pitEnabled) tr("Naka-on") else tr("Naka-off")) { showPitDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
@@ -2494,9 +2510,9 @@ class MainActivity : ComponentActivity() {
                 lastPetLabelSeen = null
             }
 
-            if (consecutivePersonDetections >= requiredPersonDetections()) {
+            if (!robotSleeping && consecutivePersonDetections >= requiredPersonDetections()) {
                 rootLayout.postDelayed({
-                    if (appState == AppState.EYES && consecutivePersonDetections >= requiredPersonDetections()) {
+                    if (!robotSleeping && appState == AppState.EYES && consecutivePersonDetections >= requiredPersonDetections()) {
                         showCameraUi()
                     }
                 }, 350)
@@ -2691,6 +2707,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun greetIfNeeded(name: String) {
+        if (robotSleeping) return
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
         if (alreadyGreetedRecently) return
@@ -2718,6 +2735,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun greetUnknownIfNeeded() {
+        if (robotSleeping) return
         val now = System.currentTimeMillis()
         if (now - lastUnknownGreetTime < greetingCooldownMs) return
         lastUnknownGreetTime = now
@@ -2740,6 +2758,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun greetPetIfNeeded(label: String) {
+        if (robotSleeping) return
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
         lastPetGreetTime = now
@@ -2993,7 +3012,7 @@ class MainActivity : ComponentActivity() {
 
     private val voskListener = object : VoskListener {
         override fun onPartialResult(hypothesis: String?) {
-            if (!wakeEnabled) return
+            if (!wakeEnabled && !robotSleeping) return
             val partial = try { JSONObject(hypothesis ?: "").optString("partial", "") } catch (e: Exception) { "" }
             runOnUi { onPartialWakeCandidate(partial) }
         }
@@ -3068,7 +3087,8 @@ class MainActivity : ComponentActivity() {
         val stopHeard = hasStopWord(candidates.map { it.first })
         // Ang wake word ay madalas mahina o mali ang dinig (brand name na wala sa vocabulary ng Vosk),
         // kaya mas mababang bar - pero kapag natutulog lang ang robot. Kapag gising na, normal na threshold.
-        val wakeHeard = wakeEnabled && System.currentTimeMillis() >= awakeUntil &&
+        lastVoiceActivityTime = System.currentTimeMillis()
+        val wakeHeard = (wakeEnabled || robotSleeping) && (robotSleeping || System.currentTimeMillis() >= awakeUntil) &&
             candidates.any { stripWakeWord(it.first) != null }
         val threshold = if (wakeHeard) micConfidenceThreshold * 0.6f else micConfidenceThreshold
         if (!stopHeard && topConfidence < threshold) {
@@ -3424,6 +3444,238 @@ class MainActivity : ComponentActivity() {
         roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
     }
 
+    // ======================= SLEEP MODE =======================
+    // "Matulog ka muna" -> kalahating nakapikit ang mata (SLEEPY), gumagalaw na "zzz" sa kanang-taas ng mata,
+    // naka-tungo ang servo, at hindi na papansinin ang kahit ano (tracking, bati, kusang komento) MALIBAN sa wake word.
+    // Ang wake word ("Rustech") ang gigising sa kanya - GUMAGANA ITO KAHIT NAKA-OFF ANG WAKE WORD SA SETTINGS.
+    // Pwede ring matulog nang kusa kapag walang tao/utos/galaw sa loob ng ilang minuto (Menu > Sleep Mode).
+    // Boses: DFPlayer track LANG kapag OFF ang Gemini at OFF ang app TTS; kung hindi, TTS (gaya ng ibang boses).
+    @Volatile private var robotSleeping = false
+    private var sleepPrevServo = -1f
+    @Volatile private var lastVoiceActivityTime = System.currentTimeMillis()
+    private val sleepServoAngle = 20      // naka-tungo: mas malapit sa 0 = mas pababa (ITAAS kung sobrang yuko)
+    private val sleepMoodHandler = Handler(android.os.Looper.getMainLooper())
+    private val autoSleepHandler = Handler(android.os.Looper.getMainLooper())
+
+    private val defaultSleepPhrases = "matulog ka muna\ntulog ka muna\nmatulog ka na\nsleep mode\ngo to sleep"
+    private var sleepPhrasesRaw: String
+        get() = prefs.getString("sleep_phrases", null) ?: defaultSleepPhrases
+        set(value) { prefs.edit().putString("sleep_phrases", value).apply() }
+    private var sleepSayText: String
+        get() = prefs.getString("sleep_say_text", null) ?: "Sige, matutulog muna ako. Gisingin mo lang ako kapag kailangan mo ako."
+        set(value) { prefs.edit().putString("sleep_say_text", value).apply() }
+    private var sleepWakeText: String
+        get() = prefs.getString("sleep_wake_text", null) ?: "Gising na po ako! Ano po 'yun?"
+        set(value) { prefs.edit().putString("sleep_wake_text", value).apply() }
+    private var sleepIdleMinutes: Int       // 0 = hindi matutulog nang kusa
+        get() = prefs.getInt("sleep_idle_minutes", 10).coerceIn(0, 240)
+        set(value) { prefs.edit().putInt("sleep_idle_minutes", value.coerceIn(0, 240)).apply() }
+    private var sleepTrack: Int
+        get() = prefs.getInt("sleep_track", 0)
+        set(value) { prefs.edit().putInt("sleep_track", value.coerceAtLeast(0)).apply() }
+    private var sleepWakeTrack: Int
+        get() = prefs.getInt("sleep_wake_track", 0)
+        set(value) { prefs.edit().putInt("sleep_wake_track", value.coerceAtLeast(0)).apply() }
+
+    private fun sleepPhraseList(): List<String> =
+        sleepPhrasesRaw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+
+    private fun sleepMood(): RoboEyesView.Mood =
+        RoboEyesView.Mood.fromKey("SLEEPY") ?: RoboEyesView.Mood.IDLE
+
+    /** DFPlayer track kapag pwede (OFF ang Gemini at OFF ang TTS); kung hindi, TTS ng app. */
+    private fun sleepSay(text: String, track: Int) {
+        if (dfPlayerAllowed()) {
+            if (track > 0) sendTrackDirect(track)
+        } else {
+            speak(text)
+        }
+    }
+
+    private val sleepMoodRunnable = object : Runnable {
+        override fun run() {
+            if (!robotSleeping || shuttingDown) return
+            // Siguraduhing nananatili ang antok na mata (may ibang code na nagpapalit ng mood paminsan-minsan)
+            roboEyesView.setMood(sleepMood())
+            sleepMoodHandler.postDelayed(this, 2000L)
+        }
+    }
+
+    private fun enterSleepMode(source: String, auto: Boolean = false) {
+        if (robotSleeping) return
+        cancelPersonSearch()
+        headScanActive = false
+        queuedGeminiCandidates = null
+        robotSleeping = true
+        awakeUntil = 0L
+        if (appState == AppState.CAMERA) showEyesUi()   // balik sa mata (hindi camera view)
+        sendCommandToEsp32("STOP")                      // huminto (kung face-tracking mode)
+
+        // Naka-tungo (servo lang - walang galaw ng motor)
+        sleepPrevServo = outputServoAngle
+        outputServoAngle = sleepServoAngle.toFloat()
+        smoothedServoAngle = sleepServoAngle.toFloat()
+        sendServoOnly(sleepServoAngle)
+
+        // Antok na mata + gumagalaw na zzz
+        roboEyesView.clearFlash()
+        roboEyesView.setMood(sleepMood())
+        if (showRoboEyes) zzzView.start()
+        sleepMoodHandler.removeCallbacksAndMessages(null)
+        sleepMoodHandler.postDelayed(sleepMoodRunnable, 2000L)
+
+        statusText.text = tr("😴 Natutulog... (sabihin ang wake word para gisingin)")
+        addVoiceLogEntry(source, if (auto) "😴 natulog (walang ginagawa)" else "😴 sleep mode")
+        sleepSay(sleepSayText, sleepTrack)
+    }
+
+    private fun wakeUpFromSleep(rawHeard: String, early: Boolean) {
+        if (!robotSleeping) return
+        robotSleeping = false
+        sleepMoodHandler.removeCallbacksAndMessages(null)
+        zzzView.stop()
+        roboEyesView.clearFlash()
+        roboEyesView.setMood(RoboEyesView.Mood.IDLE)
+
+        val now = System.currentTimeMillis()
+        val restore = if (sleepPrevServo >= 0f) sleepPrevServo else personSearchTilts[0].toFloat()
+        outputServoAngle = restore
+        smoothedServoAngle = restore
+        sendServoOnly(restore.toInt())
+
+        lastVoiceActivityTime = now
+        awakeUntil = now + wakeWindowSec * 1000L
+        if (early) { earlyAckPending = true; earlyAckTime = now }   // para hindi na ulitin ng final result
+
+        flashWakeEyes()
+        statusText.text = tr("🔔 Gising na!")
+        addVoiceLogEntry(rawHeard, if (early) "🔔 gising mula sa tulog (agad)" else "🔔 gising mula sa tulog")
+        sleepSay(sleepWakeText, sleepWakeTrack)
+        // Kakagising lang at walang nakikitang tao? Hanapin ang tumatawag (gaya ng wake word)
+        if (personSearchBlockedReason() == null) startPersonSearch(rawHeard, flashSearchEyes = false)
+    }
+
+    /** "matulog ka muna" - lokal (gumagana kahit naka-off ang Gemini). */
+    private fun tryHandleSleepCommand(candidates: List<String>): String? {
+        val phrases = sleepPhraseList()
+        if (phrases.isEmpty() || candidates.none { t -> phrases.any { t.contains(it) } }) return null
+        if (navActive || navCalibrating || navTestMode) {
+            speak(tr("Nasa AUTO mode pa ako. Sabihin mo muna ang \"hinto\"."))
+            return "tulog: nasa AUTO mode"
+        }
+        enterSleepMode("voice")
+        return "😴 sleep mode"
+    }
+
+    private val autoSleepRunnable = object : Runnable {
+        override fun run() {
+            if (shuttingDown) return
+            try { autoSleepCheck() } catch (_: Throwable) { }
+            autoSleepHandler.postDelayed(this, 10_000L)
+        }
+    }
+
+    /** Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng sleepIdleMinutes. */
+    private fun autoSleepCheck() {
+        val minutes = sleepIdleMinutes
+        if (minutes <= 0 || robotSleeping) return
+        val now = System.currentTimeMillis()
+        if (navActive || navCalibrating || navTestMode || personSearchActive || headScanActive ||
+            isSpeaking || geminiBusy || observeInFlight || now < pitReactionUntil ||
+            pendingPhotoCapture || pendingVisionCapture != null) return
+        val lastActivity = maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime)
+        if (now - lastActivity >= minutes * 60_000L) enterSleepMode("auto", auto = true)
+    }
+
+    private fun showSleepDialog() {
+        val phrasesInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            setText(sleepPhrasesRaw)
+        }
+        val sayInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            setText(sleepSayText)
+        }
+        val wakeInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            setText(sleepWakeText)
+        }
+        val idleInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(sleepIdleMinutes.toString())
+        }
+        val sleepTrackInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(sleepTrack.toString())
+        }
+        val wakeTrackInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(sleepWakeTrack.toString())
+        }
+
+        fun label(text: String, top: Int = 16) = TextView(this).apply {
+            this.text = text
+            setPadding(0, top, 0, 0)
+        }
+        fun saveFields() {
+            sleepPhrasesRaw = phrasesInput.text.toString()
+            sleepSayText = sayInput.text.toString().trim().ifEmpty { sleepSayText }
+            sleepWakeText = wakeInput.text.toString().trim().ifEmpty { sleepWakeText }
+            idleInput.text.toString().toIntOrNull()?.let { sleepIdleMinutes = it }
+            sleepTrack = sleepTrackInput.text.toString().toIntOrNull() ?: 0
+            sleepWakeTrack = wakeTrackInput.text.toString().toIntOrNull() ?: 0
+        }
+
+        val note = TextView(this).apply {
+            text = tr("Kalahating nakapikit ang mata, may gumagalaw na zzz sa kanang-taas, at naka-tungo ang servo. Ang wake word (\"Rustech\") ang gigising sa kanya - gumagana ito KAHIT NAKA-OFF ang wake word sa settings.")
+            textSize = 12f
+        }
+        val testRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(Button(this@MainActivity).apply {
+                text = tr("😴 Matulog ngayon")
+                isAllCaps = false
+                setOnClickListener { saveFields(); enterSleepMode("test") }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(Button(this@MainActivity).apply {
+                text = tr("⏰ Gisingin")
+                isAllCaps = false
+                setOnClickListener { wakeUpFromSleep("test", early = false) }
+            }, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(note)
+            addView(label(tr("Mga sasabihin para matulog (isang linya bawat isa):")))
+            addView(phrasesInput)
+            addView(label(tr("Sasabihin bago matulog (TTS):")))
+            addView(sayInput)
+            addView(label(tr("Sasabihin paggising (TTS):")))
+            addView(wakeInput)
+            addView(label(tr("Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng (minuto; 0 = hindi matutulog nang kusa):")))
+            addView(idleInput)
+            addView(label(tr("DFPlayer track sa pagtulog (kapag OFF ang Gemini at OFF ang TTS; 0 = wala):")))
+            addView(sleepTrackInput)
+            addView(label(tr("DFPlayer track sa paggising (0 = wala):")))
+            addView(wakeTrackInput)
+            addView(label("", 12))
+            addView(testRow)
+        }
+
+        ModernDialog()
+            .setTitle(tr("😴 Sleep Mode"))
+            .setView(box)
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                saveFields()
+                statusText.text = tr("Na-save ang Sleep Mode settings")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
     // ======================= PIT SENSOR (IR_SENSOR_LEFT=19, IR_SENSOR_RIGHT=16 sa ESP32) =======================
     // Kapag na-trigger ang pit/cliff sensor: titingin sa baba, nagugulat ang mata, sasabihin ang "Ay nako,
     // mahuhulog pala ako dito!" (TTS) o tutugtog ang DFPlayer track (default 75) kapag naka-OFF ang app TTS,
@@ -3678,6 +3930,7 @@ class MainActivity : ComponentActivity() {
             observeInFlight = false
             if (pendingVisionCapture === observeCaptureCallback) pendingVisionCapture = null
         }
+        if (robotSleeping) return                                   // tulog - tahimik
         if (!observeEnabled || !geminiEnabled || geminiApiKey.isBlank()) return
         if (observeInFlight || geminiBusy || isSpeaking || elevenLabsBusy) return
         if (pendingVisionCapture != null || pendingPhotoCapture) return
@@ -3898,7 +4151,7 @@ class MainActivity : ComponentActivity() {
 
     /** Tinatawag sa main thread sa bawat partial result ng kahit anong engine. */
     private fun onPartialWakeCandidate(rawPartial: String) {
-        if (!wakeEnabled || isSpeaking || shuttingDown) return
+        if ((!wakeEnabled && !robotSleeping) || isSpeaking || shuttingDown) return
         val text = rawPartial.trim()
         val wakeOnly = text.isNotEmpty() && stripWakeWord(text) == ""   // may wake word at WALANG kasunod
         if (!wakeOnly) {
@@ -3914,7 +4167,7 @@ class MainActivity : ComponentActivity() {
             earlyAckPending = true
             earlyAckTime = now
             awakeUntil = now + wakeWindowSec * 1000L
-            performWakeAck(text, early = true)
+            if (robotSleeping) wakeUpFromSleep(text, early = true) else performWakeAck(text, early = true)
         }, partialWakeStableMs)
     }
 
@@ -4023,6 +4276,16 @@ class MainActivity : ComponentActivity() {
      * (wake word lang ang sinabi, o natutulog ang robot at walang wake word).
      */
     private fun applyWakeGate(rawCandidates: List<String>, rawHeard: String): List<String>? {
+        // Kagigising lang mula sa tulog (maaga, mula sa partial) at naka-OFF ang wake word sa settings:
+        // huwag ipasa sa utos ang "Rustech" na final result.
+        if (!wakeEnabled && earlyAckPending && System.currentTimeMillis() - earlyAckTime < 5000L) {
+            val earlyRests = rawCandidates.map { stripWakeWord(it) }
+            if (earlyRests.any { it != null }) {
+                earlyAckPending = false
+                val rem = earlyRests.filterNotNull().filter { it.isNotBlank() }
+                return if (rem.isEmpty()) null else rem
+            }
+        }
         if (!wakeEnabled) return rawCandidates
         val now = System.currentTimeMillis()
         val windowMs = wakeWindowSec * 1000L
@@ -4056,6 +4319,24 @@ class MainActivity : ComponentActivity() {
     private fun handleVoiceCommand(rawCandidates: List<String>) {
         val rawHeard = rawCandidates.firstOrNull() ?: return
 
+        // SLEEP MODE: tulog ang robot - ang wake word LANG ang papansinin, KAHIT naka-OFF ang wake word sa settings.
+        var wokeWithCommand: List<String>? = null
+        if (robotSleeping) {
+            val sleepRests = rawCandidates.map { stripWakeWord(it) }
+            if (sleepRests.none { it != null }) {
+                addVoiceLogEntry(rawHeard, "😴 natutulog (walang wake word)")
+                return
+            }
+            wakeUpFromSleep(rawHeard, early = false)
+            val rem = sleepRests.filterNotNull().filter { it.isNotBlank() }
+            if (rem.isEmpty()) return            // "Rustech" lang - gising na
+            if (hasStopWord(rem)) {
+                addVoiceLogEntry(rawHeard, doVoiceStop())
+                return
+            }
+            wokeWithCommand = rem                // may kasamang utos ("Rustech, kumusta?") - ituloy
+        }
+
         // 0) KALIGTASAN: STOP ang pinakaunang tsine-check sa LAHAT ng alternatives, bago ang Gemini,
         // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
@@ -4066,7 +4347,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
-        val candidates = applyWakeGate(rawCandidates, rawHeard) ?: return
+        val candidates = wokeWithCommand ?: applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
@@ -4077,6 +4358,12 @@ class MainActivity : ComponentActivity() {
 
         // "ikuwento mo ang nakikita mo" / "wag ka nang magkomento" - i-on/i-off ang kusang paningin
         tryHandleObserveToggleCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
+        // "matulog ka muna" - sleep mode (lokal; mauuna sa Gemini)
+        tryHandleSleepCommand(candidates)?.let { result ->
             addVoiceLogEntry(heardText, result)
             return
         }
@@ -5308,6 +5595,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
         val now = System.currentTimeMillis()
+        if (robotSleeping) return            // tulog: walang tracking motor/servo command
         if (now < pitReactionUntil) return   // nagre-react sa pit: huwag gumalaw/ibalik ang servo hanggang matapos
         if (now - lastSendTime < sendIntervalMs) return
         lastSendTime = now
@@ -6801,6 +7089,9 @@ class MainActivity : ComponentActivity() {
         personSearchHandler.removeCallbacksAndMessages(null)
         geminiQueueHandler.removeCallbacksAndMessages(null)
         earlyWakeHandler.removeCallbacksAndMessages(null)
+        sleepMoodHandler.removeCallbacksAndMessages(null)
+        autoSleepHandler.removeCallbacksAndMessages(null)
+        zzzView.stop()
         observeHandler.removeCallbacksAndMessages(null)
         pitHandler.removeCallbacksAndMessages(null)
 
@@ -6826,5 +7117,58 @@ class MainActivity : ComponentActivity() {
         elevenLabsPlayer?.release()
         releaseVosk()
         releaseAndroidRecognizer()
+    }
+}
+
+
+/**
+ * Gumagalaw na "z Z Z" para sa Sleep Mode: tatlong titik na unti-unting lumalaki habang umaakyat pakanan-taas
+ * at nawawala, paulit-ulit. Walang ginagawa kapag hindi tulog (GONE at walang animator).
+ */
+class ZzzView(context: Context) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = 0xFFD6DEFF.toInt()
+        typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD_ITALIC)
+        textAlign = Paint.Align.CENTER
+    }
+    private var progress = 0f
+    private var animator: ValueAnimator? = null
+    private val letters = arrayOf("z", "Z", "Z")
+
+    fun start() {
+        visibility = VISIBLE
+        if (animator?.isRunning == true) return
+        animator = ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 3600L
+            repeatCount = ValueAnimator.INFINITE
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                progress = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    fun stop() {
+        animator?.cancel()
+        animator = null
+        visibility = GONE
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        if (w <= 0f || h <= 0f) return
+        for (i in letters.indices) {
+            // bawat titik ay may sariling yugto (naka-stagger) 0..1
+            val p = (progress + i / 3f) % 1f
+            val alpha = (Math.sin(p * Math.PI).toFloat().coerceIn(0f, 1f) * 255f).toInt()
+            paint.alpha = alpha
+            paint.textSize = h * (0.20f + 0.09f * i) * (0.75f + 0.5f * p)
+            val x = w * (0.12f + 0.62f * p) + i * w * 0.04f
+            val y = h * (0.92f - 0.80f * p)
+            canvas.drawText(letters[i], x, y, paint)
+        }
     }
 }
