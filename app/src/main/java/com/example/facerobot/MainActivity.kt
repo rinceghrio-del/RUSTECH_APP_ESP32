@@ -3484,6 +3484,21 @@ class MainActivity : ComponentActivity() {
         RoboEyesView.Mood.fromKey("SLEEPY") ?: RoboEyesView.Mood.IDLE
 
     /** DFPlayer track kapag pwede (OFF ang Gemini at OFF ang TTS); kung hindi, TTS ng app. */
+    /**
+     * Sabihin sa firmware (V5.4.2) na tulog ang app: patay ang ultrasonic distance-keeper/atras/presence trigger
+     * (ang pit sensors ay patuloy para sa kaligtasan). Inuulit ito habang tulog (heartbeat); mag-e-expire ang flag
+     * sa firmware kapag tumigil ang heartbeat (hal. nag-crash ang app o nawala ang WiFi).
+     */
+    private fun sendSleepFlag(on: Boolean) {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=${if (on) "SLEEP_ON" else "SLEEP_OFF"}")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) { response.close() }
+        })
+    }
+
     private fun sleepSay(text: String, track: Int) {
         if (dfPlayerAllowed()) {
             if (track > 0) sendTrackDirect(track)
@@ -3497,6 +3512,7 @@ class MainActivity : ComponentActivity() {
             if (!robotSleeping || shuttingDown) return
             // Siguraduhing nananatili ang antok na mata (may ibang code na nagpapalit ng mood paminsan-minsan)
             roboEyesView.setMood(sleepMood())
+            sendSleepFlag(true)   // heartbeat: panatilihing patay ang ultrasonic sa firmware habang tulog
             sleepMoodHandler.postDelayed(this, 2000L)
         }
     }
@@ -3510,6 +3526,7 @@ class MainActivity : ComponentActivity() {
         awakeUntil = 0L
         if (appState == AppState.CAMERA) showEyesUi()   // balik sa mata (hindi camera view)
         sendCommandToEsp32("STOP")                      // huminto (kung face-tracking mode)
+        sendSleepFlag(true)                             // patayin ang ultrasonic abante/atras sa firmware
 
         // Naka-tungo (servo lang - walang galaw ng motor)
         sleepPrevServo = outputServoAngle
@@ -3533,6 +3550,7 @@ class MainActivity : ComponentActivity() {
         if (!robotSleeping) return
         robotSleeping = false
         sleepMoodHandler.removeCallbacksAndMessages(null)
+        sendSleepFlag(false)                            // ibalik ang ultrasonic sa firmware
         zzzView.stop()
         roboEyesView.clearFlash()
         roboEyesView.setMood(RoboEyesView.Mood.IDLE)
