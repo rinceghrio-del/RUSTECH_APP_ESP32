@@ -3,6 +3,7 @@ package com.example.facerobot
 import android.content.Context
 import android.graphics.Bitmap
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MPImage
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
@@ -60,8 +61,8 @@ class HandGestureTracker(
                 .setMinHandDetectionConfidence(0.5f)
                 .setMinHandPresenceConfidence(0.5f)
                 .setMinTrackingConfidence(0.5f)
-                .setResultListener { result, _ -> handleResult(result) }
-                .setErrorListener { e -> onError(e.message ?: "hand tracker error") }
+                .setResultListener { result: HandLandmarkerResult, _: MPImage -> handleResult(result) }
+                .setErrorListener { e: RuntimeException -> onError(e.message ?: "hand tracker error") }
                 .build()
             landmarker = HandLandmarker.createFromOptions(context, options)
             ready = true
