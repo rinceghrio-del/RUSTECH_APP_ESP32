@@ -3473,6 +3473,7 @@ class MainActivity : ComponentActivity() {
     // Kontrol: pinch (thumb + index) sa candy, tapos i-drag papunta sa katabi = palit. May touch din (pang-test).
     // Kailangan: assets/hand_landmarker.task at ang gradle dependency ng MediaPipe tasks-vision.
     @Volatile private var gameModeActive = false
+    private val gameServoAngle = 100      // servo habang naglalaro: mas mataas = pataas ang tingin (para makita ang kamay mo)
     private var handTracker: HandGestureTracker? = null
     private var gamePrevServo = -1f
     private var lastHandFrameTime = 0L
@@ -3524,9 +3525,9 @@ class MainActivity : ComponentActivity() {
         sendCommandToEsp32("STOP")
         sendSleepFlag(true)   // patay ang ultrasonic abante/atras/presence trigger ng firmware (V5.4.2)
 
-        // Itaas/gitnang tingin para makita ang kamay mo
+        // Itaas ang tingin (gameServoAngle) para makita ang kamay mo
         gamePrevServo = outputServoAngle
-        val tilt = personSearchTilts[0]
+        val tilt = gameServoAngle
         outputServoAngle = tilt.toFloat()
         smoothedServoAngle = tilt.toFloat()
         sendServoOnly(tilt)
@@ -3774,6 +3775,17 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /** Gisingin ang ESP32 mula sa sleep nito (firmware V5.4.3) papunta sa STATE_BOOT_WAIT. Walang epekto kung hindi tulog. */
+    private fun sendWakeEsp32() {
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=WAKE")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) { response.close() }
+        })
+    }
+
     private fun sleepSay(text: String, track: Int) {
         if (dfPlayerAllowed()) {
             if (track > 0) sendTrackDirect(track)
@@ -3826,6 +3838,7 @@ class MainActivity : ComponentActivity() {
         robotSleeping = false
         sleepMoodHandler.removeCallbacksAndMessages(null)
         sendSleepFlag(false)                            // ibalik ang ultrasonic sa firmware
+        sendWakeEsp32()                                 // gisingin din ang ESP32 (kung tulog) -> BOOT_WAIT
         zzzView.stop()
         roboEyesView.clearFlash()
         roboEyesView.setMood(RoboEyesView.Mood.IDLE)
@@ -4466,6 +4479,7 @@ class MainActivity : ComponentActivity() {
 
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
+        if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
         statusText.text = tr("🔔 Gising - sabihin ang utos")
         flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
         // Walang nakikitang tao (hal. nakatalikod ang robot)? Hanapin muna ang tumatawag.
@@ -6057,6 +6071,8 @@ class MainActivity : ComponentActivity() {
         if (!started) autoFindBusy = false
     }
 
+    @Volatile private var espSleepingLast = false   // huling nabasang estado: tulog ba ang ESP32?
+
     private fun onEspPingResult(body: String?) {
         if (body == null) {
             pingFailCount++
@@ -6070,6 +6086,15 @@ class MainActivity : ComponentActivity() {
         // "PONG|MOVING" o "PONG|MOVING|PIT=L" - ang STATE lang ang kukunin
         val state = if (body.startsWith("PONG|")) body.substringAfter("|").substringBefore("|").trim() else ""
         val inNavState = state == "MOVING" || state.startsWith("AVOIDING")
+
+        // Natutulog ba ang ESP32 mismo? (hal. maraming pit trigger = "stuck" -> STATE_SLEEPING_IR). Kapag pumasok
+        // ito sa sleep, sabay ding matutulog ang app. Edge-trigger lang (hindi uulit-ulitin habang tulog pa).
+        val espSleeping = state == "SLEEPING_IR" || state == "SLEEP_ALERT" || state == "SLEEP_ULTRASONIC_OSC"
+        if (espSleeping && !espSleepingLast) {
+            if (gameModeActive) exitGameMode("esp32 natulog", announce = false)
+            if (!robotSleeping) enterSleepMode("ESP32 natulog (pit/stuck)")
+        }
+        espSleepingLast = espSleeping
 
         if (inNavState) {
             navNonMovingPolls = 0
