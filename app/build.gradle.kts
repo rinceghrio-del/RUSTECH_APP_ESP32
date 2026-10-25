@@ -31,6 +31,9 @@ android {
         // huwag i-compress ang .tflite model files sa assets/, kailangan sila i-mmap
         // nang direkta ng TensorFlow Lite Interpreter
         noCompress += "tflite"
+        // MediaPipe Hand Landmarker model (assets/hand_landmarker.task) - para sa Game Mode (hand gestures).
+        // Pag-iingat lang: hindi rin ico-compress para mabilis at tiyak ang pag-load.
+        noCompress += "task"
     }
     packaging {
         jniLibs {
@@ -65,6 +68,11 @@ dependencies {
 
     // TensorFlow Lite - para sa YOLO person detection at face recognition (embedding) models
     implementation("org.tensorflow:tensorflow-lite:2.14.0")
+
+    // MediaPipe Hand Landmarker - para sa hand gestures ng Game Mode (Candy Crush). Naka-pin ang bersyon para
+    // laging pareho ang build; 0.10.18 ay ginagamit sa mga proyektong may compileSdk 34. Kailangan din ang
+    // app/src/main/assets/hand_landmarker.task
+    implementation("com.google.mediapipe:tasks-vision:0.10.18")
 
     // OkHttp - para sa pagpapadala ng HTTP commands papunta sa ESP32
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
