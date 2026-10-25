@@ -116,6 +116,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var previewView: PreviewView
     private lateinit var roboEyesView: RoboEyesView
     private lateinit var zzzView: ZzzView
+    private lateinit var gameView: GameView
     private lateinit var capturedPhotoView: ImageView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
@@ -483,6 +484,7 @@ class MainActivity : ComponentActivity() {
     private fun personSearchBlockedReason(): String? = when {
         !personSearchEnabled -> "naka-off sa settings"
         navActive || navCalibrating || navTestMode -> "naka-AUTO/nav mode"
+        gameModeActive -> "naglalaro"
         personSearchActive -> "naghahanap na"
         System.currentTimeMillis() - lastPersonSeenTime < personSearchFreshMs -> personSearchBlockVisible
         else -> null
@@ -1212,6 +1214,18 @@ class MainActivity : ComponentActivity() {
             menuButton,
             FrameLayout.LayoutParams(dpPx(54), dpPx(54))
                 .apply { gravity = Gravity.BOTTOM or Gravity.END; bottomMargin = dpPx(16); rightMargin = dpPx(16) }
+        )
+
+        // GAME MODE screen: nasa pinakataas ng lahat; nakatago hanggang "mag laro tayo"
+        gameView = GameView(this).apply {
+            visibility = View.GONE
+            onExitRequested = { exitGameMode("touch") }
+            onGameEvent = { e -> handleGameEvent(e) }
+            onBestScoreChanged = { best -> gameBestScore = best }
+        }
+        rootLayout.addView(
+            gameView,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         )
 
         setContentView(rootLayout)
@@ -1962,6 +1976,7 @@ class MainActivity : ComponentActivity() {
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
+            makeCard("🎮", tr("Laro (Hand Game)"), tr("Best: {0}", gameBestScore.toString())) { showGameDialog() },
             makeCard("😴", tr("Sleep Mode"), if (sleepIdleMinutes > 0) tr("Auto: {0} min", sleepIdleMinutes.toString()) else tr("Mano-mano")) { showSleepDialog() },
             makeCard("🕳️", tr("Pit Sensor"), if (pitEnabled) tr("Naka-on") else tr("Naka-off")) { showPitDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
@@ -2447,6 +2462,12 @@ class MainActivity : ComponentActivity() {
         pendingVisionCapture?.let { callback ->
             pendingVisionCapture = null
             captureFrameForVision(imageProxy, callback)
+            return
+        }
+
+        // GAME MODE: ang frames ay para sa hand tracking ng laro (hindi face/YOLO/nav)
+        if (gameModeActive) {
+            processGameFrame(imageProxy)
             return
         }
 
@@ -3444,6 +3465,260 @@ class MainActivity : ComponentActivity() {
         roboEyesView.flashMood(mood, if (mood == RoboEyesView.Mood.ANGRY) 2000L else 3000L)
     }
 
+    // ======================= GAME MODE: Candy-Crush gamit ang kamay =======================
+    // Voice: "mag laro tayo" -> pumapasok sa Game Mode; "ayaw ko na maglalaro" -> labas at balik sa mata/standby.
+    // Sa Game Mode: ang camera frames ay napupunta sa MediaPipe Hand Landmarker (hindi sa face/YOLO/nav), nakahinto ang
+    // robot, nakataas ang servo, patay ang ultrasonic ng firmware (SLEEP_ON flag - malapit kasi ang kamay mo sa sensor),
+    // at ang tanging papansinin sa boses ay ang "labas" na parirala (hindi kailangan ng wake word).
+    // Kontrol: pinch (thumb + index) sa candy, tapos i-drag papunta sa katabi = palit. May touch din (pang-test).
+    // Kailangan: assets/hand_landmarker.task at ang gradle dependency ng MediaPipe tasks-vision.
+    @Volatile private var gameModeActive = false
+    private var handTracker: HandGestureTracker? = null
+    private var gamePrevServo = -1f
+    private var lastHandFrameTime = 0L
+    private var lastGameSpeakTime = 0L
+    private val gameHandler = Handler(android.os.Looper.getMainLooper())
+
+    private val defaultGameStartPhrases = "mag laro tayo\nmaglaro tayo\nlaro tayo\nlet's play\ngame mode"
+    private val defaultGameExitPhrases =
+        "ayaw ko na maglalaro\nayaw ko nang maglalaro\nayaw ko na maglaro\nayaw ko nang maglaro\nayoko na maglaro\nayoko na maglalaro\ntama na ang laro\ntigil laro\nexit game"
+    private var gameStartPhrasesRaw: String
+        get() = prefs.getString("game_start_phrases", null) ?: defaultGameStartPhrases
+        set(value) { prefs.edit().putString("game_start_phrases", value).apply() }
+    private var gameExitPhrasesRaw: String
+        get() = prefs.getString("game_exit_phrases", null) ?: defaultGameExitPhrases
+        set(value) { prefs.edit().putString("game_exit_phrases", value).apply() }
+    private var gameBestScore: Int
+        get() = prefs.getInt("game_best_score", 0)
+        set(value) { prefs.edit().putInt("game_best_score", value).apply() }
+
+    private fun phraseList(raw: String): List<String> =
+        raw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+
+    private val gameTickRunnable = object : Runnable {
+        override fun run() {
+            if (!gameModeActive || shuttingDown) return
+            sendSleepFlag(true)   // heartbeat: panatilihing patay ang ultrasonic sa firmware habang naglalaro
+            gameHandler.postDelayed(this, 2000L)
+        }
+    }
+
+    /** "mag laro tayo" - lokal (gumagana kahit naka-off ang Gemini). */
+    private fun tryHandleGameStartCommand(candidates: List<String>): String? {
+        val phrases = phraseList(gameStartPhrasesRaw)
+        if (phrases.isEmpty() || candidates.none { t -> phrases.any { t.contains(it) } }) return null
+        if (navActive || navCalibrating || navTestMode) {
+            speak(tr("Nasa AUTO mode pa ako. Sabihin mo muna ang \"hinto\"."))
+            return "laro: nasa AUTO mode"
+        }
+        enterGameMode("voice")
+        return "🎮 game mode"
+    }
+
+    private fun enterGameMode(source: String) {
+        if (gameModeActive || robotSleeping) return
+        cancelPersonSearch()
+        headScanActive = false
+        queuedGeminiCandidates = null
+        if (appState == AppState.CAMERA) showEyesUi()
+        sendCommandToEsp32("STOP")
+        sendSleepFlag(true)   // patay ang ultrasonic abante/atras/presence trigger ng firmware (V5.4.2)
+
+        // Itaas/gitnang tingin para makita ang kamay mo
+        gamePrevServo = outputServoAngle
+        val tilt = personSearchTilts[0]
+        outputServoAngle = tilt.toFloat()
+        smoothedServoAngle = tilt.toFloat()
+        sendServoOnly(tilt)
+
+        gameModeActive = true
+        awakeUntil = 0L
+        roboEyesView.clearFlash()
+        gameView.bestScore = gameBestScore
+        gameView.handStatus = tr("⏳ Inihahanda ang hand tracking...")
+        gameView.visibility = View.VISIBLE
+        gameView.startNewGame()
+        startHandTracker()
+        gameHandler.removeCallbacksAndMessages(null)
+        gameHandler.postDelayed(gameTickRunnable, 2000L)
+
+        statusText.text = tr("🎮 Game Mode")
+        addVoiceLogEntry(source, "🎮 game mode ON")
+        lastGameSpeakTime = System.currentTimeMillis()
+        speak(tr("Sige, maglaro tayo! I-pinch mo ang candy at i-drag papunta sa katabi."))
+    }
+
+    private fun startHandTracker() {
+        val seen = tr("✋ Nakikita ang kamay")
+        val pinch = tr("✋ PINCH - hawak ang candy")
+        val none = tr("Ilagay ang kamay sa harap ng camera")
+        val tracker = HandGestureTracker(
+            context = this,
+            mirrorX = true,   // front camera: i-mirror para parang salamin ang galaw
+            onHand = { state ->
+                runOnUi {
+                    if (gameModeActive) {
+                        gameView.handStatus = when {
+                            state == null -> none
+                            state.pinching -> pinch
+                            else -> seen
+                        }
+                        gameView.onHandState(state)
+                    }
+                }
+            },
+            onError = { msg ->
+                runOnUi {
+                    if (gameModeActive) gameView.handStatus = "⚠️ $msg - touch lang muna"
+                    addVoiceLogEntry("hand tracker", msg)
+                }
+            }
+        )
+        handTracker = tracker
+        cameraExecutor.execute {
+            tracker.start()   // naglo-load ng model - nasa background
+            runOnUi {
+                if (tracker.ready && gameModeActive) gameView.handStatus = none
+            }
+        }
+    }
+
+    private fun exitGameMode(source: String, announce: Boolean = true) {
+        if (!gameModeActive) return
+        gameModeActive = false
+        gameHandler.removeCallbacksAndMessages(null)
+        val finalScore = gameView.currentScore
+        gameView.stopAnimations()
+        gameView.visibility = View.GONE
+        val t = handTracker
+        handTracker = null
+        cameraExecutor.execute { t?.close() }
+
+        sendSleepFlag(false)   // ibalik ang ultrasonic sa firmware
+        val restore = if (gamePrevServo >= 0f) gamePrevServo else personSearchTilts[0].toFloat()
+        outputServoAngle = restore
+        smoothedServoAngle = restore
+        sendServoOnly(restore.toInt())
+
+        showEyesUi()           // balik sa mata (normal idle/standby)
+        val now = System.currentTimeMillis()
+        lastVoiceActivityTime = now
+        awakeUntil = now + wakeWindowSec * 1000L
+        addVoiceLogEntry(source, "🎮 game mode OFF")
+        if (announce) speak(tr("Okay, tapos na ang laro! Ang score mo ay {0}.", finalScore.toString()))
+    }
+
+    /** Mga reaksyon ng robot sa laro (may cooldown para hindi maingay). */
+    private fun handleGameEvent(e: GameEvent) {
+        val now = System.currentTimeMillis()
+        when (e) {
+            is GameEvent.Combo, is GameEvent.BigClear -> {
+                if (now - lastGameSpeakTime > 6000L) {
+                    lastGameSpeakTime = now
+                    speak(listOf(tr("Wow, combo!"), tr("Ang galing mo!"), tr("Sunod-sunod!")).random())
+                }
+            }
+            is GameEvent.Shuffled -> {
+                lastGameSpeakTime = now
+                speak(tr("Wala nang pwedeng galaw, hahaluin ko ulit."))
+            }
+            is GameEvent.GameOver -> {
+                lastGameSpeakTime = now
+                speak(
+                    tr("Tapos na ang laro! Ang score mo ay {0}.", e.score.toString()) +
+                        if (e.newBest) " " + tr("Bagong rekord!") else ""
+                )
+            }
+            else -> {}
+        }
+    }
+
+    /** Ang bawat frame ng camera sa Game Mode: kamay lang ang hinahanap (MediaPipe). */
+    private fun processGameFrame(imageProxy: ImageProxy) {
+        val tracker = handTracker
+        val now = System.currentTimeMillis()
+        if (tracker == null || !tracker.ready || now - lastHandFrameTime < 40L) {
+            imageProxy.close()
+            return
+        }
+        lastHandFrameTime = now
+        try {
+            var bmp = ImageUtils.imageProxyToBitmap(imageProxy)
+            bmp = rotateBitmap(bmp, imageProxy.imageInfo.rotationDegrees)
+            if (bmp.config != Bitmap.Config.ARGB_8888) bmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
+            tracker.detect(bmp, android.os.SystemClock.uptimeMillis())
+        } catch (e: Exception) {
+            e.printStackTrace()
+        } finally {
+            imageProxy.close()
+        }
+    }
+
+    private fun showGameDialog() {
+        val hasModel = try {
+            assets.list("")?.contains(HandGestureTracker.MODEL_ASSET) == true
+        } catch (_: Exception) { false }
+
+        val note = TextView(this).apply {
+            text = if (hasModel)
+                tr("✅ Nakita ang hand_landmarker.task. Sabihin ang \"mag laro tayo\" (kasama ang wake word kung naka-ON) para magsimula, at \"ayaw ko na maglalaro\" para lumabas. I-pinch (thumb + index) ang candy at i-drag papunta sa katabi para magpalit; may touch din ang screen.")
+            else
+                tr("⚠️ Kulang ang assets/hand_landmarker.task - touch lang ang gagana hanggang mailagay mo ito (tingnan ang gabay). Sabihin ang \"mag laro tayo\" para magsimula, at \"ayaw ko na maglalaro\" para lumabas.")
+            textSize = 12f
+            setPadding(0, 0, 0, 12)
+        }
+        val startInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            setText(gameStartPhrasesRaw)
+        }
+        val exitInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            setText(gameExitPhrasesRaw)
+        }
+        fun label(text: String) = TextView(this).apply {
+            this.text = text
+            setPadding(0, 16, 0, 0)
+        }
+        val resetButton = Button(this).apply {
+            text = tr("Reset best score ({0})", gameBestScore.toString())
+            isAllCaps = false
+            setOnClickListener {
+                gameBestScore = 0
+                gameView.resetBest()
+                text = tr("Reset best score ({0})", "0")
+            }
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(note)
+            addView(label(tr("Mga sasabihin para MAGSIMULA (isang linya bawat isa):")))
+            addView(startInput)
+            addView(label(tr("Mga sasabihin para LUMABAS (hindi kailangan ng wake word):")))
+            addView(exitInput)
+            addView(label(""))
+            addView(resetButton)
+        }
+        fun saveFields() {
+            gameStartPhrasesRaw = startInput.text.toString()
+            gameExitPhrasesRaw = exitInput.text.toString()
+        }
+        ModernDialog()
+            .setTitle(tr("🎮 Laro (Hand Game)"))
+            .setView(box)
+            .setPositiveButton(tr("▶ Maglaro")) { _, _ ->
+                saveFields()
+                enterGameMode("menu")
+            }
+            .setNegativeButton(tr("I-save lang")) { _, _ ->
+                saveFields()
+                statusText.text = tr("Na-save ang Laro settings")
+            }
+            .showImmersive()
+    }
+
     // ======================= SLEEP MODE =======================
     // "Matulog ka muna" -> kalahating nakapikit ang mata (SLEEPY), gumagalaw na "zzz" sa kanang-taas ng mata,
     // naka-tungo ang servo, at hindi na papansinin ang kahit ano (tracking, bati, kusang komento) MALIBAN sa wake word.
@@ -3596,7 +3871,7 @@ class MainActivity : ComponentActivity() {
     /** Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng sleepIdleMinutes. */
     private fun autoSleepCheck() {
         val minutes = sleepIdleMinutes
-        if (minutes <= 0 || robotSleeping) return
+        if (minutes <= 0 || robotSleeping || gameModeActive) return
         val now = System.currentTimeMillis()
         if (navActive || navCalibrating || navTestMode || personSearchActive || headScanActive ||
             isSpeaking || geminiBusy || observeInFlight || now < pitReactionUntil ||
@@ -3948,7 +4223,7 @@ class MainActivity : ComponentActivity() {
             observeInFlight = false
             if (pendingVisionCapture === observeCaptureCallback) pendingVisionCapture = null
         }
-        if (robotSleeping) return                                   // tulog - tahimik
+        if (robotSleeping || gameModeActive) return                 // tulog o naglalaro - tahimik
         if (!observeEnabled || !geminiEnabled || geminiApiKey.isBlank()) return
         if (observeInFlight || geminiBusy || isSpeaking || elevenLabsBusy) return
         if (pendingVisionCapture != null || pendingPhotoCapture) return
@@ -4169,7 +4444,7 @@ class MainActivity : ComponentActivity() {
 
     /** Tinatawag sa main thread sa bawat partial result ng kahit anong engine. */
     private fun onPartialWakeCandidate(rawPartial: String) {
-        if ((!wakeEnabled && !robotSleeping) || isSpeaking || shuttingDown) return
+        if ((!wakeEnabled && !robotSleeping) || isSpeaking || shuttingDown || gameModeActive) return
         val text = rawPartial.trim()
         val wakeOnly = text.isNotEmpty() && stripWakeWord(text) == ""   // may wake word at WALANG kasunod
         if (!wakeOnly) {
@@ -4355,6 +4630,18 @@ class MainActivity : ComponentActivity() {
             wokeWithCommand = rem                // may kasamang utos ("Rustech, kumusta?") - ituloy
         }
 
+        // GAME MODE: naglalaro - ang "ayaw ko na maglalaro" LANG ang papansinin (hindi kailangan ng wake word)
+        if (gameModeActive) {
+            val exitPhrases = phraseList(gameExitPhrasesRaw)
+            if (exitPhrases.isNotEmpty() && rawCandidates.any { t -> exitPhrases.any { t.lowercase().contains(it) } }) {
+                addVoiceLogEntry(rawHeard, "🎮 labas sa laro")
+                exitGameMode("voice")
+            } else {
+                addVoiceLogEntry(rawHeard, "🎮 naglalaro (hindi pinansin)")
+            }
+            return
+        }
+
         // 0) KALIGTASAN: STOP ang pinakaunang tsine-check sa LAHAT ng alternatives, bago ang Gemini,
         // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
@@ -4382,6 +4669,12 @@ class MainActivity : ComponentActivity() {
 
         // "matulog ka muna" - sleep mode (lokal; mauuna sa Gemini)
         tryHandleSleepCommand(candidates)?.let { result ->
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
+        // "mag laro tayo" - Game Mode (lokal; mauuna sa Gemini)
+        tryHandleGameStartCommand(candidates)?.let { result ->
             addVoiceLogEntry(heardText, result)
             return
         }
@@ -5613,7 +5906,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendCommandThrottled(command: String, servoAngle: Int? = null) {
         val now = System.currentTimeMillis()
-        if (robotSleeping) return            // tulog: walang tracking motor/servo command
+        if (robotSleeping || gameModeActive) return   // tulog o naglalaro: walang tracking motor/servo command
         if (now < pitReactionUntil) return   // nagre-react sa pit: huwag gumalaw/ibalik ang servo hanggang matapos
         if (now - lastSendTime < sendIntervalMs) return
         lastSendTime = now
@@ -7109,6 +7402,8 @@ class MainActivity : ComponentActivity() {
         earlyWakeHandler.removeCallbacksAndMessages(null)
         sleepMoodHandler.removeCallbacksAndMessages(null)
         autoSleepHandler.removeCallbacksAndMessages(null)
+        gameHandler.removeCallbacksAndMessages(null)
+        handTracker?.close()
         zzzView.stop()
         observeHandler.removeCallbacksAndMessages(null)
         pitHandler.removeCallbacksAndMessages(null)
