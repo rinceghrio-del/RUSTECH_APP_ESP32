@@ -5931,7 +5931,9 @@ class MainActivity : ComponentActivity() {
 
             // May nakita na palang tao habang kasalukuyang nag-i-scan pa - itigil agad, huwag
             // na tapusin ang buong 4 segundong galaw.
-            if (headScanActive && !idleTooLong) {
+            // (Kasama ang Game Mode at Sleep Mode: dapat nakatigil ang servo - hindi na mag-i-scan.)
+            val servoMustStay = gameModeActive || robotSleeping || now < pitReactionUntil
+            if (headScanActive && (!idleTooLong || servoMustStay)) {
                 headScanActive = false
                 lastHeadScanEndTime = now
             }
@@ -5939,7 +5941,8 @@ class MainActivity : ComponentActivity() {
             val cooldownPassed = now - lastHeadScanEndTime > personMissingScanThresholdMs
             val eligible = idleTooLong && cooldownPassed && appState == AppState.EYES && showRoboEyes &&
                 !navActive && !navCalibrating && !navTestMode &&
-                !pendingPhotoCapture && pendingVisionCapture == null && !personSearchActive
+                !pendingPhotoCapture && pendingVisionCapture == null && !personSearchActive &&
+                !servoMustStay
 
             if (eligible && !headScanActive) {
                 headScanActive = true
