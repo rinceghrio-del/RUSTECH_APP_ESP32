@@ -117,6 +117,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var roboEyesView: RoboEyesView
     private lateinit var zzzView: ZzzView
     private lateinit var gameView: GameView
+    private lateinit var chessView: ChessView
     private lateinit var capturedPhotoView: ImageView
     private lateinit var statusText: TextView
     private lateinit var menuButton: Button
@@ -1227,6 +1228,17 @@ class MainActivity : ComponentActivity() {
             gameView,
             FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
         )
+        // CHESS screen: parehong nakatago hanggang "maglaro tayo ng chess"
+        chessView = ChessView(this).apply {
+            visibility = View.GONE
+            onExitRequested = { exitGameMode("touch") }
+            onChessEvent = { e -> chessCoach.onEvent(e) }
+            speechBusy = { isSpeaking }   // hintayin munang matapos ang boses bago gumalaw ang robot
+        }
+        rootLayout.addView(
+            chessView,
+            FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        )
 
         setContentView(rootLayout)
         applyDisplayMode()
@@ -1977,6 +1989,7 @@ class MainActivity : ComponentActivity() {
             makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
             makeCard("🎮", tr("Laro (Hand Game)"), tr("Best: {0}", gameBestScore.toString())) { showGameDialog() },
+            makeCard("♟️", "Chess", tr("Level {0}", chessCoach.level.toString())) { showChessDialog() },
             makeCard("😴", tr("Sleep Mode"), if (sleepIdleMinutes > 0) tr("Auto: {0} min", sleepIdleMinutes.toString()) else tr("Mano-mano")) { showSleepDialog() },
             makeCard("🕳️", tr("Pit Sensor"), if (pitEnabled) tr("Naka-on") else tr("Naka-off")) { showPitDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
@@ -3506,6 +3519,16 @@ class MainActivity : ComponentActivity() {
 
     /** "mag laro tayo" - lokal (gumagana kahit naka-off ang Gemini). */
     private fun tryHandleGameStartCommand(candidates: List<String>): String? {
+        // CHESS muna: ang "maglaro tayo" ay bahagi rin ng "maglaro tayo ng chess"
+        val chessPhrases = chessCoach.startPhrases()
+        if (chessPhrases.isNotEmpty() && candidates.any { t -> chessPhrases.any { t.contains(it) } }) {
+            if (navActive || navCalibrating || navTestMode) {
+                speak(tr("Nasa AUTO mode pa ako. Sabihin mo muna ang \"hinto\"."))
+                return "chess: nasa AUTO mode"
+            }
+            enterGameMode("voice", GameKind.CHESS)
+            return "♟️ chess"
+        }
         val phrases = phraseList(gameStartPhrasesRaw)
         if (phrases.isEmpty() || candidates.none { t -> phrases.any { t.contains(it) } }) return null
         if (navActive || navCalibrating || navTestMode) {
@@ -3516,7 +3539,51 @@ class MainActivity : ComponentActivity() {
         return "🎮 game mode"
     }
 
-    private fun enterGameMode(source: String) {
+    private enum class GameKind { CANDY, CHESS }
+    @Volatile private var gameKind = GameKind.CANDY
+
+    // Ang "bibig at katawan" ng robot sa chess (mga linya, track, shake) - tignan ang ChessCoach.kt
+    private val chessCoach by lazy {
+        ChessCoach(prefs, object : ChessCoach.Host {
+            override fun say(text: String, track: Int) { chessSay(text, track) }
+            override fun shake(ms: Int) { sendShakeBurst(ms) }
+        })
+    }
+
+    /** Boses ng chess: DFPlayer track LANG kapag OFF ang Gemini at OFF ang TTS; kung hindi, TTS ng app. */
+    private fun chessSay(text: String, track: Int) {
+        if (dfPlayerAllowed()) {
+            if (track > 0) sendTrackDirect(track)
+        } else {
+            // Ang MALALAKING TITIK (hal. "WALA KA PA LANG BINATBAT EH!") ay minsan binabaybay ng TTS - gawing normal
+            val spoken = text.split(" ").joinToString(" ") { w ->
+                if (w.length > 1 && w.any { it.isLetter() } && w == w.uppercase()) w.lowercase() else w
+            }
+            speak(spoken)
+        }
+    }
+
+    /** Maikling alog ng robot (firmware V5.4.4 SHAKE). Para sa pagkain ng robot sa chess (~100 ms). */
+    private fun sendShakeBurst(ms: Int) {
+        if (!gameModeActive || robotSleeping) return
+        val request = Request.Builder()
+            .url("$esp32BaseUrl/command?dir=SHAKE&ms=$ms")
+            .build()
+        wakeTrackClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) { response.close() }
+        })
+    }
+
+    private fun setGameHandStatus(text: String) {
+        if (gameKind == GameKind.CHESS) chessView.handStatus = text else gameView.handStatus = text
+    }
+
+    private fun dispatchHandState(state: HandState?) {
+        if (gameKind == GameKind.CHESS) chessView.onHandState(state) else gameView.onHandState(state)
+    }
+
+    private fun enterGameMode(source: String, kind: GameKind = GameKind.CANDY) {
         if (gameModeActive || robotSleeping) return
         cancelPersonSearch()
         headScanActive = false
@@ -3532,26 +3599,36 @@ class MainActivity : ComponentActivity() {
         smoothedServoAngle = tilt.toFloat()
         sendServoOnly(tilt)
 
+        gameKind = kind
         gameModeActive = true
         awakeUntil = 0L
         roboEyesView.clearFlash()
-        gameView.bestScore = gameBestScore
-        gameView.handStatus = tr("⏳ Inihahanda ang hand tracking...")
-        gameView.visibility = View.VISIBLE
-        gameView.startNewGame()
+        setGameHandStatus(tr("⏳ Inihahanda ang hand tracking..."))
+        if (kind == GameKind.CHESS) {
+            chessView.userIsWhite = chessCoach.userIsWhite
+            chessView.level = chessCoach.level
+            chessView.visibility = View.VISIBLE
+            chessView.startNewGame()      // (Started event -> "Sige, mag-chess tayo...")
+        } else {
+            gameView.bestScore = gameBestScore
+            gameView.visibility = View.VISIBLE
+            gameView.startNewGame()
+        }
         startHandTracker()
         gameHandler.removeCallbacksAndMessages(null)
         gameHandler.postDelayed(gameTickRunnable, 2000L)
 
-        statusText.text = tr("🎮 Game Mode")
-        addVoiceLogEntry(source, "🎮 game mode ON")
+        statusText.text = if (kind == GameKind.CHESS) tr("♟️ Chess") else tr("🎮 Game Mode")
+        addVoiceLogEntry(source, "🎮 game mode ON (${kind.name.lowercase()})")
         lastGameSpeakTime = System.currentTimeMillis()
-        speak(tr("Sige, maglaro tayo! I-pinch mo ang candy at i-drag papunta sa katabi."))
+        if (kind == GameKind.CANDY) {
+            speak(tr("Sige, maglaro tayo! I-pinch mo ang candy at i-drag papunta sa katabi."))
+        }
     }
 
     private fun startHandTracker() {
         val seen = tr("✋ Nakikita ang kamay")
-        val pinch = tr("✋ PINCH - hawak ang candy")
+        val pinch = tr("✋ PINCH - hawak")
         val none = tr("Ilagay ang kamay sa harap ng camera")
         val tracker = HandGestureTracker(
             context = this,
@@ -3559,18 +3636,20 @@ class MainActivity : ComponentActivity() {
             onHand = { state ->
                 runOnUi {
                     if (gameModeActive) {
-                        gameView.handStatus = when {
-                            state == null -> none
-                            state.pinching -> pinch
-                            else -> seen
-                        }
-                        gameView.onHandState(state)
+                        setGameHandStatus(
+                            when {
+                                state == null -> none
+                                state.pinching -> pinch
+                                else -> seen
+                            }
+                        )
+                        dispatchHandState(state)
                     }
                 }
             },
             onError = { msg ->
                 runOnUi {
-                    if (gameModeActive) gameView.handStatus = "⚠️ $msg - touch lang muna"
+                    if (gameModeActive) setGameHandStatus("⚠️ $msg - touch lang muna")
                     addVoiceLogEntry("hand tracker", msg)
                 }
             }
@@ -3579,7 +3658,7 @@ class MainActivity : ComponentActivity() {
         cameraExecutor.execute {
             tracker.start()   // naglo-load ng model - nasa background
             runOnUi {
-                if (tracker.ready && gameModeActive) gameView.handStatus = none
+                if (tracker.ready && gameModeActive) setGameHandStatus(none)
             }
         }
     }
@@ -3588,9 +3667,12 @@ class MainActivity : ComponentActivity() {
         if (!gameModeActive) return
         gameModeActive = false
         gameHandler.removeCallbacksAndMessages(null)
+        val kindWas = gameKind
         val finalScore = gameView.currentScore
         gameView.stopAnimations()
         gameView.visibility = View.GONE
+        chessView.stopAnimations()
+        chessView.visibility = View.GONE
         val t = handTracker
         handTracker = null
         cameraExecutor.execute { t?.close() }
@@ -3606,7 +3688,10 @@ class MainActivity : ComponentActivity() {
         lastVoiceActivityTime = now
         awakeUntil = now + wakeWindowSec * 1000L
         addVoiceLogEntry(source, "🎮 game mode OFF")
-        if (announce) speak(tr("Okay, tapos na ang laro! Ang score mo ay {0}.", finalScore.toString()))
+        if (announce) {
+            if (kindWas == GameKind.CHESS) speak(tr("Okay, tapos na ang chess. Salamat sa laro!"))
+            else speak(tr("Okay, tapos na ang laro! Ang score mo ay {0}.", finalScore.toString()))
+        }
     }
 
     /** Mga reaksyon ng robot sa laro (may cooldown para hindi maingay). */
@@ -3716,6 +3801,88 @@ class MainActivity : ComponentActivity() {
             .setNegativeButton(tr("I-save lang")) { _, _ ->
                 saveFields()
                 statusText.text = tr("Na-save ang Laro settings")
+            }
+            .showImmersive()
+    }
+
+    private fun showChessDialog() {
+        val coach = chessCoach
+        fun label(text: String, top: Int = 16) = TextView(this).apply {
+            this.text = text
+            setPadding(0, top, 0, 0)
+        }
+        val note = TextView(this).apply {
+            text = tr("Sabihin ang \"maglaro tayo ng chess\" (kasama ang wake word kung naka-ON). Pinch ang piyesa mo at i-drag sa parisukat na pupuntahan (o pinch ang piyesa, tapos pinch ang pupuntahan). Ang \"ayaw ko na maglalaro\" ang lalabas. Awtomatikong reyna ang promotion.")
+            textSize = 12f
+        }
+        val phrasesInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            setText(coach.startPhrasesRaw)
+        }
+        val levelInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(coach.level.toString())
+        }
+        val whiteSwitch = Switch(this).apply {
+            text = tr("Ako ang PUTI (ako ang mauuna)")
+            isChecked = coach.userIsWhite
+            setPadding(0, 16, 0, 8)
+        }
+        val shakeInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(coach.shakeMs.toString())
+        }
+        class Row(val line: ChessCoach.Line, val text: EditText, val track: EditText)
+        val rows = ChessCoach.Line.values().map { line ->
+            Row(
+                line,
+                EditText(this).apply {
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    setText(coach.text(line))
+                },
+                EditText(this).apply {
+                    inputType = InputType.TYPE_CLASS_NUMBER
+                    hint = tr("DFPlayer track (0 = wala)")
+                    setText(coach.track(line).toString())
+                }
+            )
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(note)
+            addView(label(tr("Mga sasabihin para MAGSIMULA (isang linya bawat isa):")))
+            addView(phrasesInput)
+            addView(label(tr("Level ng robot (1 madali ... 4 mahirap; mas mabagal mag-isip ang 4):")))
+            addView(levelInput)
+            addView(whiteSwitch)
+            addView(label(tr("Shake ng robot kapag nakakain siya (milliseconds; 0 = walang shake):")))
+            addView(shakeInput)
+            addView(label(tr("Mga sasabihin ng robot (at DFPlayer track kapag OFF ang Gemini at OFF ang TTS):"), 28))
+            for (r in rows) {
+                addView(label(r.line.label, 14))
+                addView(r.text)
+                addView(r.track)
+            }
+        }
+        fun saveFields() {
+            coach.startPhrasesRaw = phrasesInput.text.toString()
+            levelInput.text.toString().toIntOrNull()?.let { coach.level = it }
+            coach.userIsWhite = whiteSwitch.isChecked
+            shakeInput.text.toString().toIntOrNull()?.let { coach.shakeMs = it }
+            for (r in rows) coach.setLine(r.line, r.text.text.toString(), r.track.text.toString().toIntOrNull() ?: 0)
+        }
+        ModernDialog()
+            .setTitle(tr("♟️ Chess"))
+            .setView(box)
+            .setPositiveButton(tr("▶ Maglaro")) { _, _ ->
+                saveFields()
+                enterGameMode("menu", GameKind.CHESS)
+            }
+            .setNegativeButton(tr("I-save lang")) { _, _ ->
+                saveFields()
+                statusText.text = tr("Na-save ang Chess settings")
             }
             .showImmersive()
     }
