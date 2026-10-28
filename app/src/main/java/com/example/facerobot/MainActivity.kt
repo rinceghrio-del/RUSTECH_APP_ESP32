@@ -3545,13 +3545,20 @@ class MainActivity : ComponentActivity() {
     // Ang "bibig at katawan" ng robot sa chess (mga linya, track, shake) - tignan ang ChessCoach.kt
     private val chessCoach by lazy {
         ChessCoach(prefs, object : ChessCoach.Host {
-            override fun say(text: String, track: Int) { chessSay(text, track) }
+            override fun say(text: String, track: Int) { gameSay(text, track) }
             override fun shake(ms: Int) { sendShakeBurst(ms) }
         })
     }
 
-    /** Boses ng chess: DFPlayer track LANG kapag OFF ang Gemini at OFF ang TTS; kung hindi, TTS ng app. */
-    private fun chessSay(text: String, track: Int) {
+    // Ang "bibig" ng robot sa Candy-Crush na laro (mga linya at DFPlayer track) - tignan ang CandyCoach.kt
+    private val candyCoach by lazy {
+        CandyCoach(prefs, object : CandyCoach.Host {
+            override fun say(text: String, track: Int) { gameSay(text, track) }
+        })
+    }
+
+    /** Boses ng mga laro (chess at candy): DFPlayer track LANG kapag OFF ang Gemini at OFF ang TTS; kung hindi, TTS ng app. */
+    private fun gameSay(text: String, track: Int) {
         if (dfPlayerAllowed()) {
             if (track > 0) sendTrackDirect(track)
         } else {
@@ -3621,9 +3628,7 @@ class MainActivity : ComponentActivity() {
         statusText.text = if (kind == GameKind.CHESS) tr("♟️ Chess") else tr("🎮 Game Mode")
         addVoiceLogEntry(source, "🎮 game mode ON (${kind.name.lowercase()})")
         lastGameSpeakTime = System.currentTimeMillis()
-        if (kind == GameKind.CANDY) {
-            speak(tr("Sige, maglaro tayo! I-pinch mo ang candy at i-drag papunta sa katabi."))
-        }
+        if (kind == GameKind.CANDY) candyCoach.onStart()   // (ang chess: sa Started event)
     }
 
     private fun startHandTracker() {
@@ -3689,34 +3694,14 @@ class MainActivity : ComponentActivity() {
         awakeUntil = now + wakeWindowSec * 1000L
         addVoiceLogEntry(source, "🎮 game mode OFF")
         if (announce) {
-            if (kindWas == GameKind.CHESS) speak(tr("Okay, tapos na ang chess. Salamat sa laro!"))
-            else speak(tr("Okay, tapos na ang laro! Ang score mo ay {0}.", finalScore.toString()))
+            // Sumasagot ang robot sa paglabas: TTS, o DFPlayer track kapag OFF ang Gemini at OFF ang TTS
+            if (kindWas == GameKind.CHESS) chessCoach.onExit() else candyCoach.onExit(finalScore)
         }
     }
 
     /** Mga reaksyon ng robot sa laro (may cooldown para hindi maingay). */
     private fun handleGameEvent(e: GameEvent) {
-        val now = System.currentTimeMillis()
-        when (e) {
-            is GameEvent.Combo, is GameEvent.BigClear -> {
-                if (now - lastGameSpeakTime > 6000L) {
-                    lastGameSpeakTime = now
-                    speak(listOf(tr("Wow, combo!"), tr("Ang galing mo!"), tr("Sunod-sunod!")).random())
-                }
-            }
-            is GameEvent.Shuffled -> {
-                lastGameSpeakTime = now
-                speak(tr("Wala nang pwedeng galaw, hahaluin ko ulit."))
-            }
-            is GameEvent.GameOver -> {
-                lastGameSpeakTime = now
-                speak(
-                    tr("Tapos na ang laro! Ang score mo ay {0}.", e.score.toString()) +
-                        if (e.newBest) " " + tr("Bagong rekord!") else ""
-                )
-            }
-            else -> {}
-        }
+        candyCoach.onEvent(e)   // mga linya/track ng candy game: Menu > Laro (Hand Game)
     }
 
     /** Ang bawat frame ng camera sa Game Mode: kamay lang ang hinahanap (MediaPipe). */
@@ -3776,6 +3761,21 @@ class MainActivity : ComponentActivity() {
                 text = tr("Reset best score ({0})", "0")
             }
         }
+        class CandyRow(val line: CandyCoach.Line, val text: EditText, val track: EditText)
+        val candyRows = CandyCoach.Line.values().map { line ->
+            CandyRow(
+                line,
+                EditText(this).apply {
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                    setText(candyCoach.text(line))
+                },
+                EditText(this).apply {
+                    inputType = InputType.TYPE_CLASS_NUMBER
+                    hint = tr("DFPlayer track (0 = wala)")
+                    setText(candyCoach.track(line).toString())
+                }
+            )
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
@@ -3784,12 +3784,19 @@ class MainActivity : ComponentActivity() {
             addView(startInput)
             addView(label(tr("Mga sasabihin para LUMABAS (hindi kailangan ng wake word):")))
             addView(exitInput)
+            addView(label(tr("Mga sasabihin ng robot (at DFPlayer track kapag OFF ang Gemini at OFF ang TTS):")))
+            for (r in candyRows) {
+                addView(label(r.line.label))
+                addView(r.text)
+                addView(r.track)
+            }
             addView(label(""))
             addView(resetButton)
         }
         fun saveFields() {
             gameStartPhrasesRaw = startInput.text.toString()
             gameExitPhrasesRaw = exitInput.text.toString()
+            for (r in candyRows) candyCoach.setLine(r.line, r.text.text.toString(), r.track.text.toString().toIntOrNull() ?: 0)
         }
         ModernDialog()
             .setTitle(tr("🎮 Laro (Hand Game)"))
@@ -3812,13 +3819,18 @@ class MainActivity : ComponentActivity() {
             setPadding(0, top, 0, 0)
         }
         val note = TextView(this).apply {
-            text = tr("Sabihin ang \"maglaro tayo ng chess\" (kasama ang wake word kung naka-ON). Pinch ang piyesa mo at i-drag sa parisukat na pupuntahan (o pinch ang piyesa, tapos pinch ang pupuntahan). Ang \"ayaw ko na maglalaro\" ang lalabas. Awtomatikong reyna ang promotion.")
+            text = tr("Sabihin ang \"maglaro tayo ng chess\" (kasama ang wake word kung naka-ON). Pinch ang piyesa mo at i-drag sa parisukat na pupuntahan (o pinch ang piyesa, tapos pinch ang pupuntahan). Ang \"ayaw ko na mag chess\" (o \"ayaw ko na maglalaro\") ang lalabas at sasagot ang robot. Awtomatikong reyna ang promotion.")
             textSize = 12f
         }
         val phrasesInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
             minLines = 3
             setText(coach.startPhrasesRaw)
+        }
+        val exitPhrasesInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            setText(coach.exitPhrasesRaw)
         }
         val levelInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
@@ -3854,6 +3866,8 @@ class MainActivity : ComponentActivity() {
             addView(note)
             addView(label(tr("Mga sasabihin para MAGSIMULA (isang linya bawat isa):")))
             addView(phrasesInput)
+            addView(label(tr("Mga sasabihin para LUMABAS sa chess (hindi kailangan ng wake word):")))
+            addView(exitPhrasesInput)
             addView(label(tr("Level ng robot (1 madali ... 4 mahirap; mas mabagal mag-isip ang 4):")))
             addView(levelInput)
             addView(whiteSwitch)
@@ -3868,6 +3882,7 @@ class MainActivity : ComponentActivity() {
         }
         fun saveFields() {
             coach.startPhrasesRaw = phrasesInput.text.toString()
+            coach.exitPhrasesRaw = exitPhrasesInput.text.toString()
             levelInput.text.toString().toIntOrNull()?.let { coach.level = it }
             coach.userIsWhite = whiteSwitch.isChecked
             shakeInput.text.toString().toIntOrNull()?.let { coach.shakeMs = it }
@@ -4813,7 +4828,8 @@ class MainActivity : ComponentActivity() {
 
         // GAME MODE: naglalaro - ang "ayaw ko na maglalaro" LANG ang papansinin (hindi kailangan ng wake word)
         if (gameModeActive) {
-            val exitPhrases = phraseList(gameExitPhrasesRaw)
+            val exitPhrases = phraseList(gameExitPhrasesRaw) +
+                (if (gameKind == GameKind.CHESS) chessCoach.exitPhrases() else emptyList())
             if (exitPhrases.isNotEmpty() && rawCandidates.any { t -> exitPhrases.any { t.lowercase().contains(it) } }) {
                 addVoiceLogEntry(rawHeard, "🎮 labas sa laro")
                 exitGameMode("voice")
