@@ -35,10 +35,18 @@ class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
         ROBOT_MATE("chess_line_robot_mate", "WALA KA PA LANG BINATBAT EH!", "Na-checkmate ka ng robot"),
         USER_CAPTURE("chess_line_user_capture", "Huwag mo naman masyadong galingan.", "Nakakain ka ng piyesa ng robot"),
         USER_WIN("chess_line_user_win", "Ang galing mo naman.", "Natalo mo ang robot"),
-        DRAW("chess_line_draw", "Tabla tayo!", "Tabla")
+        DRAW("chess_line_draw", "Tabla tayo!", "Tabla"),
+        EXIT("chess_line_exit", "Okay, sige. Salamat sa laro!", "Paglabas: ayaw mo na mag-chess")
     }
 
     companion object {
+        /** Mga sasabihin para LUMABAS sa chess (dagdag sa "ayaw ko na maglalaro" na pangkalahatan). */
+        const val DEFAULT_EXIT_PHRASES =
+            "ayaw ko na mag chess\nayaw ko nang mag chess\nayoko na mag chess\nayoko nang mag chess\n" +
+                "ayaw ko na mag-chess\nayoko na mag-chess\nayaw ko na maglaro ng chess\nayoko na maglaro ng chess\n" +
+                "tama na ang chess\ntigil chess\nexit chess\n" +
+                "ayaw ko na mag ches\nayaw ko na mag chest\nayaw ko na mag tses\nayoko na mag ches\nayoko na mag tses"
+
         const val DEFAULT_START_PHRASES =
             "maglaro tayo ng chess\nlaro tayo ng chess\nmag chess tayo\nmag-chess tayo\nchess tayo\n" +
                 "let's play chess\nplay chess\nmaglaro tayo ng ahedres\nmag ahedres tayo\n" +
@@ -71,6 +79,16 @@ class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
     var shakeMs: Int
         get() = prefs.getInt("chess_shake_ms", 100).coerceIn(0, 1500)
         set(value) { prefs.edit().putInt("chess_shake_ms", value.coerceIn(0, 1500)).apply() }
+
+    var exitPhrasesRaw: String
+        get() = prefs.getString("chess_exit_phrases", null) ?: DEFAULT_EXIT_PHRASES
+        set(value) { prefs.edit().putString("chess_exit_phrases", value).apply() }
+
+    fun exitPhrases(): List<String> =
+        exitPhrasesRaw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
+
+    /** Paglabas sa chess (ayaw mo na): sumasagot ang robot. */
+    fun onExit() = say(Line.EXIT)
 
     fun startPhrases(): List<String> =
         startPhrasesRaw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
