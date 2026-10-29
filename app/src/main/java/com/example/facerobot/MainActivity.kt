@@ -3691,7 +3691,6 @@ class MainActivity : ComponentActivity() {
         showEyesUi()           // balik sa mata (normal idle/standby)
         val now = System.currentTimeMillis()
         lastVoiceActivityTime = now
-        lastInteractionTime = now
         awakeUntil = now + wakeWindowSec * 1000L
         addVoiceLogEntry(source, "🎮 game mode OFF")
         if (announce) {
@@ -3912,21 +3911,6 @@ class MainActivity : ComponentActivity() {
     @Volatile private var robotSleeping = false
     private var sleepPrevServo = -1f
     @Volatile private var lastVoiceActivityTime = System.currentTimeMillis()
-    // Huling TUNAY na interaksyon sa robot: wake word / utos sa kanya / hawak sa screen / gising mula tulog / labas sa laro.
-    // HINDI kasama dito ang basta nakita niyang tao, narinig na usapan sa paligid, o galaw ng robot.
-    @Volatile private var lastInteractionTime = System.currentTimeMillis()
-    // ON (default): matutulog pa rin kahit may nakikita/naririnig sa paligid - ang bilang ay mula lang sa huling tunay na interaksyon.
-    // OFF: lumang behavior (hindi matutulog hangga't may nakikitang tao, naririnig na boses, o gumagalaw).
-    private var sleepIgnoreSurroundings: Boolean
-        get() = prefs.getBoolean("sleep_ignore_surroundings", true)
-        set(value) { prefs.edit().putBoolean("sleep_ignore_surroundings", value).apply() }
-
-    private fun markInteraction() { lastInteractionTime = System.currentTimeMillis() }
-
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) markInteraction()
-        return super.dispatchTouchEvent(ev)
-    }
     private val sleepServoAngle = 20      // naka-tungo: mas malapit sa 0 = mas pababa (ITAAS kung sobrang yuko)
     private val sleepMoodHandler = Handler(android.os.Looper.getMainLooper())
     private val autoSleepHandler = Handler(android.os.Looper.getMainLooper())
@@ -3944,6 +3928,12 @@ class MainActivity : ComponentActivity() {
     private var sleepIdleMinutes: Int       // 0 = hindi matutulog nang kusa
         get() = prefs.getInt("sleep_idle_minutes", 10).coerceIn(0, 240)
         set(value) { prefs.edit().putInt("sleep_idle_minutes", value.coerceIn(0, 240)).apply() }
+    // True = matutulog pagkalipas ng sleepIdleMinutes mula sa huling gising/app start, KAHIT may nakikita,
+    // naririnig, o gumagalaw sa paligid. False = dating behavior (naghihintay munang walang tao/boses/galaw).
+    private var sleepForceTimer: Boolean
+        get() = prefs.getBoolean("sleep_force_timer", true)
+        set(value) { prefs.edit().putBoolean("sleep_force_timer", value).apply() }
+    @Volatile private var sleepAwakeSince = System.currentTimeMillis()   // simula ng bilang ng fixed timer
     private var sleepTrack: Int
         get() = prefs.getInt("sleep_track", 0)
         set(value) { prefs.edit().putInt("sleep_track", value.coerceAtLeast(0)).apply() }
@@ -4042,13 +4032,13 @@ class MainActivity : ComponentActivity() {
         roboEyesView.setMood(RoboEyesView.Mood.IDLE)
 
         val now = System.currentTimeMillis()
+        sleepAwakeSince = now                           // fixed sleep timer: umpisa ulit ng bilang paggising
         val restore = if (sleepPrevServo >= 0f) sleepPrevServo else personSearchTilts[0].toFloat()
         outputServoAngle = restore
         smoothedServoAngle = restore
         sendServoOnly(restore.toInt())
 
         lastVoiceActivityTime = now
-        lastInteractionTime = now
         awakeUntil = now + wakeWindowSec * 1000L
         if (early) { earlyAckPending = true; earlyAckTime = now }   // para hindi na ulitin ng final result
 
@@ -4083,19 +4073,28 @@ class MainActivity : ComponentActivity() {
     /** Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng sleepIdleMinutes. */
     private fun autoSleepCheck() {
         val minutes = sleepIdleMinutes
-        if (minutes <= 0 || robotSleeping || gameModeActive) return
         val now = System.currentTimeMillis()
-        // Hindi dapat matulog sa gitna ng ginagawa (AUTO nav, nagsasalita, may Gemini request, pit reaction, atbp.)
-        if (navActive || navCalibrating || navTestMode || personSearchActive ||
+        if (gameModeActive) {
+            if (sleepForceTimer) sleepAwakeSince = now   // tapos ng laro = bagong bilang (hindi bigla-biglang matutulog)
+            return
+        }
+        if (minutes <= 0 || robotSleeping) return
+
+        // FIXED TIMER: matutulog pagkalipas ng X minuto mula huling gising, hindi pinapansin kung may nakikita,
+        // naririnig, o gumagalaw. Hihintayin lang matapos ang mga kritikal na ginagawa (nagsasalita, AUTO nav,
+        // pit reaction, kumukuha ng litrato/vision) para hindi maputol sa gitna.
+        if (sleepForceTimer) {
+            if (navActive || navCalibrating || navTestMode || isSpeaking || geminiBusy ||
+                observeInFlight || now < pitReactionUntil ||
+                pendingPhotoCapture || pendingVisionCapture != null) return
+            if (now - sleepAwakeSince >= minutes * 60_000L) enterSleepMode("auto", auto = true)
+            return
+        }
+
+        if (navActive || navCalibrating || navTestMode || personSearchActive || headScanActive ||
             isSpeaking || geminiBusy || observeInFlight || now < pitReactionUntil ||
             pendingPhotoCapture || pendingVisionCapture != null) return
-        val lastActivity = if (sleepIgnoreSurroundings) {
-            // Kahit may nakikita o naririnig sa paligid: bilang lang mula sa huling tunay na interaksyon
-            lastInteractionTime
-        } else {
-            if (headScanActive) return
-            maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime, lastInteractionTime)
-        }
+        val lastActivity = maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime)
         if (now - lastActivity >= minutes * 60_000L) enterSleepMode("auto", auto = true)
     }
 
@@ -4117,6 +4116,11 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(sleepIdleMinutes.toString())
         }
+        val forceSwitch = Switch(this).apply {
+            text = tr("Matulog kahit may nakikita/naririnig (fixed timer)")
+            isChecked = sleepForceTimer
+            setPadding(0, 16, 0, 8)
+        }
         val sleepTrackInput = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(sleepTrack.toString())
@@ -4126,21 +4130,20 @@ class MainActivity : ComponentActivity() {
             setText(sleepWakeTrack.toString())
         }
 
-        val ignoreSurroundingsSwitch = Switch(this).apply {
-            text = tr("Matulog kahit may nakikita/naririnig sa paligid")
-            isChecked = sleepIgnoreSurroundings
-        }
-
         fun label(text: String, top: Int = 16) = TextView(this).apply {
             this.text = text
             setPadding(0, top, 0, 0)
         }
         fun saveFields() {
-            sleepIgnoreSurroundings = ignoreSurroundingsSwitch.isChecked
             sleepPhrasesRaw = phrasesInput.text.toString()
             sleepSayText = sayInput.text.toString().trim().ifEmpty { sleepSayText }
             sleepWakeText = wakeInput.text.toString().trim().ifEmpty { sleepWakeText }
+            val oldMinutes = sleepIdleMinutes
+            val oldForce = sleepForceTimer
             idleInput.text.toString().toIntOrNull()?.let { sleepIdleMinutes = it }
+            sleepForceTimer = forceSwitch.isChecked
+            // Binago ang minuto o mode: magsimula ulit ang bilang mula ngayon
+            if (oldMinutes != sleepIdleMinutes || oldForce != sleepForceTimer) sleepAwakeSince = System.currentTimeMillis()
             sleepTrack = sleepTrackInput.text.toString().toIntOrNull() ?: 0
             sleepWakeTrack = wakeTrackInput.text.toString().toIntOrNull() ?: 0
         }
@@ -4173,12 +4176,11 @@ class MainActivity : ComponentActivity() {
             addView(sayInput)
             addView(label(tr("Sasabihin paggising (TTS):")))
             addView(wakeInput)
-            addView(label(tr("Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng (minuto; 0 = hindi matutulog nang kusa):")))
+            addView(label(tr("Matutulog nang kusa pagkalipas ng (minuto; 0 = hindi matutulog nang kusa):")))
             addView(idleInput)
-            addView(label("", 8))
-            addView(ignoreSurroundingsSwitch)
+            addView(forceSwitch)
             addView(TextView(this@MainActivity).apply {
-                text = tr("ON: ang bilang ng minuto ay mula sa huling tunay na interaksyon (wake word/utos/hawak sa screen). Hindi ito mare-reset ng taong dumadaan o usapan sa paligid. OFF: hindi matutulog hangga't may nakikita o naririnig.")
+                text = tr("ON = matutulog pagkalipas ng minutong iyan mula nang huling gising, KAHIT may nakikita o naririnig. OFF = matutulog lang kapag walang tao, utos, o galaw sa loob ng minutong iyan.")
                 textSize = 11f
             })
             addView(label(tr("DFPlayer track sa pagtulog (kapag OFF ang Gemini at OFF ang TTS; 0 = wala):")))
@@ -4818,7 +4820,6 @@ class MainActivity : ComponentActivity() {
         val rests = rawCandidates.map { stripWakeWord(it) }
         if (rests.any { it != null }) {
             awakeUntil = now + windowMs
-            lastInteractionTime = now
             // Nasagot na ba agad (mula sa partial result) ang wake word na ito?
             val ackedEarly = earlyAckPending && now - earlyAckTime < 5000L
             earlyAckPending = false
@@ -4836,7 +4837,6 @@ class MainActivity : ComponentActivity() {
         }
         if (now < awakeUntil) {
             awakeUntil = now + windowMs   // bawat tinanggap na utos ay nagpapahaba ng window
-            lastInteractionTime = now
             return rawCandidates
         }
         addVoiceLogEntry(rawHeard, "na-ignore (walang wake word)")
@@ -4882,7 +4882,6 @@ class MainActivity : ComponentActivity() {
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
         if (hasStopWord(rawCandidates)) {
             addVoiceLogEntry(rawHeard, doVoiceStop())
-            markInteraction()
             if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
         }
@@ -4890,7 +4889,6 @@ class MainActivity : ComponentActivity() {
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
         val candidates = wokeWithCommand ?: applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
-        markInteraction()   // utos na tinanggap ng robot (hindi basta ingay sa paligid)
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
         tryHandleFindPersonCommand(candidates)?.let { result ->
