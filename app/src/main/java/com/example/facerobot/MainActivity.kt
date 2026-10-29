@@ -285,9 +285,6 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
     private var lastPersonSeenTime = System.currentTimeMillis()
-    // Huling oras na may MUKHANG nakita (ML Kit). Ito ang ginagamit ng "hahanapin ang tao kapag tinawag" - para kahit
-    // may "tao" na nakikita ang YOLO (hal. nakatalikod ka), maghahanap pa rin hanggang makita ang mukha.
-    @Volatile private var lastFaceSeenTime = 0L
     private var faceTooClose = false
     private val personTimeoutMs = 4000L
 
@@ -485,20 +482,12 @@ class MainActivity : ComponentActivity() {
     private fun requiredPersonDetections(): Int =
         if (personSearchActive) 1 else requiredConsecutiveDetections
 
-    private fun personSearchBlockedReason(): String? {
-        // Pananggalang: kung "naghahanap" pa raw pero lumampas na nang husto sa pinakamahabang oras, may natigil - i-reset
-        if (personSearchActive && System.currentTimeMillis() - personSearchStartTime > personSearchMaxMs + 8_000L) {
-            cancelPersonSearch()
-        }
-        return personSearchBlockedReasonRaw()
-    }
-
-    private fun personSearchBlockedReasonRaw(): String? = when {
+    private fun personSearchBlockedReason(): String? = when {
         !personSearchEnabled -> "naka-off sa settings"
         navActive || navCalibrating || navTestMode -> "naka-AUTO/nav mode"
         gameModeActive -> "naglalaro"
         personSearchActive -> "naghahanap na"
-        System.currentTimeMillis() - lastFaceSeenTime < personSearchFreshMs -> personSearchBlockVisible
+        System.currentTimeMillis() - lastPersonSeenTime < personSearchFreshMs -> personSearchBlockVisible
         else -> null
     }
 
@@ -2596,7 +2585,6 @@ class MainActivity : ComponentActivity() {
 
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
-        lastFaceSeenTime = lastPersonSeenTime
 
 
         val box = face.boundingBox
@@ -3695,7 +3683,6 @@ class MainActivity : ComponentActivity() {
         cameraExecutor.execute { t?.close() }
 
         sendSleepFlag(false)   // ibalik ang ultrasonic sa firmware
-        scheduleSleepFlagOffRepeats()
         val restore = if (gamePrevServo >= 0f) gamePrevServo else personSearchTilts[0].toFloat()
         outputServoAngle = restore
         smoothedServoAngle = restore
@@ -3704,6 +3691,7 @@ class MainActivity : ComponentActivity() {
         showEyesUi()           // balik sa mata (normal idle/standby)
         val now = System.currentTimeMillis()
         lastVoiceActivityTime = now
+        lastInteractionTime = now
         awakeUntil = now + wakeWindowSec * 1000L
         addVoiceLogEntry(source, "🎮 game mode OFF")
         if (announce) {
@@ -3924,6 +3912,21 @@ class MainActivity : ComponentActivity() {
     @Volatile private var robotSleeping = false
     private var sleepPrevServo = -1f
     @Volatile private var lastVoiceActivityTime = System.currentTimeMillis()
+    // Huling TUNAY na interaksyon sa robot: wake word / utos sa kanya / hawak sa screen / gising mula tulog / labas sa laro.
+    // HINDI kasama dito ang basta nakita niyang tao, narinig na usapan sa paligid, o galaw ng robot.
+    @Volatile private var lastInteractionTime = System.currentTimeMillis()
+    // ON (default): matutulog pa rin kahit may nakikita/naririnig sa paligid - ang bilang ay mula lang sa huling tunay na interaksyon.
+    // OFF: lumang behavior (hindi matutulog hangga't may nakikitang tao, naririnig na boses, o gumagalaw).
+    private var sleepIgnoreSurroundings: Boolean
+        get() = prefs.getBoolean("sleep_ignore_surroundings", true)
+        set(value) { prefs.edit().putBoolean("sleep_ignore_surroundings", value).apply() }
+
+    private fun markInteraction() { lastInteractionTime = System.currentTimeMillis() }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) markInteraction()
+        return super.dispatchTouchEvent(ev)
+    }
     private val sleepServoAngle = 20      // naka-tungo: mas malapit sa 0 = mas pababa (ITAAS kung sobrang yuko)
     private val sleepMoodHandler = Handler(android.os.Looper.getMainLooper())
     private val autoSleepHandler = Handler(android.os.Looper.getMainLooper())
@@ -3968,19 +3971,6 @@ class MainActivity : ComponentActivity() {
             override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {}
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) { response.close() }
         })
-    }
-
-    /**
-     * Ang heartbeat ng SLEEP_ON at ang SLEEP_OFF ay magkahiwalay na request at pwedeng magkabaligtad ang dating - kapag
-     * nahuli ang SLEEP_ON, mananatiling "tulog" ang firmware nang hanggang 15s (nakahinto ang motor, kaya hindi umiikot sa
-     * paghahanap). Kaya inuulit ang SLEEP_OFF sandali pagkatapos gumising/lumabas sa laro.
-     */
-    private fun scheduleSleepFlagOffRepeats() {
-        for (delayMs in longArrayOf(700L, 2000L)) {
-            observeHandler.postDelayed({
-                if (!robotSleeping && !gameModeActive) sendSleepFlag(false)
-            }, delayMs)
-        }
     }
 
     /** Gisingin ang ESP32 mula sa sleep nito (firmware V5.4.3) papunta sa STATE_BOOT_WAIT. Walang epekto kung hindi tulog. */
@@ -4046,7 +4036,6 @@ class MainActivity : ComponentActivity() {
         robotSleeping = false
         sleepMoodHandler.removeCallbacksAndMessages(null)
         sendSleepFlag(false)                            // ibalik ang ultrasonic sa firmware
-        scheduleSleepFlagOffRepeats()
         sendWakeEsp32()                                 // gisingin din ang ESP32 (kung tulog) -> BOOT_WAIT
         zzzView.stop()
         roboEyesView.clearFlash()
@@ -4059,6 +4048,7 @@ class MainActivity : ComponentActivity() {
         sendServoOnly(restore.toInt())
 
         lastVoiceActivityTime = now
+        lastInteractionTime = now
         awakeUntil = now + wakeWindowSec * 1000L
         if (early) { earlyAckPending = true; earlyAckTime = now }   // para hindi na ulitin ng final result
 
@@ -4095,10 +4085,17 @@ class MainActivity : ComponentActivity() {
         val minutes = sleepIdleMinutes
         if (minutes <= 0 || robotSleeping || gameModeActive) return
         val now = System.currentTimeMillis()
-        if (navActive || navCalibrating || navTestMode || personSearchActive || headScanActive ||
+        // Hindi dapat matulog sa gitna ng ginagawa (AUTO nav, nagsasalita, may Gemini request, pit reaction, atbp.)
+        if (navActive || navCalibrating || navTestMode || personSearchActive ||
             isSpeaking || geminiBusy || observeInFlight || now < pitReactionUntil ||
             pendingPhotoCapture || pendingVisionCapture != null) return
-        val lastActivity = maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime)
+        val lastActivity = if (sleepIgnoreSurroundings) {
+            // Kahit may nakikita o naririnig sa paligid: bilang lang mula sa huling tunay na interaksyon
+            lastInteractionTime
+        } else {
+            if (headScanActive) return
+            maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime, lastInteractionTime)
+        }
         if (now - lastActivity >= minutes * 60_000L) enterSleepMode("auto", auto = true)
     }
 
@@ -4129,11 +4126,17 @@ class MainActivity : ComponentActivity() {
             setText(sleepWakeTrack.toString())
         }
 
+        val ignoreSurroundingsSwitch = Switch(this).apply {
+            text = tr("Matulog kahit may nakikita/naririnig sa paligid")
+            isChecked = sleepIgnoreSurroundings
+        }
+
         fun label(text: String, top: Int = 16) = TextView(this).apply {
             this.text = text
             setPadding(0, top, 0, 0)
         }
         fun saveFields() {
+            sleepIgnoreSurroundings = ignoreSurroundingsSwitch.isChecked
             sleepPhrasesRaw = phrasesInput.text.toString()
             sleepSayText = sayInput.text.toString().trim().ifEmpty { sleepSayText }
             sleepWakeText = wakeInput.text.toString().trim().ifEmpty { sleepWakeText }
@@ -4172,6 +4175,12 @@ class MainActivity : ComponentActivity() {
             addView(wakeInput)
             addView(label(tr("Matutulog nang kusa kapag walang tao, utos, o galaw sa loob ng (minuto; 0 = hindi matutulog nang kusa):")))
             addView(idleInput)
+            addView(label("", 8))
+            addView(ignoreSurroundingsSwitch)
+            addView(TextView(this@MainActivity).apply {
+                text = tr("ON: ang bilang ng minuto ay mula sa huling tunay na interaksyon (wake word/utos/hawak sa screen). Hindi ito mare-reset ng taong dumadaan o usapan sa paligid. OFF: hindi matutulog hangga't may nakikita o naririnig.")
+                textSize = 11f
+            })
             addView(label(tr("DFPlayer track sa pagtulog (kapag OFF ang Gemini at OFF ang TTS; 0 = wala):")))
             addView(sleepTrackInput)
             addView(label(tr("DFPlayer track sa paggising (0 = wala):")))
@@ -4702,9 +4711,8 @@ class MainActivity : ComponentActivity() {
             speak(if (canSearch) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
         }
         // (Hindi pinapalitan ng "SEARCHING" ang eyes mood na pinili mo para sa wake word.)
-        val searchStarted = canSearch && startPersonSearch(rawHeard, flashSearchEyes = false)
-        val searchNote = if (searchStarted) " | naghahanap" else " | hindi naghanap (${personSearchBlockedReason() ?: "?"})"
-        addVoiceLogEntry(rawHeard, (if (early) "🔔 wake word (agad)" else "🔔 wake word") + searchNote)
+        if (canSearch) startPersonSearch(rawHeard, flashSearchEyes = false)
+        addVoiceLogEntry(rawHeard, if (early) "🔔 wake word (agad)" else "🔔 wake word")
     }
 
     // Sariling client/dispatcher para sa wake track: hindi maiipit sa mga movement/tracking request ng httpClient
@@ -4810,6 +4818,7 @@ class MainActivity : ComponentActivity() {
         val rests = rawCandidates.map { stripWakeWord(it) }
         if (rests.any { it != null }) {
             awakeUntil = now + windowMs
+            lastInteractionTime = now
             // Nasagot na ba agad (mula sa partial result) ang wake word na ito?
             val ackedEarly = earlyAckPending && now - earlyAckTime < 5000L
             earlyAckPending = false
@@ -4827,6 +4836,7 @@ class MainActivity : ComponentActivity() {
         }
         if (now < awakeUntil) {
             awakeUntil = now + windowMs   // bawat tinanggap na utos ay nagpapahaba ng window
+            lastInteractionTime = now
             return rawCandidates
         }
         addVoiceLogEntry(rawHeard, "na-ignore (walang wake word)")
@@ -4872,6 +4882,7 @@ class MainActivity : ComponentActivity() {
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
         if (hasStopWord(rawCandidates)) {
             addVoiceLogEntry(rawHeard, doVoiceStop())
+            markInteraction()
             if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
         }
@@ -4879,6 +4890,7 @@ class MainActivity : ComponentActivity() {
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
         val candidates = wokeWithCommand ?: applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
+        markInteraction()   // utos na tinanggap ng robot (hindi basta ingay sa paligid)
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
         tryHandleFindPersonCommand(candidates)?.let { result ->
