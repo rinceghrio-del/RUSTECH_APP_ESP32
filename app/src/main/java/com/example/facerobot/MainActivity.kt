@@ -285,6 +285,9 @@ class MainActivity : ComponentActivity() {
         set(value) { prefs.edit().putString("unknown_greeting_tracks", value).apply() }
 
     private var lastPersonSeenTime = System.currentTimeMillis()
+    // Huling oras na may MUKHANG nakita (ML Kit). Ito ang ginagamit ng "hahanapin ang tao kapag tinawag" - para kahit
+    // may "tao" na nakikita ang YOLO (hal. nakatalikod ka), maghahanap pa rin hanggang makita ang mukha.
+    @Volatile private var lastFaceSeenTime = 0L
     private var faceTooClose = false
     private val personTimeoutMs = 4000L
 
@@ -482,12 +485,20 @@ class MainActivity : ComponentActivity() {
     private fun requiredPersonDetections(): Int =
         if (personSearchActive) 1 else requiredConsecutiveDetections
 
-    private fun personSearchBlockedReason(): String? = when {
+    private fun personSearchBlockedReason(): String? {
+        // Pananggalang: kung "naghahanap" pa raw pero lumampas na nang husto sa pinakamahabang oras, may natigil - i-reset
+        if (personSearchActive && System.currentTimeMillis() - personSearchStartTime > personSearchMaxMs + 8_000L) {
+            cancelPersonSearch()
+        }
+        return personSearchBlockedReasonRaw()
+    }
+
+    private fun personSearchBlockedReasonRaw(): String? = when {
         !personSearchEnabled -> "naka-off sa settings"
         navActive || navCalibrating || navTestMode -> "naka-AUTO/nav mode"
         gameModeActive -> "naglalaro"
         personSearchActive -> "naghahanap na"
-        System.currentTimeMillis() - lastPersonSeenTime < personSearchFreshMs -> personSearchBlockVisible
+        System.currentTimeMillis() - lastFaceSeenTime < personSearchFreshMs -> personSearchBlockVisible
         else -> null
     }
 
@@ -2585,6 +2596,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleFaceFound(face: Face, imageProxy: ImageProxy, rotation: Int) {
         lastPersonSeenTime = System.currentTimeMillis()
+        lastFaceSeenTime = lastPersonSeenTime
 
 
         val box = face.boundingBox
@@ -3683,6 +3695,7 @@ class MainActivity : ComponentActivity() {
         cameraExecutor.execute { t?.close() }
 
         sendSleepFlag(false)   // ibalik ang ultrasonic sa firmware
+        scheduleSleepFlagOffRepeats()
         val restore = if (gamePrevServo >= 0f) gamePrevServo else personSearchTilts[0].toFloat()
         outputServoAngle = restore
         smoothedServoAngle = restore
@@ -3957,6 +3970,19 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    /**
+     * Ang heartbeat ng SLEEP_ON at ang SLEEP_OFF ay magkahiwalay na request at pwedeng magkabaligtad ang dating - kapag
+     * nahuli ang SLEEP_ON, mananatiling "tulog" ang firmware nang hanggang 15s (nakahinto ang motor, kaya hindi umiikot sa
+     * paghahanap). Kaya inuulit ang SLEEP_OFF sandali pagkatapos gumising/lumabas sa laro.
+     */
+    private fun scheduleSleepFlagOffRepeats() {
+        for (delayMs in longArrayOf(700L, 2000L)) {
+            observeHandler.postDelayed({
+                if (!robotSleeping && !gameModeActive) sendSleepFlag(false)
+            }, delayMs)
+        }
+    }
+
     /** Gisingin ang ESP32 mula sa sleep nito (firmware V5.4.3) papunta sa STATE_BOOT_WAIT. Walang epekto kung hindi tulog. */
     private fun sendWakeEsp32() {
         val request = Request.Builder()
@@ -4020,6 +4046,7 @@ class MainActivity : ComponentActivity() {
         robotSleeping = false
         sleepMoodHandler.removeCallbacksAndMessages(null)
         sendSleepFlag(false)                            // ibalik ang ultrasonic sa firmware
+        scheduleSleepFlagOffRepeats()
         sendWakeEsp32()                                 // gisingin din ang ESP32 (kung tulog) -> BOOT_WAIT
         zzzView.stop()
         roboEyesView.clearFlash()
@@ -4675,8 +4702,9 @@ class MainActivity : ComponentActivity() {
             speak(if (canSearch) tr("Po? Sandali, hahanapin kita.") else wakeReplies.random())
         }
         // (Hindi pinapalitan ng "SEARCHING" ang eyes mood na pinili mo para sa wake word.)
-        if (canSearch) startPersonSearch(rawHeard, flashSearchEyes = false)
-        addVoiceLogEntry(rawHeard, if (early) "🔔 wake word (agad)" else "🔔 wake word")
+        val searchStarted = canSearch && startPersonSearch(rawHeard, flashSearchEyes = false)
+        val searchNote = if (searchStarted) " | naghahanap" else " | hindi naghanap (${personSearchBlockedReason() ?: "?"})"
+        addVoiceLogEntry(rawHeard, (if (early) "🔔 wake word (agad)" else "🔔 wake word") + searchNote)
     }
 
     // Sariling client/dispatcher para sa wake track: hindi maiipit sa mga movement/tracking request ng httpClient
