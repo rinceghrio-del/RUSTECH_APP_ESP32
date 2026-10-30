@@ -6,6 +6,7 @@ import android.content.Context
 import android.animation.ValueAnimator
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.display.DisplayManager
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -2410,6 +2411,22 @@ class MainActivity : ComponentActivity() {
 
     // ---------- Camera setup ----------
 
+    // Kapag binaligtad ang phone (landscape <-> reverse landscape), HINDI nire-restart ng Android ang activity,
+    // kaya ang CameraX ay nananatili sa lumang orientation at BALIGTAD ang "itaas" ng frame (baliktad ang tilt).
+    // Ina-update ng listener na ito ang targetRotation ng Preview at ImageAnalysis tuwing umiikot ang display.
+    private var camPreview: Preview? = null
+    private var camAnalysis: ImageAnalysis? = null
+    private var displayListenerRegistered = false
+    private val displayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) {}
+        override fun onDisplayRemoved(displayId: Int) {}
+        override fun onDisplayChanged(displayId: Int) {
+            val rot = previewView.display?.rotation ?: return
+            camPreview?.targetRotation = rot
+            camAnalysis?.targetRotation = rot
+        }
+    }
+
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
@@ -2432,6 +2449,16 @@ class MainActivity : ComponentActivity() {
 
                 cameraProvider.unbindAll()
                 cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+                camPreview = preview
+                camAnalysis = imageAnalyzer
+                previewView.display?.rotation?.let { rot ->      // tama na agad ang orientation pagbukas
+                    preview.targetRotation = rot
+                    imageAnalyzer.targetRotation = rot
+                }
+                if (!displayListenerRegistered) {
+                    (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, null)
+                    displayListenerRegistered = true
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
                 runOnUi {
@@ -7680,6 +7707,10 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         shuttingDown = true
         super.onDestroy()
+        if (displayListenerRegistered) {
+            try { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener) } catch (_: Exception) {}
+            displayListenerRegistered = false
+        }
         pingHandler.removeCallbacksAndMessages(null)
         navHandler.removeCallbacksAndMessages(null)
         headScanActive = false
