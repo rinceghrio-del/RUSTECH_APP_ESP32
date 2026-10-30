@@ -910,6 +910,8 @@ class MainActivity : ComponentActivity() {
         // kapag mabagal o hindi sumasagot ang ESP32.
         val homeParts = otherParts.filter { SmartHome.isHomeAction(it) }
         val restParts = otherParts.filterNot { SmartHome.isHomeAction(it) }
+        // May ESP32 action (sayaw, kilos, atbp.): kanselahin ang hanap-tao para hindi mag-agawan sa motor
+        if (restParts.isNotEmpty()) cancelPersonSearch()
         if (homeParts.isNotEmpty()) runMovementParts(homeParts)
 
         if (dfTracks.isEmpty()) {
@@ -4697,6 +4699,22 @@ class MainActivity : ComponentActivity() {
         }, partialWakeStableMs)
     }
 
+    /**
+     * Wake word + utos sa iisang pangungusap. Kapag walang nakikitang tao, magsisimula ang hanap-tao
+     * (tahimik - ang utos mismo ang sasagot). Hindi ito gagawin kung ang utos ay "hanapin mo ako" (may sarili
+     * itong handler), "matulog ka" o "hinto". Ang movement/ESP32 action na utos ay kakansela sa paghahanap.
+     */
+    private fun startSearchOnWakeWithCommand(rawHeard: String, remainders: List<String>) {
+        if (robotSleeping || shuttingDown) return
+        val lowered = remainders.map { it.lowercase() }
+        val sleepPhrases = sleepPhraseList()
+        if (lowered.any { t ->
+                findPersonPhrases.any { t.contains(it) } || sleepPhrases.any { t.contains(it) } ||
+                    stopStems.any { t.contains(it) }
+            }) return
+        if (personSearchBlockedReason() == null) startPersonSearch(rawHeard, flashSearchEyes = false)
+    }
+
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
         if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
@@ -4833,6 +4851,9 @@ class MainActivity : ComponentActivity() {
                 }
                 return null
             }
+            // May kasamang utos ("Rustech, kumusta ka?"): kung wala siyang nakikitang tao (nakatalikod),
+            // umikot na rin para hanapin ka habang sinasagot/ginagawa ang utos.
+            startSearchOnWakeWithCommand(rawHeard, remainders)
             return remainders
         }
         if (now < awakeUntil) {
