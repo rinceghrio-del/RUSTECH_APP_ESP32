@@ -4831,7 +4831,24 @@ class MainActivity : ComponentActivity() {
                 return if (rem.isEmpty()) null else rem
             }
         }
-        if (!wakeEnabled) return rawCandidates
+        if (!wakeEnabled) {
+            // Naka-OFF ang wake gate (hindi kailangan ng "Rustech" para sa utos), PERO kapag sinabi mo pa rin
+            // ang "Rustech" at wala siyang nakikitang tao (nakatalikod), hahanapin ka niya - hindi mo na
+            // kailangang sabihin ang "hanapin mo ako".
+            val offRests = rawCandidates.map { stripWakeWord(it) }
+            if (offRests.any { it != null }) {
+                val offRem = offRests.filterNotNull().filter { it.isNotBlank() }
+                if (offRem.isEmpty()) {
+                    if (personSearchBlockedReason() == null) {
+                        performWakeAck(rawHeard, early = false)   // "Po? Sandali, hahanapin kita." + hanap-tao
+                        return null
+                    }
+                } else {
+                    startSearchOnWakeWithCommand(rawHeard, offRem)
+                }
+            }
+            return rawCandidates
+        }
         val now = System.currentTimeMillis()
         val windowMs = wakeWindowSec * 1000L
 
