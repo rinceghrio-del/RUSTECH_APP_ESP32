@@ -466,7 +466,7 @@ class MainActivity : ComponentActivity() {
     private val personSearchFreshMs = 2_500L       // kung may nakita sa loob nito, hindi na maghahanap
     private val personSearchLockFrames = 3         // ilang sunod na frame na nakagitna ang mukha = lock
     private val personSearchTiltPeriodMs = 9_000L  // palit ng taas/baba ng ulo bawat ganitong tagal
-    private val personSearchTilts = intArrayOf(55, 72, 38)  // servo angles (0-110, mas mataas = pataas ang tingin)
+    private val personSearchTilts = intArrayOf(80, 105, 55)  // servo angles (0-160, mas mataas = pataas ang tingin)
 
     private val personSearchBlockVisible = "may nakikita nang tao"
     private val personSearchFoundLines: List<String> get() = listOf(
@@ -816,11 +816,11 @@ class MainActivity : ComponentActivity() {
 
     private var navServoA: Int
         get() = prefs.getInt("nav_servo_a", 30)
-        set(value) { prefs.edit().putInt("nav_servo_a", value.coerceIn(0, 110)).apply() }
+        set(value) { prefs.edit().putInt("nav_servo_a", value.coerceIn(0, SERVO_MAX_ANGLE)).apply() }
 
     private var navServoB: Int
         get() = prefs.getInt("nav_servo_b", 55)
-        set(value) { prefs.edit().putInt("nav_servo_b", value.coerceIn(0, 110)).apply() }
+        set(value) { prefs.edit().putInt("nav_servo_b", value.coerceIn(0, SERVO_MAX_ANGLE)).apply() }
 
     private var navBlockThreshold: Float
         get() = prefs.getFloat("nav_block_threshold", 0.75f)
@@ -3322,12 +3322,6 @@ class MainActivity : ComponentActivity() {
                     androidErrorStreak = 0
                     scheduleAndroidRestart(300L)
                 }
-                SpeechRecognizer.ERROR_CLIENT -> {
-                    // Karaniwang race lang ito (sabay ang cancel/restart): mabilis at tahimik na ulitin.
-                    // Kapag paulit-ulit, humaba ang pagitan para hindi mag-loop.
-                    androidErrorStreak++
-                    scheduleAndroidRestart(if (androidErrorStreak >= 3) 2000L else 400L, recreate = true)
-                }
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     statusText.text = tr("❌ Walang mic permission ang Android recognizer")
                 }
@@ -3426,7 +3420,6 @@ class MainActivity : ComponentActivity() {
 
     /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
     private fun doVoiceStop(): String {
-        markInteraction()
         sendCommandToEsp32("FORCE_STOP")
         cancelPersonSearch()
         queuedGeminiCandidates = null
@@ -3943,15 +3936,6 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getBoolean("sleep_force_timer", true)
         set(value) { prefs.edit().putBoolean("sleep_force_timer", value).apply() }
     @Volatile private var sleepAwakeSince = System.currentTimeMillis()   // simula ng bilang ng fixed timer
-
-    /** Tunay na interaksyon (wake word, utos, hinto, hawak sa screen): umpisa ulit ang bilang ng sleep timer.
-     *  HINDI ito tinatawag ng basta ingay o taong dumadaan. */
-    private fun markInteraction() { sleepAwakeSince = System.currentTimeMillis() }
-
-    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) markInteraction()
-        return super.dispatchTouchEvent(ev)
-    }
     private var sleepTrack: Int
         get() = prefs.getInt("sleep_track", 0)
         set(value) { prefs.edit().putInt("sleep_track", value.coerceAtLeast(0)).apply() }
@@ -4733,7 +4717,6 @@ class MainActivity : ComponentActivity() {
 
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
-        markInteraction()
         if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
         statusText.text = tr("🔔 Gising - sabihin ang utos")
         flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
@@ -4854,7 +4837,6 @@ class MainActivity : ComponentActivity() {
             // kailangang sabihin ang "hanapin mo ako".
             val offRests = rawCandidates.map { stripWakeWord(it) }
             if (offRests.any { it != null }) {
-                markInteraction()
                 val offRem = offRests.filterNotNull().filter { it.isNotBlank() }
                 if (offRem.isEmpty()) {
                     if (personSearchBlockedReason() == null) {
@@ -4873,7 +4855,6 @@ class MainActivity : ComponentActivity() {
         val rests = rawCandidates.map { stripWakeWord(it) }
         if (rests.any { it != null }) {
             awakeUntil = now + windowMs
-            markInteraction()
             // Nasagot na ba agad (mula sa partial result) ang wake word na ito?
             val ackedEarly = earlyAckPending && now - earlyAckTime < 5000L
             earlyAckPending = false
@@ -4894,7 +4875,6 @@ class MainActivity : ComponentActivity() {
         }
         if (now < awakeUntil) {
             awakeUntil = now + windowMs   // bawat tinanggap na utos ay nagpapahaba ng window
-            markInteraction()
             return rawCandidates
         }
         addVoiceLogEntry(rawHeard, "na-ignore (walang wake word)")
@@ -6137,7 +6117,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private val SERVO_MAX_ANGLE = 110
+    private val SERVO_MAX_ANGLE = 160      // pinakamataas na tilt ng servo (mas mataas = mas pataas ang tingin)
+    private val SERVO_START_ANGLE = 80f     // panimulang anggulo
 
     // ---------- IDLE HEAD SCAN (taas-baba ng ulo kapag 1 minutong walang nakitang tao) ----------
     // Dahan-dahang pag-taas/baba ng ulo gamit ang parehong navServoA/navServoB na naka-calibrate
@@ -6149,8 +6130,8 @@ class MainActivity : ComponentActivity() {
     // Hiwalay na mga anggulo para sa head-scan (hindi na gamit ang navServoA/B), para malaya
     // nating ma-adjust ito nang hindi naaapektuhan ang calibration ng Nav settings mo. Base sa
     // computeServoAngle() mo: mas MATAAS na numero = mas PATAAS ang tingin. I-adjust lang itong
-    // dalawang numero (0-110) kung kailangan pang i-tweak ang dating ng galaw.
-    private val headScanUpAngle = 95     // mas malapit sa SERVO_MAX_ANGLE (110) = mas pataas
+    // dalawang numero (0-160) kung kailangan pang i-tweak ang dating ng galaw.
+    private val headScanUpAngle = 138    // mas malapit sa SERVO_MAX_ANGLE (160) = mas pataas
     private val headScanDownAngle = 15   // mas malapit sa 0 = mas pababa
     @Volatile private var headScanActive = false
     private val headScanHandler = Handler(android.os.Looper.getMainLooper())
@@ -6181,7 +6162,7 @@ class MainActivity : ComponentActivity() {
 
     private fun computeServoAngle(box: Rect, frameHeight: Int): Int {
         val verticalRatio = box.centerY().toFloat() / frameHeight.toFloat()
-        if (outputServoAngle < 0f) outputServoAngle = SERVO_MAX_ANGLE / 2f
+        if (outputServoAngle < 0f) outputServoAngle = SERVO_START_ANGLE
 
         val now = System.currentTimeMillis()
         if (now - lastServoStepTime >= servoStepIntervalMs) {
@@ -6265,7 +6246,7 @@ class MainActivity : ComponentActivity() {
      * loob ng durationMs, sa pamamagitan ng maliliit na hakbang - para "dahan-dahan" talaga ang
      * galaw, hindi biglaang tumalon. */
     private fun animateServoTo(targetAngle: Int, durationMs: Long, onDone: () -> Unit) {
-        val startAngle = if (outputServoAngle >= 0f) outputServoAngle else SERVO_MAX_ANGLE / 2f
+        val startAngle = if (outputServoAngle >= 0f) outputServoAngle else SERVO_START_ANGLE
         val steps = (durationMs / headScanStepIntervalMs).toInt().coerceAtLeast(1)
         var stepCount = 0
 
@@ -6935,12 +6916,12 @@ class MainActivity : ComponentActivity() {
         }
 
         val servoAInput = EditText(this).apply {
-            hint = "Servo tilt A (0-110), default 30"
+            hint = "Servo tilt A (0-160), default 30"
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(navServoA.toString())
         }
         val servoBInput = EditText(this).apply {
-            hint = "Servo tilt B (0-110), default 55"
+            hint = "Servo tilt B (0-160), default 55"
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(navServoB.toString())
         }
