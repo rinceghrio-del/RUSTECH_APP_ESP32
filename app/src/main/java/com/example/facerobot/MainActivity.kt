@@ -3322,6 +3322,12 @@ class MainActivity : ComponentActivity() {
                     androidErrorStreak = 0
                     scheduleAndroidRestart(300L)
                 }
+                SpeechRecognizer.ERROR_CLIENT -> {
+                    // Karaniwang race lang ito (sabay ang cancel/restart): mabilis at tahimik na ulitin.
+                    // Kapag paulit-ulit, humaba ang pagitan para hindi mag-loop.
+                    androidErrorStreak++
+                    scheduleAndroidRestart(if (androidErrorStreak >= 3) 2000L else 400L, recreate = true)
+                }
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     statusText.text = tr("❌ Walang mic permission ang Android recognizer")
                 }
@@ -3420,6 +3426,7 @@ class MainActivity : ComponentActivity() {
 
     /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
     private fun doVoiceStop(): String {
+        markInteraction()
         sendCommandToEsp32("FORCE_STOP")
         cancelPersonSearch()
         queuedGeminiCandidates = null
@@ -3936,6 +3943,15 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getBoolean("sleep_force_timer", true)
         set(value) { prefs.edit().putBoolean("sleep_force_timer", value).apply() }
     @Volatile private var sleepAwakeSince = System.currentTimeMillis()   // simula ng bilang ng fixed timer
+
+    /** Tunay na interaksyon (wake word, utos, hinto, hawak sa screen): umpisa ulit ang bilang ng sleep timer.
+     *  HINDI ito tinatawag ng basta ingay o taong dumadaan. */
+    private fun markInteraction() { sleepAwakeSince = System.currentTimeMillis() }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) markInteraction()
+        return super.dispatchTouchEvent(ev)
+    }
     private var sleepTrack: Int
         get() = prefs.getInt("sleep_track", 0)
         set(value) { prefs.edit().putInt("sleep_track", value.coerceAtLeast(0)).apply() }
@@ -4717,6 +4733,7 @@ class MainActivity : ComponentActivity() {
 
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
+        markInteraction()
         if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
         statusText.text = tr("🔔 Gising - sabihin ang utos")
         flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
@@ -4837,6 +4854,7 @@ class MainActivity : ComponentActivity() {
             // kailangang sabihin ang "hanapin mo ako".
             val offRests = rawCandidates.map { stripWakeWord(it) }
             if (offRests.any { it != null }) {
+                markInteraction()
                 val offRem = offRests.filterNotNull().filter { it.isNotBlank() }
                 if (offRem.isEmpty()) {
                     if (personSearchBlockedReason() == null) {
@@ -4855,6 +4873,7 @@ class MainActivity : ComponentActivity() {
         val rests = rawCandidates.map { stripWakeWord(it) }
         if (rests.any { it != null }) {
             awakeUntil = now + windowMs
+            markInteraction()
             // Nasagot na ba agad (mula sa partial result) ang wake word na ito?
             val ackedEarly = earlyAckPending && now - earlyAckTime < 5000L
             earlyAckPending = false
@@ -4875,6 +4894,7 @@ class MainActivity : ComponentActivity() {
         }
         if (now < awakeUntil) {
             awakeUntil = now + windowMs   // bawat tinanggap na utos ay nagpapahaba ng window
+            markInteraction()
             return rawCandidates
         }
         addVoiceLogEntry(rawHeard, "na-ignore (walang wake word)")
