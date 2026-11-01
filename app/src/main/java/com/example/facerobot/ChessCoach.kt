@@ -1,6 +1,7 @@
 package com.example.facerobot
 
 import android.content.SharedPreferences
+import java.util.Random
 
 /**
  * Ang "bibig at katawan" ng robot sa chess: ayon sa nangyayari sa laro (ChessEvent), sinasabi nito ang tamang linya
@@ -19,7 +20,11 @@ import android.content.SharedPreferences
  * kung hindi, TTS). Sa DFPlayer mode, isang track lang ang kayang patugtugin kada tira, kaya ang pinaka-tiyak na
  * linya na may track ang gagamitin (mate > kain > tira).
  */
-class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
+class ChessCoach(
+    private val prefs: SharedPreferences,
+    private val host: Host,
+    private val rnd: Random = Random()
+) {
 
     interface Host {
         /** [text] para sa TTS; [track] para sa DFPlayer (0 = walang track). */
@@ -54,11 +59,26 @@ class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
     }
 
     fun text(l: Line): String = prefs.getString(l.prefKey, null)?.takeIf { it.isNotBlank() } ?: l.default
-    fun track(l: Line): Int = prefs.getInt(l.prefKey + "_track", 0)
-    fun setLine(l: Line, text: String, track: Int) {
+
+    /**
+     * Listahan ng DFPlayer track ng linya, hal. "12,13,14" (random ang pipiliin tuwing tutugtog). Kung may dating
+     * isang track lang na naka-save (lumang bersyon), iyon ang gagamitin.
+     */
+    fun tracksRaw(l: Line): String {
+        prefs.getString(l.prefKey + "_tracks", null)?.let { return it }
+        val old = try { prefs.getInt(l.prefKey + "_track", 0) } catch (e: ClassCastException) { 0 }
+        return if (old > 0) old.toString() else ""
+    }
+
+    fun hasTrack(l: Line): Boolean = TrackList.parse(tracksRaw(l)).isNotEmpty()
+
+    /** Isang random na track ng linya (0 = wala). */
+    fun pickTrack(l: Line): Int = TrackList.pick(tracksRaw(l), rnd)
+
+    fun setLine(l: Line, text: String, tracksRaw: String) {
         prefs.edit()
             .putString(l.prefKey, text.trim().ifEmpty { l.default })
-            .putInt(l.prefKey + "_track", track.coerceAtLeast(0))
+            .putString(l.prefKey + "_tracks", TrackList.normalize(tracksRaw))
             .apply()
     }
 
@@ -93,7 +113,7 @@ class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
     fun startPhrases(): List<String> =
         startPhrasesRaw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
 
-    private fun say(l: Line) = host.say(text(l), track(l))
+    private fun say(l: Line) = host.say(text(l), pickTrack(l))
 
     fun onEvent(e: ChessEvent) {
         when (e) {
@@ -113,7 +133,7 @@ class ChessCoach(private val prefs: SharedPreferences, private val host: Host) {
                 }
                 val spoken = text(Line.ROBOT_MOVE) + (if (special != null) " " + text(special) else "")
                 // DFPlayer: isang track lang - ang pinaka-tiyak na may track
-                val trackToPlay = listOfNotNull(special, Line.ROBOT_MOVE).map { track(it) }.firstOrNull { it > 0 } ?: 0
+                val trackToPlay = listOfNotNull(special, Line.ROBOT_MOVE).firstOrNull { hasTrack(it) }?.let { pickTrack(it) } ?: 0
                 host.say(spoken, trackToPlay)
             }
 
