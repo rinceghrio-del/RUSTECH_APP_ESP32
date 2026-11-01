@@ -3799,9 +3799,9 @@ class MainActivity : ComponentActivity() {
                     setText(candyCoach.text(line))
                 },
                 EditText(this).apply {
-                    inputType = InputType.TYPE_CLASS_NUMBER
-                    hint = tr("DFPlayer track (0 = wala)")
-                    setText(candyCoach.track(line).toString())
+                    inputType = InputType.TYPE_CLASS_TEXT
+                    hint = tr("DFPlayer track(s), hal. 12 o 12,13,14 (random; wala = walang track)")
+                    setText(candyCoach.tracksRaw(line))
                 }
             )
         }
@@ -3825,7 +3825,7 @@ class MainActivity : ComponentActivity() {
         fun saveFields() {
             gameStartPhrasesRaw = startInput.text.toString()
             gameExitPhrasesRaw = exitInput.text.toString()
-            for (r in candyRows) candyCoach.setLine(r.line, r.text.text.toString(), r.track.text.toString().toIntOrNull() ?: 0)
+            for (r in candyRows) candyCoach.setLine(r.line, r.text.text.toString(), r.track.text.toString())
         }
         ModernDialog()
             .setTitle(tr("🎮 Laro (Hand Game)"))
@@ -3883,9 +3883,9 @@ class MainActivity : ComponentActivity() {
                     setText(coach.text(line))
                 },
                 EditText(this).apply {
-                    inputType = InputType.TYPE_CLASS_NUMBER
-                    hint = tr("DFPlayer track (0 = wala)")
-                    setText(coach.track(line).toString())
+                    inputType = InputType.TYPE_CLASS_TEXT
+                    hint = tr("DFPlayer track(s), hal. 12 o 12,13,14 (random; wala = walang track)")
+                    setText(coach.tracksRaw(line))
                 }
             )
         }
@@ -3915,7 +3915,7 @@ class MainActivity : ComponentActivity() {
             levelInput.text.toString().toIntOrNull()?.let { coach.level = it }
             coach.userIsWhite = whiteSwitch.isChecked
             shakeInput.text.toString().toIntOrNull()?.let { coach.shakeMs = it }
-            for (r in rows) coach.setLine(r.line, r.text.text.toString(), r.track.text.toString().toIntOrNull() ?: 0)
+            for (r in rows) coach.setLine(r.line, r.text.text.toString(), r.track.text.toString())
         }
         ModernDialog()
             .setTitle(tr("♟️ Chess"))
@@ -3963,12 +3963,18 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getBoolean("sleep_force_timer", true)
         set(value) { prefs.edit().putBoolean("sleep_force_timer", value).apply() }
     @Volatile private var sleepAwakeSince = System.currentTimeMillis()   // simula ng bilang ng fixed timer
-    private var sleepTrack: Int
-        get() = prefs.getInt("sleep_track", 0)
-        set(value) { prefs.edit().putInt("sleep_track", value.coerceAtLeast(0)).apply() }
-    private var sleepWakeTrack: Int
-        get() = prefs.getInt("sleep_wake_track", 0)
-        set(value) { prefs.edit().putInt("sleep_wake_track", value.coerceAtLeast(0)).apply() }
+    // Mga DFPlayer track ng sleep mode: LISTAHAN na pinaghihiwalay ng kuwit (hal. "12,13,14"), random ang pipiliin.
+    // Kung may dating isang track lang na naka-save ("sleep_track"/"sleep_wake_track"), iyon ang gagamitin.
+    private fun legacySingleTrack(key: String): String {
+        val v = try { prefs.getInt(key, 0) } catch (e: ClassCastException) { 0 }
+        return if (v > 0) v.toString() else ""
+    }
+    private var sleepTracksRaw: String
+        get() = prefs.getString("sleep_tracks", null) ?: legacySingleTrack("sleep_track")
+        set(value) { prefs.edit().putString("sleep_tracks", TrackList.normalize(value)).apply() }
+    private var sleepWakeTracksRaw: String
+        get() = prefs.getString("sleep_wake_tracks", null) ?: legacySingleTrack("sleep_wake_track")
+        set(value) { prefs.edit().putString("sleep_wake_tracks", TrackList.normalize(value)).apply() }
 
     private fun sleepPhraseList(): List<String> =
         sleepPhrasesRaw.lines().map { it.trim().lowercase() }.filter { it.isNotEmpty() }
@@ -4047,7 +4053,7 @@ class MainActivity : ComponentActivity() {
 
         statusText.text = tr("😴 Natutulog... (sabihin ang wake word para gisingin)")
         addVoiceLogEntry(source, if (auto) "😴 natulog (walang ginagawa)" else "😴 sleep mode")
-        sleepSay(sleepSayText, sleepTrack)
+        sleepSay(sleepSayText, TrackList.pick(sleepTracksRaw))
     }
 
     private fun wakeUpFromSleep(rawHeard: String, early: Boolean) {
@@ -4074,7 +4080,7 @@ class MainActivity : ComponentActivity() {
         flashWakeEyes()
         statusText.text = tr("🔔 Gising na!")
         addVoiceLogEntry(rawHeard, if (early) "🔔 gising mula sa tulog (agad)" else "🔔 gising mula sa tulog")
-        sleepSay(sleepWakeText, sleepWakeTrack)
+        sleepSay(sleepWakeText, TrackList.pick(sleepWakeTracksRaw))
         // Kakagising lang at walang nakikitang tao? Hanapin ang tumatawag (gaya ng wake word)
         if (personSearchBlockedReason() == null) startPersonSearch(rawHeard, flashSearchEyes = false)
     }
@@ -4151,12 +4157,14 @@ class MainActivity : ComponentActivity() {
             setPadding(0, 16, 0, 8)
         }
         val sleepTrackInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(sleepTrack.toString())
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = tr("hal. 12 o 12,13,14 (random)")
+            setText(sleepTracksRaw)
         }
         val wakeTrackInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(sleepWakeTrack.toString())
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = tr("hal. 12 o 12,13,14 (random)")
+            setText(sleepWakeTracksRaw)
         }
 
         fun label(text: String, top: Int = 16) = TextView(this).apply {
@@ -4173,8 +4181,8 @@ class MainActivity : ComponentActivity() {
             sleepForceTimer = forceSwitch.isChecked
             // Binago ang minuto o mode: magsimula ulit ang bilang mula ngayon
             if (oldMinutes != sleepIdleMinutes || oldForce != sleepForceTimer) sleepAwakeSince = System.currentTimeMillis()
-            sleepTrack = sleepTrackInput.text.toString().toIntOrNull() ?: 0
-            sleepWakeTrack = wakeTrackInput.text.toString().toIntOrNull() ?: 0
+            sleepTracksRaw = sleepTrackInput.text.toString()
+            sleepWakeTracksRaw = wakeTrackInput.text.toString()
         }
 
         val note = TextView(this).apply {
@@ -4212,9 +4220,9 @@ class MainActivity : ComponentActivity() {
                 text = tr("ON = matutulog pagkalipas ng minutong iyan mula nang huling gising, KAHIT may nakikita o naririnig. OFF = matutulog lang kapag walang tao, utos, o galaw sa loob ng minutong iyan.")
                 textSize = 11f
             })
-            addView(label(tr("DFPlayer track sa pagtulog (kapag OFF ang Gemini at OFF ang TTS; 0 = wala):")))
+            addView(label(tr("DFPlayer track sa pagtulog (kapag OFF ang Gemini at OFF ang TTS). Pwedeng marami, pinaghihiwalay ng kuwit (hal. 12,13,14); random ang pipiliin. Blangko = walang track:")))
             addView(sleepTrackInput)
-            addView(label(tr("DFPlayer track sa paggising (0 = wala):")))
+            addView(label(tr("DFPlayer track sa paggising (pwedeng marami, pinaghihiwalay ng kuwit; random ang pipiliin):")))
             addView(wakeTrackInput)
             addView(label("", 12))
             addView(testRow)
