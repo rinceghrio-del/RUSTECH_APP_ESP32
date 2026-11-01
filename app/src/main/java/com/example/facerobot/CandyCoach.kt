@@ -1,6 +1,7 @@
 package com.example.facerobot
 
 import android.content.SharedPreferences
+import java.util.Random
 
 /**
  * Ang "bibig" ng robot sa Candy-Crush na hand game: ayon sa nangyayari sa laro (GameEvent), sinasabi ang tamang linya.
@@ -12,6 +13,7 @@ import android.content.SharedPreferences
 class CandyCoach(
     private val prefs: SharedPreferences,
     private val host: Host,
+    private val rnd: Random = Random(),
     private val now: () -> Long = { System.currentTimeMillis() }
 ) {
     interface Host {
@@ -31,11 +33,22 @@ class CandyCoach(
     private var lastSpokeAt = 0L
 
     fun text(l: Line): String = prefs.getString(l.prefKey, null)?.takeIf { it.isNotBlank() } ?: l.default
-    fun track(l: Line): Int = prefs.getInt(l.prefKey + "_track", 0)
-    fun setLine(l: Line, text: String, track: Int) {
+
+    /** Listahan ng DFPlayer track ng linya, hal. "12,13,14" (random ang pipiliin). Sinusuportahan ang dating isang track. */
+    fun tracksRaw(l: Line): String {
+        prefs.getString(l.prefKey + "_tracks", null)?.let { return it }
+        val old = try { prefs.getInt(l.prefKey + "_track", 0) } catch (e: ClassCastException) { 0 }
+        return if (old > 0) old.toString() else ""
+    }
+
+    fun hasTrack(l: Line): Boolean = TrackList.parse(tracksRaw(l)).isNotEmpty()
+
+    fun pickTrack(l: Line): Int = TrackList.pick(tracksRaw(l), rnd)
+
+    fun setLine(l: Line, text: String, tracksRaw: String) {
         prefs.edit()
             .putString(l.prefKey, text.trim().ifEmpty { l.default })
-            .putInt(l.prefKey + "_track", track.coerceAtLeast(0))
+            .putString(l.prefKey + "_tracks", TrackList.normalize(tracksRaw))
             .apply()
     }
 
@@ -43,7 +56,7 @@ class CandyCoach(
 
     private fun say(l: Line, score: Int? = null) {
         lastSpokeAt = now()
-        host.say(fill(text(l), score).trim(), track(l))
+        host.say(fill(text(l), score).trim(), pickTrack(l))
     }
 
     /** Pagpasok sa laro. */
@@ -61,7 +74,7 @@ class CandyCoach(
             is GameEvent.GameOver -> {
                 val text = fill(text(Line.GAME_OVER), e.score) + (if (e.newBest) " " + text(Line.NEW_BEST) else "")
                 // DFPlayer: isang track lang - kung bagong rekord at may track ito, iyon; kung hindi, ang "tapos na"
-                val tr = if (e.newBest && track(Line.NEW_BEST) > 0) track(Line.NEW_BEST) else track(Line.GAME_OVER)
+                val tr = if (e.newBest && hasTrack(Line.NEW_BEST)) pickTrack(Line.NEW_BEST) else pickTrack(Line.GAME_OVER)
                 lastSpokeAt = now()
                 host.say(text.trim(), tr)
             }
