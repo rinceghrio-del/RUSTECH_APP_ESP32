@@ -3743,8 +3743,9 @@ class MainActivity : ComponentActivity() {
         }
         lastHandFrameTime = now
         try {
+            // Nai-rotate NA ng imageProxyToBitmap ang bitmap ayon sa rotationDegrees - HUWAG nang i-rotate ulit.
+            // (Dati: dalawang beses nirorotate, kaya sa 180° (baliktad na landscape) nagkakansela at baliktad ang pointer.)
             var bmp = ImageUtils.imageProxyToBitmap(imageProxy)
-            bmp = rotateBitmap(bmp, imageProxy.imageInfo.rotationDegrees)
             if (bmp.config != Bitmap.Config.ARGB_8888) bmp = bmp.copy(Bitmap.Config.ARGB_8888, false)
             tracker.detect(bmp, android.os.SystemClock.uptimeMillis())
         } catch (e: Exception) {
@@ -6577,7 +6578,7 @@ class MainActivity : ComponentActivity() {
         pendingPhotoCapture = false
         try {
             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            val upright = bitmap   // nai-rotate na ng imageProxyToBitmap - huwag nang i-rotate ulit
             runOnUi { showCapturedPhoto(upright) }
             savePhotoToGallery(upright)
         } catch (e: Exception) {
@@ -6627,7 +6628,7 @@ class MainActivity : ComponentActivity() {
     private fun captureFrameForVision(imageProxy: ImageProxy, onCaptured: (Bitmap) -> Unit) {
         try {
             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            val upright = bitmap   // nai-rotate na ng imageProxyToBitmap - huwag nang i-rotate ulit
             runOnUi { onCaptured(upright) }
         } catch (e: Exception) {
             e.printStackTrace()
@@ -6657,7 +6658,7 @@ class MainActivity : ComponentActivity() {
 
         try {
             val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
-            val upright = rotateBitmap(bitmap, imageProxy.imageInfo.rotationDegrees)
+            val upright = bitmap   // nai-rotate na ng imageProxyToBitmap - huwag nang i-rotate ulit
             // Sa test/calibrate, laging tilt A lang ang gamit. Sa totoong nav, sumusunod sa kasalukuyang servo pose.
             val pose = if (navScanEnabled && navActive && !navCalibrating && !navTestMode) navPose else 0
             val cfg = ObstacleAnalyzer.Config(
