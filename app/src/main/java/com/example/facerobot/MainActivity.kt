@@ -2649,7 +2649,7 @@ class MainActivity : ComponentActivity() {
                 val bitmap = ImageUtils.imageProxyToBitmap(imageProxy)
                 // naka-align na 112x112; kung walang landmarks, balik sa lumang crop
                 val faceCrop = alignFace(bitmap, rotation, face)
-                    ?: ImageUtils.safeCrop(bitmap, adjustBoxForRotation(box, frameWidth, frameHeight, rotation))
+                    ?: ImageUtils.safeCrop(bitmap, box)   // upright na ang box (ML Kit) at upright na rin ang bitmap
 
                 if (faceCrop != null) {
                     val embedding = faceEmbedder.getEmbedding(faceCrop)
@@ -6057,11 +6057,9 @@ class MainActivity : ComponentActivity() {
         val le = face.getLandmark(FaceLandmark.LEFT_EYE)?.position ?: return null
         val re = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position ?: return null
 
-        // I-upright muna ang bitmap para tugma sa coordinates ng ML Kit
-        val upright = if (rotation != 0) {
-            val m = Matrix().apply { postRotate(rotation.toFloat()) }
-            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, m, true)
-        } else rawBitmap
+        // PATAYO NA ang bitmap (nai-rotate na ng ImageUtils.imageProxyToBitmap) at upright din ang coordinates ng ML Kit.
+        // HUWAG nang i-rotate ulit - dati doble ang rotate kaya sa 180° (baliktad na landscape) baliktad ang crop at palpak ang recognition.
+        val upright = rawBitmap
 
         // Ang may mas maliit na x ang kaliwang mata sa larawan (iwas sa kalituhan ng LEFT/RIGHT)
         val p1 = if (le.x <= re.x) le else re
