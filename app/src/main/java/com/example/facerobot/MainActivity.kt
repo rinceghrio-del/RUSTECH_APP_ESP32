@@ -3964,6 +3964,18 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getBoolean("sleep_force_timer", true)
         set(value) { prefs.edit().putBoolean("sleep_force_timer", value).apply() }
     @Volatile private var sleepAwakeSince = System.currentTimeMillis()   // simula ng bilang ng fixed timer
+    @Volatile private var sleepBusyEndedAt = 0L   // huling beses na may kritikal na ginagawa (nagsasalita, Gemini, atbp.)
+    private val sleepGraceAfterBusyMs = 20_000L       // pagkatapos ng salita/gawain, hintay muna bago matulog (hindi biglaan)
+
+    /** TUNAY na interaction (utos na tinanggap, wake word, hinto, hawak sa screen) = umpisa ulit ng bilang ng sleep timer. */
+    private fun noteInteraction() {
+        sleepAwakeSince = System.currentTimeMillis()
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) noteInteraction()
+        return super.dispatchTouchEvent(ev)
+    }
     // Mga DFPlayer track ng sleep mode: LISTAHAN na pinaghihiwalay ng kuwit (hal. "12,13,14"), random ang pipiliin.
     // Kung may dating isang track lang na naka-save ("sleep_track"/"sleep_wake_track"), iyon ang gagamitin.
     private fun legacySingleTrack(key: String): String {
@@ -4122,7 +4134,12 @@ class MainActivity : ComponentActivity() {
         if (sleepForceTimer) {
             if (navActive || navCalibrating || navTestMode || isSpeaking || geminiBusy ||
                 observeInFlight || now < pitReactionUntil ||
-                pendingPhotoCapture || pendingVisionCapture != null) return
+                pendingPhotoCapture || pendingVisionCapture != null) {
+                sleepBusyEndedAt = now
+                return
+            }
+            // Kakatapos lang magsalita/gumawa? Hintay muna ng ilang segundo - hindi natutulog agad pagkatapos ng utos.
+            if (now - sleepBusyEndedAt < sleepGraceAfterBusyMs) return
             if (now - sleepAwakeSince >= minutes * 60_000L) enterSleepMode("auto", auto = true)
             return
         }
@@ -4753,6 +4770,7 @@ class MainActivity : ComponentActivity() {
 
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
+        noteInteraction()   // wake word = tunay na interaction -> reset ang sleep timer
         if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
         statusText.text = tr("🔔 Gising - sabihin ang utos")
         flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
@@ -4955,6 +4973,7 @@ class MainActivity : ComponentActivity() {
         // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
         if (hasStopWord(rawCandidates)) {
+            noteInteraction()   // "hinto" = tunay na interaction -> reset ang sleep timer
             addVoiceLogEntry(rawHeard, doVoiceStop())
             if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
@@ -4963,6 +4982,7 @@ class MainActivity : ComponentActivity() {
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
         val candidates = wokeWithCommand ?: applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
+        noteInteraction()   // tinanggap na utos (lumampas sa wake gate) -> reset ang sleep timer
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
         tryHandleFindPersonCommand(candidates)?.let { result ->
