@@ -3968,12 +3968,17 @@ class MainActivity : ComponentActivity() {
     private val sleepGraceAfterBusyMs = 20_000L       // pagkatapos ng salita/gawain, hintay muna bago matulog (hindi biglaan)
 
     /** TUNAY na interaction (utos na tinanggap, wake word, hinto, hawak sa screen) = umpisa ulit ng bilang ng sleep timer. */
-    private fun noteInteraction() {
+    private fun noteInteraction(reason: String = "") {
         sleepAwakeSince = System.currentTimeMillis()
+        if (reason.isNotEmpty() && !robotSleeping && sleepIdleMinutes > 0) {
+            addVoiceLogEntry("⏱ sleep timer", "reset: $reason")   // para makita sa Voice Log kung ano ang nag-reset
+        }
     }
+    private var lastSleepBlockLog = ""
+    private var lastSleepBlockLogTime = 0L
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-        if (ev.actionMasked == MotionEvent.ACTION_DOWN) noteInteraction()
+        if (ev.actionMasked == MotionEvent.ACTION_DOWN) noteInteraction("hawak sa screen")
         return super.dispatchTouchEvent(ev)
     }
     // Mga DFPlayer track ng sleep mode: LISTAHAN na pinaghihiwalay ng kuwit (hal. "12,13,14"), random ang pipiliin.
@@ -4132,14 +4137,27 @@ class MainActivity : ComponentActivity() {
         // naririnig, o gumagalaw. Hihintayin lang matapos ang mga kritikal na ginagawa (nagsasalita, AUTO nav,
         // pit reaction, kumukuha ng litrato/vision) para hindi maputol sa gitna.
         if (sleepForceTimer) {
-            if (navActive || navCalibrating || navTestMode || isSpeaking || geminiBusy ||
-                observeInFlight || now < pitReactionUntil ||
-                pendingPhotoCapture || pendingVisionCapture != null) {
+            val due = now - sleepAwakeSince >= minutes * 60_000L
+            val busyWhy = when {
+                navActive || navCalibrating || navTestMode -> "AUTO/nav mode"
+                isSpeaking -> "nagsasalita"
+                geminiBusy -> "nag-iisip si Gemini"
+                observeInFlight -> "kumukuha ng frame (observe)"
+                now < pitReactionUntil -> "pit reaction"
+                pendingPhotoCapture -> "kumukuha ng litrato"
+                pendingVisionCapture != null -> "naghihintay ng frame (vision)"
+                else -> null
+            }
+            if (busyWhy != null) {
                 sleepBusyEndedAt = now
+                logSleepBlock(due, "busy: $busyWhy")
                 return
             }
             // Kakatapos lang magsalita/gumawa? Hintay muna ng ilang segundo - hindi natutulog agad pagkatapos ng utos.
-            if (now - sleepBusyEndedAt < sleepGraceAfterBusyMs) return
+            if (now - sleepBusyEndedAt < sleepGraceAfterBusyMs) {
+                logSleepBlock(due, "palugit ${sleepGraceAfterBusyMs / 1000}s pagkatapos ng busy")
+                return
+            }
             if (now - sleepAwakeSince >= minutes * 60_000L) enterSleepMode("auto", auto = true)
             return
         }
@@ -4149,6 +4167,16 @@ class MainActivity : ComponentActivity() {
             pendingPhotoCapture || pendingVisionCapture != null) return
         val lastActivity = maxOf(lastPersonSeenTime, lastVoiceActivityTime, lastMotionTime)
         if (now - lastActivity >= minutes * 60_000L) enterSleepMode("auto", auto = true)
+    }
+
+    /** Diagnostic: kapag due na ang sleep timer pero may humaharang, isulat sa Voice Log kung ano (hindi inuulit-ulit). */
+    private fun logSleepBlock(due: Boolean, why: String) {
+        if (!due) return
+        val now = System.currentTimeMillis()
+        if (why == lastSleepBlockLog && now - lastSleepBlockLogTime < 60_000L) return
+        lastSleepBlockLog = why
+        lastSleepBlockLogTime = now
+        addVoiceLogEntry("⏱ sleep timer", "due na pero hindi pa natutulog - $why")
     }
 
     private fun showSleepDialog() {
@@ -4770,7 +4798,7 @@ class MainActivity : ComponentActivity() {
 
     /** Ang aktwal na sagot sa wake word (mata + DFPlayer track/TTS + paghahanap ng tao). */
     private fun performWakeAck(rawHeard: String, early: Boolean) {
-        noteInteraction()   // wake word = tunay na interaction -> reset ang sleep timer
+        noteInteraction("wake word")   // wake word = tunay na interaction -> reset ang sleep timer
         if (espSleepingLast) sendWakeEsp32()   // tulog ang ESP32 mismo: gisingin pabalik sa BOOT_WAIT
         statusText.text = tr("🔔 Gising - sabihin ang utos")
         flashWakeEyes()   // ang napili sa Wake Word settings (default: galit)
@@ -4973,7 +5001,7 @@ class MainActivity : ComponentActivity() {
         // custom commands, o kahit anong ibang pagtutugma - lokal at agad, hindi dumadaan sa internet.
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
         if (hasStopWord(rawCandidates)) {
-            noteInteraction()   // "hinto" = tunay na interaction -> reset ang sleep timer
+            noteInteraction("hinto")   // "hinto" = tunay na interaction -> reset ang sleep timer
             addVoiceLogEntry(rawHeard, doVoiceStop())
             if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
@@ -4982,28 +5010,35 @@ class MainActivity : ComponentActivity() {
         // 0b) WAKE WORD: natutulog ang robot hangga't walang "Rustech" (o alias nito)
         val candidates = wokeWithCommand ?: applyWakeGate(rawCandidates, rawHeard) ?: return
         val heardText = candidates.firstOrNull() ?: return
-        noteInteraction()   // tinanggap na utos (lumampas sa wake gate) -> reset ang sleep timer
+        // Kapag naka-ON ang wake word, ang paglampas sa gate = kinausap talaga ang robot. Kapag naka-OFF, lahat ng
+        // narinig ay lumalampas - kaya HINDI ito binibilang (baka ingay/usapan lang sa paligid) maliban kung may
+        // wake word o tumugma sa lokal na utos (tingnan sa ibaba).
+        if (wakeEnabled || candidates.any { stripWakeWord(it) != null }) noteInteraction("utos (wake gate)")
 
         // "hanapin mo ako" / "humarap ka" - lokal (gumagana kahit naka-off ang Gemini)
         tryHandleFindPersonCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
 
         // "ikuwento mo ang nakikita mo" / "wag ka nang magkomento" - i-on/i-off ang kusang paningin
         tryHandleObserveToggleCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
 
         // "matulog ka muna" - sleep mode (lokal; mauuna sa Gemini)
         tryHandleSleepCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
 
         // "mag laro tayo" - Game Mode (lokal; mauuna sa Gemini)
         tryHandleGameStartCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
@@ -5020,7 +5055,9 @@ class MainActivity : ComponentActivity() {
                 geminiUsedToday() >= geminiDailyLimit -> tr(" (naabot ang daily limit ng Gemini)")
                 else -> " (Gemini cooldown)"
             }
-            addVoiceLogEntry(heardText, processVoiceCommand(candidates) + reason)
+            val localResult = processVoiceCommand(candidates)
+            if (localResult != "walang tumugma") noteInteraction("lokal na utos")
+            addVoiceLogEntry(heardText, localResult + reason)
             return
         }
 
@@ -5028,12 +5065,14 @@ class MainActivity : ComponentActivity() {
 
         // 1b) Display switch (camera/mata) - lokal din, hindi kailangan ng Gemini.
         tryHandleDisplayCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
 
         // 1c) "Take a picture" - lokal din, hindi kailangan ng Gemini.
         tryHandlePhotoCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
@@ -5044,6 +5083,7 @@ class MainActivity : ComponentActivity() {
             flashCommandEyes(exact)
             speak(exact.randomReply())
             if (exact.action.isNotBlank()) executeEsp32Actions(exact.action)
+            noteInteraction("custom command")
             addVoiceLogEntry(heardText, "custom: \"${exact.trigger}\"")
             return
         }
@@ -5051,6 +5091,7 @@ class MainActivity : ComponentActivity() {
         // 2b) Vision question (hal. "ano nakikita mo", "ano ginagawa ko") - hiwalay na Gemini
         // call na may kasamang larawan mula sa camera.
         tryHandleVisionCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
             addVoiceLogEntry(heardText, result)
             return
         }
