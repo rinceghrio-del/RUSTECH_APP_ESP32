@@ -739,7 +739,7 @@ class MainActivity : ComponentActivity() {
         .build()
     private val faceDetector = FaceDetection.getClient(faceDetectorOptions)
 
-    private val dfPlayerPlayRegex = Regex("dfplayer\\s*play\\s*(\\d+)", RegexOption.IGNORE_CASE)
+    private val dfPlayerPlayRegex = TrackList.actionRegex   // tumatanggap ng "12" o "12,13,14" (random)
 
     // ---------- CAMERA NAV (depth-based obstacle avoidance habang MOVING ang ESP32) ----------
 
@@ -902,7 +902,7 @@ class MainActivity : ComponentActivity() {
         // utos - para hindi sabay magsalita ang phone at ang robot. Tuloy pa rin ang movement/HOME.
         val ttsIsVoice = appTtsEnabled
         val dfTracks = if (!dfPlayerAllowed()) emptyList()
-            else parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.toIntOrNull() }
+            else parts.mapNotNull { dfPlayerPlayRegex.find(it)?.groupValues?.get(1)?.let { list -> TrackList.pick(list) }?.takeIf { n -> n > 0 } }
         val otherParts = parts
             .filterNot { dfPlayerPlayRegex.containsMatchIn(it) }
             .filterNot { ttsIsVoice && isDfPlayerRawCommand(it) }
@@ -938,8 +938,7 @@ class MainActivity : ComponentActivity() {
         return u.startsWith("PLAYSONG") || u.contains("ADVERT=") || u.contains("TRACK=")
     }
 
-    private fun unknownGreetingTrackList(): List<Int> =
-        unknownGreetingTracksRaw.split(",").mapNotNull { it.trim().toIntOrNull() }
+    private fun unknownGreetingTrackList(): List<Int> = TrackList.parse(unknownGreetingTracksRaw)
 
     private fun runMovementParts(otherParts: List<String>) {
         for (part in otherParts) {
@@ -2706,7 +2705,7 @@ class MainActivity : ComponentActivity() {
         val json = prefs.getString("greeting_tracks", "{}") ?: "{}"
         val obj = JSONObject(json)
         if (!obj.has(name)) return emptyList()
-        return obj.getString(name).split(",").mapNotNull { it.trim().toIntOrNull() }
+        return TrackList.parse(obj.getString(name))
     }
 
     private fun setGreetingTracks(name: String, tracksCsv: String) {
@@ -3496,8 +3495,7 @@ class MainActivity : ComponentActivity() {
         get() = prefs.getString("wake_tracks", "") ?: ""
         set(value) { prefs.edit().putString("wake_tracks", value).apply() }
 
-    private fun wakeTrackList(): List<Int> =
-        wakeTracksRaw.split(",").mapNotNull { it.trim().toIntOrNull() }.filter { it > 0 }
+    private fun wakeTrackList(): List<Int> = TrackList.parse(wakeTracksRaw)
 
     private fun flashWakeEyes() {
         val key = wakeEyesKey
@@ -4297,9 +4295,11 @@ class MainActivity : ComponentActivity() {
     private var pitEnabled: Boolean
         get() = prefs.getBoolean("pit_enabled", true)
         set(value) { prefs.edit().putBoolean("pit_enabled", value).apply() }
-    private var pitTrack: Int
-        get() = prefs.getInt("pit_track", 75)
-        set(value) { prefs.edit().putInt("pit_track", value.coerceAtLeast(0)).apply() }
+    // LISTAHAN ng DFPlayer track (hal. "75" o "75,76,77") - random ang pipiliin tuwing mag-trigger. Default 75 (dating isahang setting).
+    private val pitTrackSetting by lazy { TrackSetting(prefs, "pit_tracks", "pit_track", 75) }
+    private var pitTracksRaw: String
+        get() = pitTrackSetting.raw
+        set(value) { pitTrackSetting.raw = value }
     private var pitPhrase: String
         get() = prefs.getString("pit_phrase", "Ay nako, mahuhulog pala ako dito!") ?: "Ay nako, mahuhulog pala ako dito!"
         set(value) { prefs.edit().putString("pit_phrase", value.trim().ifEmpty { "Ay nako, mahuhulog pala ako dito!" }).apply() }
@@ -4381,7 +4381,8 @@ class MainActivity : ComponentActivity() {
         // 3) Boses: DFPlayer track LANG kapag OFF ang Gemini at OFF ang app TTS; kung hindi, TTS ng app
         //    (tahimik kung OFF din ang TTS) - para hindi magsabay ang phone at DFPlayer.
         if (dfPlayerAllowed()) {
-            if (pitTrack > 0) sendTrackDirect(pitTrack)
+            val pitTrackPicked = TrackList.pick(pitTracksRaw)
+            if (pitTrackPicked > 0) sendTrackDirect(pitTrackPicked)
         } else {
             speak(pitPhrase)
         }
@@ -4456,12 +4457,13 @@ class MainActivity : ComponentActivity() {
             setText(pitPhrase)
         }
         val trackLabel = TextView(this).apply {
-            text = tr("DFPlayer track (kapag OFF ang Gemini at OFF ang app TTS):")
+            text = tr("DFPlayer track (kapag OFF ang Gemini at OFF ang app TTS). Pwedeng higit sa isa, pinaghihiwalay ng kuwit - random ang pipiliin:")
             setPadding(0, 16, 0, 0)
         }
         val trackInput = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setText(pitTrack.toString())
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = tr("hal. 75 o 75,76,77 (random)")
+            setText(pitTracksRaw)
         }
         val testButton = Button(this).apply {
             text = tr("▶  Subukan ang reaksyon")
@@ -4469,7 +4471,7 @@ class MainActivity : ComponentActivity() {
             setOnClickListener {
                 // isinasave muna ang tina-type para marinig agad
                 pitPhrase = phraseInput.text.toString()
-                trackInput.text.toString().toIntOrNull()?.let { pitTrack = it }
+                pitTracksRaw = trackInput.text.toString()
                 onPitDetected("TEST", force = true)
             }
         }
@@ -4490,7 +4492,7 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton(tr("I-save")) { _, _ ->
                 pitEnabled = sw.isChecked
                 pitPhrase = phraseInput.text.toString()
-                trackInput.text.toString().toIntOrNull()?.let { pitTrack = it }
+                pitTracksRaw = trackInput.text.toString()
                 statusText.text = if (pitEnabled) tr("🕳️ Pit sensor: naka-on") else tr("🕳️ Pit sensor: naka-off")
             }
             .setNegativeButton("Cancel", null)
@@ -7482,8 +7484,7 @@ class MainActivity : ComponentActivity() {
             text = tr("▶  Subukan ang unang track")
             isAllCaps = false
             setOnClickListener {
-                val first = wakeTracksInput.text.toString().split(",")
-                    .mapNotNull { it.trim().toIntOrNull() }.firstOrNull { it > 0 }
+                val first = TrackList.parse(wakeTracksInput.text.toString()).firstOrNull()
                 if (first == null) {
                     statusText.text = tr("Maglagay muna ng track number")
                 } else {
@@ -7652,7 +7653,7 @@ class MainActivity : ComponentActivity() {
             inputType = InputType.TYPE_CLASS_TEXT
         }
         val actionInput = EditText(this).apply {
-            hint = tr("ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N - hiwalayin ng || kung gusto ng sabay)")
+            hint = tr("ESP32 action (opsyonal - hal. LEFT, RIGHT, STOP, dfplayer play N o dfplayer play 12,13,14 (random) - hiwalayin ng || kung gusto ng sabay)")
             // Walang autocapitalize/autocorrect - ang mga ESP32 param na gaya ng "track=" ay
             // case-sensitive, kaya delikado kung baguhin ng keyboard ang unang letra.
             inputType = InputType.TYPE_CLASS_TEXT or
