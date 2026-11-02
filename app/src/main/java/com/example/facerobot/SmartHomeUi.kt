@@ -34,7 +34,7 @@ class SmartHomeUi(
 ) {
     private fun ui(block: () -> Unit) = activity.runOnUiThread(block)
 
-    private val dfRegex = Regex("dfplayer\\s*play\\s*(\\d+)", RegexOption.IGNORE_CASE)
+    private val dfRegex = TrackList.actionRegex   // "12" o "12,13,14" (random)
 
     private fun actionParts(action: String): List<String> =
         action.split("||").map { it.trim() }.filter { it.isNotEmpty() }
@@ -539,8 +539,8 @@ class SmartHomeUi(
         val triggerInput = plainInput(tr("hal. buksan ang ilaw"), trigger)
         val replyInput = plainInput(tr("Isasagot ng robot"), reply)
         val actionInput = plainInput("HOME:...", action)
-        val trackInput = plainInput(tr("DFPlayer track # (opsyonal)"), track).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
+        val trackInput = plainInput(tr("DFPlayer track # (opsyonal, hal. 12 o 12,13,14 random)"), track).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
         }
 
         container.addView(label(tr("Sasabihin (hiwalayin ng || kung maraming paraan ng pagsabi):"), 0))
@@ -566,7 +566,7 @@ class SmartHomeUi(
                 )
             }
         ))
-        container.addView(label(tr("DFPlayer track para sa boses ng ESP32 (blangko = wala):")))
+        container.addView(label(tr("DFPlayer track para sa boses ng ESP32. Pwedeng higit sa isa, hiwalay ng kuwit (random). Blangko = wala:")))
         container.addView(trackInput)
         container.addView(row(
             button(tr("▶ Test aksyon")) {
@@ -580,8 +580,8 @@ class SmartHomeUi(
                 }
             },
             button(tr("▶ Test DFPlayer")) {
-                val n = trackInput.text.toString().trim().toIntOrNull()
-                if (n == null || n <= 0) {
+                val n = TrackList.parse(trackInput.text.toString()).firstOrNull()
+                if (n == null) {
                     say("⚠️ " + tr("Maglagay ng track number"))
                 } else {
                     say(tr("Pinapatugtog ang track {0}...").replace("{0}", n.toString()))
@@ -619,17 +619,17 @@ class SmartHomeUi(
                 val t = triggerInput.text.toString().trim()
                 val a = actionInput.text.toString().trim()
                 val tk = trackInput.text.toString().trim()
-                val trackNum = tk.toIntOrNull()
+                val trackList = TrackList.normalize(tk)   // "12, 13,14" -> "12,13,14"
                 val err = when {
                     t.isEmpty() -> tr("Kulang ang sasabihin")
                     actionParts(a).none { SmartHome.isHomeAction(it) } -> tr("Walang HOME: na aksyon - piliin ang aksyon")
-                    tk.isNotEmpty() && (trackNum == null || trackNum <= 0) -> tr("Maling DFPlayer track number")
+                    tk.isNotEmpty() && trackList.isEmpty() -> tr("Maling DFPlayer track number")
                     else -> null
                 }
                 if (err != null) {
                     showCommandEditor(original, t, replyInput.text.toString(), a, tk, "⚠️ $err")
                 } else {
-                    val finalAction = if (trackNum != null) "$a||DFPLAYER PLAY $trackNum" else a
+                    val finalAction = if (trackList.isNotEmpty()) "$a||DFPLAYER PLAY $trackList" else a
                     if (original != null && original.trigger != t.lowercase()) commandStore.remove(original.trigger)
                     commandStore.add(t, replyInput.text.toString(), finalAction, original?.expression ?: "")
                     val saved = tr("Na-save ang command: {0}").replace("{0}", t)
