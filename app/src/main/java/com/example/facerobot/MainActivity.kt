@@ -3569,34 +3569,35 @@ class MainActivity : ComponentActivity() {
 
     /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
     private fun doVoiceStop(heard: List<String> = emptyList()): String {
-        sendCommandToEsp32("FORCE_STOP")
+        // May custom track ba para sa stop (Mga Utos: "tigil || stop" + "dfplayer play 104,105")? Ipapadala kasabay ng
+        // FORCE_STOP: ang firmware (main.cpp, handleCommand FORCE_STOP) ang tutugtog nito KAPALIT ng default na track 10.
+        val stopTrack = findStopCustomTrack(heard)
+        sendCommandToEsp32(if (stopTrack > 0) "FORCE_STOP&track=$stopTrack" else "FORCE_STOP")
+        if (stopTrack > 0) markDfSpeaking(stopTrack)
         cancelPersonSearch()
         queuedGeminiCandidates = null
         flashCommandEyes()
         speak(tr("Hihinto na po!"))
-        runStopCustomTracks(heard)
         return "FORCE_STOP"
     }
 
     /**
-     * Ang STOP ("tigil", "stop", "hinto"...) ay safety fast-path na nauuna sa lahat, kaya DATI hindi na umaabot sa
-     * Mga Utos - ang DFPlayer track na nilagay mo sa "tigil || stop" ay hindi kailanman tumutugtog. Ngayon: pagkatapos
-     * ng FORCE_STOP, kung may custom command na ang trigger ay stop word at may "dfplayer play ..." ang action,
-     * tutugtog ang track nito (random kung higit sa isa). Track LANG ang ginagawa - hindi ang movement, dahil
-     * kakahinto lang ng robot. SAY ang gamit (tumutugtog sa anumang state ng ESP32; ang PLAY ay iniignora kapag hindi
-     * BOOT_WAIT), at may maikling antala para hindi matakpan ng sariling tunog ng firmware sa FORCE_STOP.
+     * Ang STOP ("tigil", "stop", "hinto"...) ay safety fast-path na nauuna sa lahat, kaya DATI hindi na umaabot sa Mga
+     * Utos - ang DFPlayer track na nilagay mo sa "tigil || stop" ay hindi kailanman tumutugtog; at ang firmware mismo
+     * ay tumutugtog ng track 10 sa FORCE_STOP. Dito hinahanap ang custom command na ang trigger ay stop word at may
+     * "dfplayer play ..." sa action; ang napili (random kung higit sa isa) ay ipapasa sa FORCE_STOP bilang &track=N.
+     * 0 = wala (gagamitin ng firmware ang default na 10). Track LANG - hindi ang movement, kakahinto lang ng robot.
      */
-    private fun runStopCustomTracks(heard: List<String>) {
-        if (heard.isEmpty() || !dfPlayerAllowed()) return
+    private fun findStopCustomTrack(heard: List<String>): Int {
+        if (heard.isEmpty() || !dfPlayerAllowed()) return 0
         val cmd = heard.firstNotNullOfOrNull { text ->
             commandStore.all().firstOrNull { c ->
                 c.action.isNotBlank() && c.triggerVariants().any { v -> text.contains(v) && stopStems.any { st -> v.contains(st) } }
             }
-        } ?: return
-        val track = cmd.action.split("||").map { it.trim() }
+        } ?: return 0
+        return cmd.action.split("||").map { it.trim() }
             .mapNotNull { part -> dfPlayerPlayRegex.find(part)?.groupValues?.get(1)?.let { TrackList.pick(it) }?.takeIf { it > 0 } }
-            .firstOrNull() ?: return
-        pingHandler.postDelayed({ sendTrackDirect(track) }, 350L)
+            .firstOrNull() ?: 0
     }
 
     /** Buong salita lang ang tugma (hindi "mata" sa "mataas", hindi "kaliwa" sa "kaliwang kamay"). */
@@ -6664,7 +6665,7 @@ class MainActivity : ComponentActivity() {
         val request = Request.Builder().url(url).build()
 
         val isAuto = command.equals("AUTO", ignoreCase = true)
-        val isForceStop = command.equals("FORCE_STOP", ignoreCase = true)
+        val isForceStop = command.startsWith("FORCE_STOP", ignoreCase = true)   // pati ang "FORCE_STOP&track=N"
 
         // Kritikal na utos (AUTO / FORCE_STOP): gamitin ang navClient - maikli ang timeout at hiwalay na
         // dispatcher, para hindi maiipit sa mga naka-hang na movement/DFPlayer request ng httpClient.
