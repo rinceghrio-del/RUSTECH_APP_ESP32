@@ -3568,13 +3568,35 @@ class MainActivity : ComponentActivity() {
         candidates.any { c -> stopStems.any { c.contains(it) } }
 
     /** UNA ang pagpapadala ng FORCE_STOP bago ang anumang mata/boses - para hindi maantala kung may mag-exception. */
-    private fun doVoiceStop(): String {
+    private fun doVoiceStop(heard: List<String> = emptyList()): String {
         sendCommandToEsp32("FORCE_STOP")
         cancelPersonSearch()
         queuedGeminiCandidates = null
         flashCommandEyes()
         speak(tr("Hihinto na po!"))
+        runStopCustomTracks(heard)
         return "FORCE_STOP"
+    }
+
+    /**
+     * Ang STOP ("tigil", "stop", "hinto"...) ay safety fast-path na nauuna sa lahat, kaya DATI hindi na umaabot sa
+     * Mga Utos - ang DFPlayer track na nilagay mo sa "tigil || stop" ay hindi kailanman tumutugtog. Ngayon: pagkatapos
+     * ng FORCE_STOP, kung may custom command na ang trigger ay stop word at may "dfplayer play ..." ang action,
+     * tutugtog ang track nito (random kung higit sa isa). Track LANG ang ginagawa - hindi ang movement, dahil
+     * kakahinto lang ng robot. SAY ang gamit (tumutugtog sa anumang state ng ESP32; ang PLAY ay iniignora kapag hindi
+     * BOOT_WAIT), at may maikling antala para hindi matakpan ng sariling tunog ng firmware sa FORCE_STOP.
+     */
+    private fun runStopCustomTracks(heard: List<String>) {
+        if (heard.isEmpty() || !dfPlayerAllowed()) return
+        val cmd = heard.firstNotNullOfOrNull { text ->
+            commandStore.all().firstOrNull { c ->
+                c.action.isNotBlank() && c.triggerVariants().any { v -> text.contains(v) && stopStems.any { st -> v.contains(st) } }
+            }
+        } ?: return
+        val track = cmd.action.split("||").map { it.trim() }
+            .mapNotNull { part -> dfPlayerPlayRegex.find(part)?.groupValues?.get(1)?.let { TrackList.pick(it) }?.takeIf { it > 0 } }
+            .firstOrNull() ?: return
+        pingHandler.postDelayed({ sendTrackDirect(track) }, 350L)
     }
 
     /** Buong salita lang ang tugma (hindi "mata" sa "mataas", hindi "kaliwa" sa "kaliwang kamay"). */
@@ -5105,7 +5127,7 @@ class MainActivity : ComponentActivity() {
             val rem = sleepRests.filterNotNull().filter { it.isNotBlank() }
             if (rem.isEmpty()) return            // "Rustech" lang - gising na
             if (hasStopWord(rem)) {
-                addVoiceLogEntry(rawHeard, doVoiceStop())
+                addVoiceLogEntry(rawHeard, doVoiceStop(rem))
                 return
             }
             wokeWithCommand = rem                // may kasamang utos ("Rustech, kumusta?") - ituloy
@@ -5129,7 +5151,7 @@ class MainActivity : ComponentActivity() {
         // HINDI kailangan ng wake word ang STOP - gumagana ito PALAGI.
         if (hasStopWord(rawCandidates)) {
             noteInteraction("hinto")   // "hinto" = tunay na interaction -> reset ang sleep timer
-            addVoiceLogEntry(rawHeard, doVoiceStop())
+            addVoiceLogEntry(rawHeard, doVoiceStop(rawCandidates))
             if (wakeEnabled) awakeUntil = System.currentTimeMillis() + wakeWindowSec * 1000L
             return
         }
@@ -5483,7 +5505,7 @@ class MainActivity : ComponentActivity() {
     private fun processVoiceCommand(candidates: List<String>): String {
         // STOP muna sa lahat ng alternatives - bago ang custom match o kaliwa/kanan (dati per-candidate
         // ang pagkakasunod, kaya "kaliwa" sa #1 ay nauuna sa "hinto" sa #2)
-        if (hasStopWord(candidates)) return doVoiceStop()
+        if (hasStopWord(candidates)) return doVoiceStop(candidates)
         tryHandleDisplayCommand(candidates)?.let { return it }
         tryHandlePhotoCommand(candidates)?.let { return it }
         for (text in candidates) {
