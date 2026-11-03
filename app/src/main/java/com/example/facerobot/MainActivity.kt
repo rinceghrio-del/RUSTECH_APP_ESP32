@@ -1008,9 +1008,81 @@ class MainActivity : ComponentActivity() {
      */
     private fun dfPlayerAllowed(): Boolean = !geminiEnabled && !appTtsEnabled
 
+    // ---- Pagsubaybay kung nagsasalita pa ang DFPlayer ----
+    // Walang ibinabalik na "tapos na" ang ESP32/DFPlayer, kaya TINATANTYA ang tagal ng bawat track: may sariling
+    // haba bawat track (Menu > "DFPlayer Haba") o ang default na segundo kung wala. Ang mga greeting ay HINIHINTAY
+    // munang matapos ang tinatayang oras bago pumasok (hindi nila inuubos ang cooldown, kaya babati pa rin sila
+    // pagkatapos basta nandoon pa rin ang tao/hayop sa harap).
+    @Volatile private var dfSpeakingUntil = 0L
+    private var dfDefaultSecs: Float
+        get() = prefs.getFloat("df_default_secs", 5f)
+        set(value) { prefs.edit().putFloat("df_default_secs", value.coerceIn(0f, 120f)).apply() }
+    /** Hal. "12=6, 13=3.5" - haba (segundo) ng bawat track. Ang wala rito ay gagamit ng default. */
+    private var dfTrackSecsRaw: String
+        get() = prefs.getString("df_track_secs", "") ?: ""
+        set(value) { prefs.edit().putString("df_track_secs", value.trim()).apply() }
+
+    private fun dfTrackDurationMs(track: Int): Long {
+        val map = dfTrackSecsRaw.split(',', ';', '\n').mapNotNull { part ->
+            val kv = part.split('=', ':')
+            if (kv.size != 2) null else {
+                val t = kv[0].trim().toIntOrNull()
+                val sec = kv[1].trim().replace(',', '.').toFloatOrNull()
+                if (t == null || sec == null) null else t to sec
+            }
+        }.toMap()
+        val secs = map[track] ?: dfDefaultSecs
+        return (secs * 1000f).toLong()
+    }
+
+    /** Tawagin tuwing may ipinapadalang track sa DFPlayer. */
+    private fun markDfSpeaking(track: Int) {
+        dfSpeakingUntil = System.currentTimeMillis() + dfTrackDurationMs(track)
+    }
+
+    private fun dfSpeakingNow(): Boolean = System.currentTimeMillis() < dfSpeakingUntil
+
+    private fun showDfDurationDialog() {
+        val note = TextView(this).apply {
+            text = tr("Walang ibinabalik na \"tapos na\" ang DFPlayer, kaya tinatantya ng app kung gaano katagal ang bawat track. Hinihintay munang matapos ang tinatayang oras bago pumasok ang mga greeting (bati). Itakda ang default na haba, at (opsyonal) ang haba ng bawat track na iba ang tagal.")
+            textSize = 12f
+            setPadding(0, 0, 0, 16)
+        }
+        val defLabel = TextView(this).apply { text = tr("Default na haba ng track (segundo):") }
+        val defInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
+            setText(dfDefaultSecs.toString().removeSuffix(".0"))
+        }
+        val perLabel = TextView(this).apply {
+            text = tr("Haba ng bawat track (opsyonal), hal. 12=6, 13=3.5, 75=2:")
+            setPadding(0, 16, 0, 0)
+        }
+        val perInput = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_TEXT
+            hint = "12=6, 13=3.5"
+            setText(dfTrackSecsRaw)
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(note); addView(defLabel); addView(defInput); addView(perLabel); addView(perInput)
+        }
+        ModernDialog()
+            .setTitle(tr("⏱ DFPlayer Haba"))
+            .setView(ScrollView(this).apply { addView(box) })
+            .setPositiveButton(tr("I-save")) { _, _ ->
+                defInput.text.toString().trim().replace(',', '.').toFloatOrNull()?.let { dfDefaultSecs = it }
+                dfTrackSecsRaw = perInput.text.toString()
+                statusText.text = tr("⏱ Na-save ang haba ng DFPlayer track")
+            }
+            .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
     private fun sendPlayTrack(track: Int) {
         // Tignan ang dfPlayerAllowed(): DFPlayer lang kapag OFF ang Gemini at OFF ang app TTS.
         if (!dfPlayerAllowed()) return
+        markDfSpeaking(track)
 
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
@@ -1043,6 +1115,7 @@ class MainActivity : ComponentActivity() {
             onDone()
             return
         }
+        markDfSpeaking(track)
 
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
@@ -1994,6 +2067,7 @@ class MainActivity : ComponentActivity() {
             makeCard("♟️", "Chess", tr("Level {0}", chessCoach.level.toString())) { showChessDialog() },
             makeCard("😴", tr("Sleep Mode"), if (sleepIdleMinutes > 0) tr("Auto: {0} min", sleepIdleMinutes.toString()) else tr("Mano-mano")) { showSleepDialog() },
             makeCard("🕳️", tr("Pit Sensor"), if (pitEnabled) tr("Naka-on") else tr("Naka-off")) { showPitDialog() },
+            makeCard("⏱", tr("DFPlayer Haba"), tr("Hintay ng bati")) { showDfDurationDialog() },
             makeCard("🗣️", tr("Bigkas ng Pangalan"), tr("Ayusin ang bigkas")) { showPronunciationDialog() },
             makeCard("🔔", "Wake Word", if (wakeEnabled) "\"Rustech\"" else tr("Naka-off")) { showWakeWordDialog() },
             makeCard("🔄", tr("Ikot (Voice)"), if (voiceInvertTurn) tr("Baligtad") else tr("Normal")) { showVoiceTurnDialog() },
@@ -2770,6 +2844,7 @@ class MainActivity : ComponentActivity() {
 
     private fun greetIfNeeded(name: String) {
         if (robotSleeping) return
+        if (dfSpeakingNow()) return   // may sinasabi pa ang DFPlayer - hintayin munang matapos bago bumati (hindi inuubos ang cooldown)
         val now = System.currentTimeMillis()
         val alreadyGreetedRecently = name == lastGreetedName && now - lastGreetedTime < greetingCooldownMs
         if (alreadyGreetedRecently) return
@@ -2798,6 +2873,7 @@ class MainActivity : ComponentActivity() {
 
     private fun greetUnknownIfNeeded() {
         if (robotSleeping) return
+        if (dfSpeakingNow()) return   // may sinasabi pa ang DFPlayer - hintayin munang matapos bago bumati (hindi inuubos ang cooldown)
         val now = System.currentTimeMillis()
         if (now - lastUnknownGreetTime < greetingCooldownMs) return
         lastUnknownGreetTime = now
@@ -2821,6 +2897,7 @@ class MainActivity : ComponentActivity() {
 
     private fun greetPetIfNeeded(label: String) {
         if (robotSleeping) return
+        if (dfSpeakingNow()) return   // may sinasabi pa ang DFPlayer - hintayin munang matapos bago bumati (hindi inuubos ang cooldown)
         val now = System.currentTimeMillis()
         if (now - lastPetGreetTime < petGreetingCooldownMs) return
         lastPetGreetTime = now
@@ -3138,6 +3215,35 @@ class MainActivity : ComponentActivity() {
     private var lastPartialStopTime = 0L
     private val androidMicHandler = Handler(android.os.Looper.getMainLooper())
     private val androidRestartRunnable = Runnable { startAndroidListening() }
+    private var androidLastStartAt = 0L     // huling beses na nagsimulang makinig
+    private var androidLastActiveAt = 0L    // huling beses na buhay/aktibo ang mic (para sa watchdog)
+    private val ERROR_SERVER_DISCONNECTED_CODE = 11   // SpeechRecognizer.ERROR_SERVER_DISCONNECTED (Android 12+)
+
+    /**
+     * Watchdog: kung hindi nakikinig ang Android mic nang >30s (at hindi naman naka-pause), o nakabitin sa
+     * "nakikinig" nang >60s na walang resulta/error, gumawa ng BAGONG recognizer at ulitin. Safety net para hindi
+     * na kailangang i-restart ang app kapag namatay ang recognizer service.
+     */
+    private val androidWatchdog = object : Runnable {
+        override fun run() {
+            if (shuttingDown || !micEngineAndroid) return
+            val now = System.currentTimeMillis()
+            if (!androidMicPaused) {
+                val deadIdle = !androidListening && now - androidLastActiveAt > 30_000L
+                val hung = androidListening && now - androidLastStartAt > 60_000L
+                if (deadIdle || hung) {
+                    addVoiceLogEntry("Mic", "watchdog: ${if (hung) "nakabitin" else "hindi nakikinig"} ang Android recognizer - bagong recognizer")
+                    androidMicHandler.removeCallbacks(androidRestartRunnable)
+                    destroyAndroidRecognizer()
+                    androidLastActiveAt = now
+                    startAndroidListening()
+                }
+            } else {
+                androidLastActiveAt = now
+            }
+            androidMicHandler.postDelayed(this, 10_000L)
+        }
+    }
 
     /** Isang daanan ng lahat ng engine: confidence gate -> STOP -> wake word -> handleVoiceCommand. */
     private fun handleRecognizedCandidates(candidates: List<Pair<String, Float>>) {
@@ -3175,6 +3281,7 @@ class MainActivity : ComponentActivity() {
         }
         speechService?.setPause(paused)
         androidMicPaused = paused
+        androidLastActiveAt = System.currentTimeMillis()
         if (micEngineAndroid) {
             if (paused) stopAndroidListening() else startAndroidListening()
         }
@@ -3192,6 +3299,9 @@ class MainActivity : ComponentActivity() {
             releaseVosk()   // hindi kailangan ang Vosk model - palayain ang memory
             androidMicPaused = isSpeaking
             androidErrorStreak = 0
+            androidLastActiveAt = System.currentTimeMillis()
+            androidMicHandler.removeCallbacks(androidWatchdog)
+            androidMicHandler.postDelayed(androidWatchdog, 10_000L)
             statusText.text = tr("🎤 Handa na makinig (Android)")
             addVoiceLogEntry("Mic", "engine: Android SpeechRecognizer (${androidSpeechLang()})")
             startAndroidListening()
@@ -3242,6 +3352,8 @@ class MainActivity : ComponentActivity() {
         }
         applyAndroidBeepMute(true)
         androidListening = true
+        androidLastStartAt = System.currentTimeMillis()
+        androidLastActiveAt = androidLastStartAt
         try {
             rec.startListening(intent)
         } catch (e: Throwable) {
@@ -3341,7 +3453,19 @@ class MainActivity : ComponentActivity() {
         override fun onError(error: Int) {
             resetPartialWake()
             androidListening = false
-            if (shuttingDown || !micEngineAndroid || androidMicPaused) return
+            if (shuttingDown || !micEngineAndroid) return
+            // Error 11 (ERROR_SERVER_DISCONNECTED): namatay ang koneksyon ng recognizer sa speech service. PATAY NA ang
+            // recognizer object na ito - kahit ilang beses i-startListening, 11 ulit ang lalabas at hindi na babalik
+            // hangga't hindi ginagawa ng BAGO. Dati ay ginagamit pa rin ang luma (at lumalampas pa sa pause check).
+            // Kaya: sirain at gumawa ng bago, kahit naka-pause (ang resume ang magsisimula gamit ang bago).
+            if (error == ERROR_SERVER_DISCONNECTED_CODE) {
+                androidErrorStreak++
+                addVoiceLogEntry("Mic", "Android recognizer error 11 (server disconnected) #$androidErrorStreak - gagawa ng bagong recognizer")
+                destroyAndroidRecognizer()
+                if (!androidMicPaused) scheduleAndroidRestart(minOf(500L * androidErrorStreak, 5000L))
+                return
+            }
+            if (androidMicPaused) return
             when (error) {
                 SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
                     // Normal lang ito kapag tahimik - ulit lang
@@ -3362,10 +3486,9 @@ class MainActivity : ComponentActivity() {
                         statusText.text = tr("⚠️ Hindi makarinig ang Android recognizer (walang internet?). Subukan ang Vosk (offline) sa Menu > Voice Engine.")
                     }
                     val wait = if (androidErrorStreak >= 8) 10_000L else minOf(androidErrorStreak * 1000L, 5000L)
-                    scheduleAndroidRestart(
-                        wait,
-                        recreate = error == SpeechRecognizer.ERROR_CLIENT || error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
-                    )
+                    // Bagong recognizer sa lahat ng di-inaasahang error (CLIENT, BUSY, TOO_MANY_REQUESTS, atbp.) - mas
+                    // ligtas kaysa ipilit ang lumang object na baka sira na.
+                    scheduleAndroidRestart(wait, recreate = true)
                 }
             }
         }
@@ -4423,6 +4546,7 @@ class MainActivity : ComponentActivity() {
 
     /** Patugtugin agad ang DFPlayer track (hiwalay na client para hindi maiipit sa tracking requests). Tignan ang dfPlayerAllowed() sa tumatawag. */
     private fun sendTrackDirect(track: Int) {
+        markDfSpeaking(track)
         // SAY (firmware V5.4.0): tumutugtog sa ANUMANG state; ang PLAY ay IGNORED kapag hindi STATE_BOOT_WAIT
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=SAY&track=$track")
@@ -4833,6 +4957,7 @@ class MainActivity : ComponentActivity() {
 
     private fun sendWakeTrackPriority(track: Int) {
         if (!dfPlayerAllowed()) return
+        markDfSpeaking(track)
         val request = Request.Builder()
             .url("$esp32BaseUrl/command?dir=PLAY&track=$track")
             .build()
