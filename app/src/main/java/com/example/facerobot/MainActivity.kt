@@ -409,7 +409,7 @@ class MainActivity : ComponentActivity() {
     )
 
     @Volatile private var voskModel: Model? = null
-    @Volatile private var speechService: SpeechService? = null
+    @Volatile private var speechService: AlexaMic? = null   // sariling mic engine (Alexa-style front-end) kapalit ng SpeechService
     @Volatile private var voskRecognizer: Recognizer? = null
     @Volatile private var voskSetupRunning = false     // iwas dobleng download/load
     @Volatile private var voskRestartAttempts = 0      // na-reset kapag may narinig ulit
@@ -3128,6 +3128,17 @@ class MainActivity : ComponentActivity() {
 
     private val voskMaxAlternatives = 3
 
+    // Alexa-style na pandinig para sa Vosk (tingnan ang AlexaMic.kt): auto-gain, noise gate, high-pass filter
+    private var alexaMic: Boolean
+        get() = prefs.getBoolean("alexa_mic", true)
+        set(value) { prefs.edit().putBoolean("alexa_mic", value).apply() }
+    private var alexaMaxGain: Int
+        get() = prefs.getInt("alexa_max_gain", 15)
+        set(value) { prefs.edit().putInt("alexa_max_gain", value.coerceIn(1, 30)).apply() }
+    private var alexaGate: Boolean
+        get() = prefs.getBoolean("alexa_gate", true)
+        set(value) { prefs.edit().putBoolean("alexa_gate", value).apply() }
+
     private fun startVoskListening() {
         if (shuttingDown) return
         if (speechService != null) return   // iwas dalawang mic service nang sabay
@@ -3136,7 +3147,12 @@ class MainActivity : ComponentActivity() {
             val recognizer = Recognizer(model, 16000.0f)
             recognizer.setWords(true)
             recognizer.setMaxAlternatives(voskMaxAlternatives)
-            val service = SpeechService(recognizer, 16000.0f)
+            val service = AlexaMic(
+                recognizer, 16000,
+                maxGain = alexaMaxGain.toFloat(),
+                gateEnabled = alexaGate,
+                bypass = !alexaMic
+            )
             voskRecognizer = recognizer
             speechService = service
             service.startListening(voskListener)
@@ -3151,13 +3167,28 @@ class MainActivity : ComponentActivity() {
 
     private val voskListener = object : VoskListener {
         override fun onPartialResult(hypothesis: String?) {
-            if (!wakeEnabled && !robotSleeping) return
-            val partial = try { JSONObject(hypothesis ?: "").optString("partial", "") } catch (e: Exception) { "" }
-            runOnUi { onPartialWakeCandidate(partial) }
+            val partial = try { JSONObject(hypothesis ?: "").optString("partial", "").trim() } catch (e: Exception) { "" }
+            runOnUi {
+                if (wakeEnabled || robotSleeping) onPartialWakeCandidate(partial)   // maagang wake response
+                if (partial.isEmpty()) {
+                    cancelFastCmd()
+                    return@runOnUi
+                }
+                if (!hasStopWord(listOf(partial))) {
+                    onPartialFastCommand(listOf(partial))   // eksaktong utos? gawin na agad kapag stable na
+                    return@runOnUi
+                }
+                // "hinto" - agad, hindi na hinihintay ang katapusan ng pangungusap (parang sa Android recognizer)
+                cancelFastCmd()
+                val now = System.currentTimeMillis()
+                if (now - lastPartialStopTime < 3000L) return@runOnUi
+                lastPartialStopTime = now
+                handleVoiceCommand(listOf(partial))
+            }
         }
 
         override fun onResult(hypothesis: String?) {
-            runOnUi { resetPartialWake() }   // dumating na ang final - hindi na kailangan ang maagang wake timer
+            runOnUi { resetPartialWake(); cancelFastCmd() }   // dumating na ang final - hindi na kailangan ang maagang wake timer
             val json = try { JSONObject(hypothesis ?: "") } catch (e: Exception) { null } ?: return
 
             val alternativesArray = json.optJSONArray("alternatives")
@@ -3175,6 +3206,19 @@ class MainActivity : ComponentActivity() {
             if (candidates.isEmpty()) return
 
             voskRestartAttempts = 0   // may narinig = gumagana ang mic
+
+            // Nagawa na ba ng partial result (hinto / mabilis na utos) ang utos na ito? Huwag nang ulitin.
+            val nowMs = System.currentTimeMillis()
+            val stopAlreadyHandled = hasStopWord(candidates.map { it.first }) && nowMs - lastPartialStopTime < 3000L
+            val firedText = fastCmdFiredText
+            val alreadyFast = firedText != null && nowMs - fastCmdFiredAt < 4000L &&
+                candidates.any { it.first.startsWith(firedText) || firedText.startsWith(it.first) }
+            if (alreadyFast) fastCmdFiredText = null
+
+            // Level ng mic sa Voice Log (gain / ingay / peak) - para makita kung sapat ang lakas ng boses
+            speechService?.let { addVoiceLogEntry("Mic", it.takeStats()) }
+            if (stopAlreadyHandled || alreadyFast) return
+
             handleRecognizedCandidates(candidates)
         }
 
@@ -3651,6 +3695,26 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             setPadding(0, 0, 0, 8)
         }
+        val alexaSwitch = Switch(this).apply {
+            text = tr("🎚️ Alexa-style na pandinig (Vosk)")
+            isChecked = alexaMic
+            setPadding(0, 16, 0, 8)
+        }
+        val alexaNote = TextView(this).apply {
+            text = tr("Para sa Vosk: kusang pinapalakas ang mahinang boses (auto-gain), tinatanggal ang ugong/ingay, at tahimik ang pinapasok sa Vosk kapag walang nagsasalita. Mas malayo ang abot ng boses mo.")
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        }
+        val gainInput = EditText(this).apply {
+            hint = "Max boost 1-30 (default 15)"
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setText(alexaMaxGain.toString())
+        }
+        val gateSwitch = Switch(this).apply {
+            text = tr("🔕 Noise gate (tahimik kapag walang nagsasalita)")
+            isChecked = alexaGate
+            setPadding(0, 8, 0, 8)
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
@@ -3660,6 +3724,10 @@ class MainActivity : ComponentActivity() {
             addView(beepNote)
             addView(fastSwitch)
             addView(fastNote)
+            addView(alexaSwitch)
+            addView(alexaNote)
+            addView(gainInput)
+            addView(gateSwitch)
         }
 
         ModernDialog()
@@ -3669,10 +3737,18 @@ class MainActivity : ComponentActivity() {
                 val engineChanged = engineSwitch.isChecked != micEngineAndroid
                 androidMuteBeep = beepSwitch.isChecked
                 fastPartialCmd = fastSwitch.isChecked
+                val newGain = gainInput.text.toString().toIntOrNull()?.coerceIn(1, 30) ?: alexaMaxGain
+                val alexaChanged = alexaSwitch.isChecked != alexaMic || gateSwitch.isChecked != alexaGate || newGain != alexaMaxGain
+                alexaMic = alexaSwitch.isChecked
+                alexaGate = gateSwitch.isChecked
+                alexaMaxGain = newGain
                 if (!androidMuteBeep) applyAndroidBeepMute(false)
                 micEngineAndroid = engineSwitch.isChecked
                 if (engineChanged) {
                     switchMicEngine()
+                } else if (alexaChanged && !micEngineAndroid && speechService != null) {
+                    restartVoskListening()   // ilapat agad ang bagong Alexa-style settings
+                    statusText.text = tr("Na-save ang Voice Engine settings")
                 } else {
                     statusText.text = tr("Na-save ang Voice Engine settings")
                 }
