@@ -3304,6 +3304,7 @@ class MainActivity : ComponentActivity() {
             androidMicHandler.postDelayed(androidWatchdog, 10_000L)
             statusText.text = tr("🎤 Handa na makinig (Android)")
             addVoiceLogEntry("Mic", "engine: Android SpeechRecognizer (${androidSpeechLang()})")
+            logAudioInputs()
             startAndroidListening()
         } else {
             releaseAndroidRecognizer()
@@ -3349,7 +3350,14 @@ class MainActivity : ComponentActivity() {
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 800L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 600L)
+            // Android 13+: bigyan ng "hint" ang recognizer - ang wake word at ang mga trigger ng Mga Utos mo.
+            // Mas madalas na tama ang "Rustech" at ang mga custom na utos kahit malayo/mahina ang boses.
+            if (Build.VERSION.SDK_INT >= 33) {
+                val bias = buildBiasingStrings()
+                if (bias.isNotEmpty()) putStringArrayListExtra("android.speech.extra.BIASING_STRINGS", bias)
+            }
         }
+        androidPeakRms = -100f
         applyAndroidBeepMute(true)
         androidListening = true
         androidLastStartAt = System.currentTimeMillis()
@@ -3407,10 +3415,105 @@ class MainActivity : ComponentActivity() {
         prefs.edit().putBoolean("beep_muted_by_app", mute).apply()
     }
 
+    // ======================= MABILIS NA RESPONSE / DIAGNOSTICS (Android recognizer) =======================
+    private var androidPeakRms = -100f   // pinakamalakas na level ng boses sa kasalukuyang session (dB, galing sa recognizer)
+
+    /** I-ON: kapag eksaktong trigger ng custom command ang naririnig sa partial result at hindi nagbago nang ~0.35s, gagawin na agad. */
+    private var fastPartialCmd: Boolean
+        get() = prefs.getBoolean("fast_partial_cmd", true)
+        set(value) { prefs.edit().putBoolean("fast_partial_cmd", value).apply() }
+
+    private var fastCmdSeq = 0
+    private var fastCmdPendingText: String? = null
+    private var fastCmdFiredText: String? = null
+    private var fastCmdFiredAt = 0L
+    private val fastCmdStableMs = 350L
+
+    private fun cancelFastCmd() {
+        fastCmdPendingText = null
+        fastCmdSeq++
+    }
+
+    /** Wake word + trigger ng Mga Utos -> hint para sa recognizer. */
+    private fun buildBiasingStrings(): ArrayList<String> {
+        val out = LinkedHashSet<String>()
+        out.add("Rustech")
+        try { out.addAll(wakeAliasSet()) } catch (_: Throwable) {}
+        try {
+            commandStore.all().forEach { c ->
+                c.triggerVariants().forEach { v ->
+                    val t = v.trim()
+                    if (t.isNotEmpty() && t.length <= 60) out.add(t)
+                }
+            }
+        } catch (_: Throwable) {}
+        return ArrayList(out.take(100))
+    }
+
+    /** Ang buong sinabi (pagkatapos ng wake word, kung meron) ay EKSAKTONG isa sa mga trigger ng custom command? */
+    private fun isFastCommandText(text: String): Boolean {
+        val now = System.currentTimeMillis()
+        val rest = stripWakeWord(text)
+        val body = (rest ?: text).trim().lowercase()
+        if (body.isEmpty()) return false
+        // Kailangan ng wake word o bukas pa ang wake window (kapag naka-ON ang wake word sa settings)
+        if (wakeEnabled && rest == null && now >= awakeUntil) return false
+        val cmd = commandStore.findMatch(body) ?: return false
+        return cmd.triggerVariants().any { it.trim().lowercase() == body }
+    }
+
+    /** Tinatawag sa bawat partial result: kung eksaktong utos at stable ng ~0.35s, gawin na agad (hindi na hihintayin ang final). */
+    private fun onPartialFastCommand(texts: List<String>) {
+        if (!fastPartialCmd || shuttingDown || isSpeaking || robotSleeping || gameModeActive) {
+            cancelFastCmd()
+            return
+        }
+        val text = texts.firstOrNull() ?: return
+        val now = System.currentTimeMillis()
+        if (text == fastCmdFiredText && now - fastCmdFiredAt < 4000L) return   // nagawa na - huwag ulitin
+        if (text == fastCmdPendingText) return                                  // hindi nagbago - tuloy ang timer
+        if (!isFastCommandText(text)) {
+            cancelFastCmd()
+            return
+        }
+        fastCmdPendingText = text
+        val seq = ++fastCmdSeq
+        earlyWakeHandler.postDelayed({
+            if (seq != fastCmdSeq || shuttingDown || isSpeaking || robotSleeping || gameModeActive) return@postDelayed
+            fastCmdPendingText = null
+            fastCmdFiredText = text
+            fastCmdFiredAt = System.currentTimeMillis()
+            lastVoiceActivityTime = fastCmdFiredAt
+            addVoiceLogEntry("Mic", "⚡ mabilis na utos (partial): \"$text\"")
+            handleVoiceCommand(listOf(text))
+        }, fastCmdStableMs)
+    }
+
+    /** Ilista sa Voice Log kung anong mic input ang available (para makita kung ang lavalier nga ang ginagamit). */
+    private fun logAudioInputs() {
+        try {
+            val am = getSystemService(AUDIO_SERVICE) as? AudioManager ?: return
+            val names = am.getDevices(AudioManager.GET_DEVICES_INPUTS).map { d ->
+                val kind = when (d.type) {
+                    15 -> "built-in mic"
+                    3, 4 -> "wired headset/mic"
+                    11, 22 -> "USB audio"
+                    7 -> "Bluetooth SCO (mababa ang quality)"
+                    26 -> "Bluetooth LE"
+                    else -> "type ${d.type}"
+                }
+                "$kind (${d.productName})"
+            }
+            addVoiceLogEntry("Mic", "mga input: " + names.joinToString(" | "))
+        } catch (_: Throwable) {
+            // hindi kritikal
+        }
+    }
+
     private val androidRecognitionListener = object : android.speech.RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
         override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onRmsChanged(rmsdB: Float) { if (rmsdB > androidPeakRms) androidPeakRms = rmsdB }
         override fun onBufferReceived(buffer: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onEvent(eventType: Int, params: Bundle?) {}
@@ -3421,7 +3524,11 @@ class MainActivity : ComponentActivity() {
             val texts = list.map { normalizeAndroidText(it) }.filter { it.isNotEmpty() }
             if (texts.isEmpty()) return
             onPartialWakeCandidate(texts.first())   // maagang wake response (hindi na hintayin ang final)
-            if (!hasStopWord(texts)) return
+            if (!hasStopWord(texts)) {
+                onPartialFastCommand(texts)         // eksaktong utos? gawin na agad kapag stable na
+                return
+            }
+            cancelFastCmd()
             val now = System.currentTimeMillis()
             if (now - lastPartialStopTime < 3000L) return
             lastPartialStopTime = now
@@ -3430,6 +3537,7 @@ class MainActivity : ComponentActivity() {
 
         override fun onResults(results: Bundle?) {
             resetPartialWake()
+            cancelFastCmd()
             androidListening = false
             androidErrorStreak = 0
             val list = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION).orEmpty()
@@ -3444,14 +3552,24 @@ class MainActivity : ComponentActivity() {
             if (pairs.isNotEmpty()) {
                 val stopAlreadyHandled = hasStopWord(pairs.map { it.first }) &&
                     System.currentTimeMillis() - lastPartialStopTime < 3000L
-                if (!stopAlreadyHandled) handleRecognizedCandidates(pairs)
+                // Nagawa na ng "mabilis na utos" (partial) ang utos na ito? Huwag nang ulitin sa final result.
+                val firedText = fastCmdFiredText
+                val alreadyFast = firedText != null && System.currentTimeMillis() - fastCmdFiredAt < 4000L &&
+                    pairs.any { it.first.startsWith(firedText) || firedText.startsWith(it.first) }
+                if (alreadyFast) fastCmdFiredText = null
+                // Mahina ang boses na nakuha ng mic? Sabihin sa log para malaman kung kailangang itaas ang gain.
+                if (androidPeakRms > -50f && androidPeakRms < 3f) {
+                    addVoiceLogEntry("Mic", "mahina ang boses (peak ${"%.1f".format(androidPeakRms)} dB) - itaas ang gain/volume ng lavalier receiver o ilapit ang mic")
+                }
+                if (!stopAlreadyHandled && !alreadyFast) handleRecognizedCandidates(pairs)
             }
             // Kung nagsalita ang robot habang pinoproseso (naka-pause na), ang resume na ang magsisimula ulit
-            if (!androidMicPaused) scheduleAndroidRestart(150L)
+            if (!androidMicPaused) scheduleAndroidRestart(50L)
         }
 
         override fun onError(error: Int) {
             resetPartialWake()
+            cancelFastCmd()
             androidListening = false
             if (shuttingDown || !micEngineAndroid) return
             // Error 11 (ERROR_SERVER_DISCONNECTED): namatay ang koneksyon ng recognizer sa speech service. PATAY NA ang
@@ -3470,7 +3588,7 @@ class MainActivity : ComponentActivity() {
                 SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
                     // Normal lang ito kapag tahimik - ulit lang
                     androidErrorStreak = 0
-                    scheduleAndroidRestart(300L)
+                    scheduleAndroidRestart(120L)
                 }
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     statusText.text = tr("❌ Walang mic permission ang Android recognizer")
@@ -3523,6 +3641,16 @@ class MainActivity : ComponentActivity() {
             textSize = 12f
             setPadding(0, 0, 0, 8)
         }
+        val fastSwitch = Switch(this).apply {
+            text = tr("⚡ Mabilis na utos (Android)")
+            isChecked = fastPartialCmd
+            setPadding(0, 16, 0, 8)
+        }
+        val fastNote = TextView(this).apply {
+            text = tr("Kapag eksaktong trigger ng isang custom command ang sinabi mo (hal. \"abante\"), gagawin na agad ng robot kahit hindi pa tapos ang recognizer - mas mabilis na sagot, parang Alexa. I-OFF kung may nagkakamaling utos.")
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
@@ -3530,6 +3658,8 @@ class MainActivity : ComponentActivity() {
             addView(engineNote)
             addView(beepSwitch)
             addView(beepNote)
+            addView(fastSwitch)
+            addView(fastNote)
         }
 
         ModernDialog()
@@ -3538,6 +3668,7 @@ class MainActivity : ComponentActivity() {
             .setPositiveButton(tr("I-save")) { _, _ ->
                 val engineChanged = engineSwitch.isChecked != micEngineAndroid
                 androidMuteBeep = beepSwitch.isChecked
+                fastPartialCmd = fastSwitch.isChecked
                 if (!androidMuteBeep) applyAndroidBeepMute(false)
                 micEngineAndroid = engineSwitch.isChecked
                 if (engineChanged) {
