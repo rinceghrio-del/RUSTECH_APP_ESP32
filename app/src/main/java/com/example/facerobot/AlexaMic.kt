@@ -56,6 +56,12 @@ class FarFieldDsp(
         private set
     @Volatile var speechOpen = false
         private set
+    /** Boses ba ang pinakahuling frame? (para sa pagbibilang ng tunay na boses sa utterance) */
+    @Volatile var lastFrameLoud = false
+        private set
+
+    /** Ilang 20 ms na frame bukas pa ang gate pagkatapos ng huling boses (mas maikli = mas mabilis ang tugon). */
+    var hangoverFrames: Int = HANGOVER_FRAMES
 
     private var onsetCount = 0
     private var hangover = 0
@@ -88,6 +94,7 @@ class FarFieldDsp(
         if (pk > peakAbs) peakAbs = pk
 
         if (bypass) {
+            lastFrameLoud = false
             System.arraycopy(input, 0, out, 0, n)
             return n
         }
@@ -113,6 +120,7 @@ class FarFieldDsp(
         val openThr = max(noiseFloor * 2.5f, MIN_SPEECH_RMS)
         val keepThr = max(noiseFloor * 1.6f, MIN_SPEECH_RMS * 0.7f)
         val loud = if (speechOpen) rms > keepThr else rms > openThr
+        lastFrameLoud = loud
         if (!speechOpen && !loud) {
             // hindi nagsasalita: i-update ang ingay ng paligid (mabilis bumaba, mabagal tumaas)
             val k = if (rms < noiseFloor) 0.2f else 0.01f
@@ -125,7 +133,7 @@ class FarFieldDsp(
             if (onsetCount >= ONSET_FRAMES || speechOpen) {
                 if (!speechOpen) emitNow = true   // kabubukas lang ng gate -> ilabas ang pre-roll
                 speechOpen = true
-                hangover = HANGOVER_FRAMES
+                hangover = hangoverFrames
             }
         } else {
             onsetCount = 0
@@ -180,15 +188,81 @@ class FarFieldDsp(
     }
 }
 
+/**
+ * Kinokolekta ang buong pangungusap (utterance) mula sa mga frame na lumalabas sa [FarFieldDsp] habang bukas ang gate.
+ * Pagkasara ng gate (natapos magsalita), ibinabalik ang audio para ipadala sa cloud speech-to-text.
+ * Ang mga napakaikling ingay (click, katok) ay itinatapon.
+ */
+class UtteranceCollector(
+    private val sampleRate: Int,
+    private val frameSize: Int,
+    private val hangoverFrames: Int,
+    private val maxSeconds: Int = 12,
+    private val minLoudFrames: Int = 12          // ~240 ms ng tunay na boses
+) {
+    private var buf = ShortArray(sampleRate * 4)
+    private var len = 0
+    private var loudFrames = 0
+    private var notified = false
+    var active = false
+        private set
+
+    fun discard() {
+        active = false
+        len = 0
+        loudFrames = 0
+        notified = false
+    }
+
+    /** Ibinabalik ang kumpletong utterance (PCM 16-bit mono) kapag tapos na, kung hindi ay null. */
+    fun feed(samples: ShortArray, w: Int, open: Boolean, loud: Boolean, onStart: () -> Unit): ShortArray? {
+        if (open) {
+            if (!active) {
+                active = true
+                len = 0
+                loudFrames = 0
+                notified = false
+            }
+            if (loud) loudFrames++
+            // I-abiso lang kapag tunay na boses na (hindi click/katok): ~120 ms
+            if (!notified && loudFrames >= 6) {
+                notified = true
+                onStart()
+            }
+            if (len + w > buf.size) buf = buf.copyOf(max(buf.size * 2, len + w))
+            System.arraycopy(samples, 0, buf, len, w)
+            len += w
+            if (len >= maxSeconds * sampleRate) return finish(trimTail = false)   // masyadong mahaba: putulin
+            return null
+        }
+        return if (active) finish(trimTail = true) else null
+    }
+
+    private fun finish(trimTail: Boolean): ShortArray? {
+        val total = len
+        val loudCount = loudFrames
+        discard()
+        if (loudCount < minLoudFrames || total <= 0) return null
+        // Ang hangover ay puro halos-tahimik na dulo: panatilihin lang ang ~160 ms para mas mabilis ang upload
+        val tail = if (trimTail) max(0, hangoverFrames - 8) * frameSize else 0
+        val end = max(total - tail, total / 2)
+        return buf.copyOf(end)
+    }
+}
+
 class AlexaMic(
-    private val recognizer: Recognizer,
+    private val recognizer: Recognizer?,                       // null = cloud mode (walang Vosk)
     private val sampleRate: Int = 16000,
     maxGain: Float = 15f,
     gateEnabled: Boolean = true,
     bypass: Boolean = false,
-    private val useSystemEffects: Boolean = true
+    private val useSystemEffects: Boolean = true,
+    private val onUtterance: ((ShortArray) -> Unit)? = null,   // cloud mode: kumpletong pangungusap (PCM 16k mono)
+    private val onSpeechStart: (() -> Unit)? = null,           // cloud mode: nagsimulang magsalita (tinatawag sa main thread)
+    hangoverFrames: Int = FarFieldDsp.HANGOVER_FRAMES
 ) {
-    private val dsp = FarFieldDsp(sampleRate, maxGain, gateEnabled, bypass)
+    private val dsp = FarFieldDsp(sampleRate, maxGain, gateEnabled, bypass).also { it.hangoverFrames = hangoverFrames }
+    private val collector = UtteranceCollector(sampleRate, sampleRate / 50, hangoverFrames)
     private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile private var running = false
@@ -292,6 +366,7 @@ class AlexaMic(
                     if (!wasPaused) {
                         wasPaused = true
                         chunkLen = 0
+                        collector.discard()
                     }
                     continue
                 }
@@ -302,18 +377,29 @@ class AlexaMic(
                 }
 
                 val w = dsp.process(inBuf, n, outBuf)
+
+                val rec = recognizer
+                if (rec == null) {
+                    // CLOUD MODE: kolektahin ang buong pangungusap, ipadala kapag tapos nang magsalita
+                    val done = collector.feed(outBuf, w, dsp.speechOpen, dsp.lastFrameLoud) {
+                        mainHandler.post { onSpeechStart?.invoke() }
+                    }
+                    if (done != null) onUtterance?.invoke(done)
+                    continue
+                }
+
                 System.arraycopy(outBuf, 0, chunk, chunkLen, w)
                 chunkLen += w
                 if (chunkLen < chunkTarget) continue
 
                 val len = chunkLen
                 chunkLen = 0
-                if (recognizer.acceptWaveForm(chunk, len)) {
-                    val res = recognizer.getResult()
+                if (rec.acceptWaveForm(chunk, len)) {
+                    val res = rec.getResult()
                     lastPartial = ""
                     mainHandler.post { l.onResult(res) }
                 } else {
-                    val part = recognizer.getPartialResult()
+                    val part = rec.getPartialResult()
                     if (part != lastPartial) {
                         lastPartial = part
                         mainHandler.post { l.onPartialResult(part) }
