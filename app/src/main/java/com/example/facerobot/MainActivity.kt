@@ -52,6 +52,7 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
@@ -2061,7 +2062,7 @@ class MainActivity : ComponentActivity() {
             makeCard("📏", "Distance", tr("Layo ng tao")) { showDistanceSettingsDialog() },
             makeCard("🎤", "Mic Sensitivity", "${(micConfidenceThreshold * 100).toInt()}%") { showMicSensitivityDialog() },
             makeCard("👁️", tr("Kusang Paningin"), if (observeEnabled) tr("Naka-on") else tr("Naka-off")) { showObserveDialog() },
-            makeCard("🎙️", "Voice Engine", if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
+            makeCard("🎙️", "Voice Engine", if (cloudModeOn) "Whisper (cloud)" else if (micEngineAndroid) "Android (Google)" else "Vosk (offline)") { showMicEngineDialog() },
             makeCard("🎚️", tr("Boses ng Robot"), tr("Pitch at bilis")) { showRobotVoiceDialog() },
             makeCard("🎮", tr("Laro (Hand Game)"), tr("Best: {0}", gameBestScore.toString())) { showGameDialog() },
             makeCard("♟️", "Chess", tr("Level {0}", chessCoach.level.toString())) { showChessDialog() },
@@ -3062,7 +3063,7 @@ class MainActivity : ComponentActivity() {
                 voskSetupRunning = false
                 runOnUi {
                     if (shuttingDown) return@runOnUi
-                    if (micEngineAndroid) { releaseVosk(); return@runOnUi }   // lumipat na sa Android recognizer
+                    if (micEngineAndroid || cloudModeOn) { releaseVosk(); return@runOnUi }   // lumipat na sa ibang engine
                     voskReady = true
                     statusText.text = tr("🎤 Handa na makinig (offline)")
                     startVoskListening()
@@ -3241,9 +3242,23 @@ class MainActivity : ComponentActivity() {
     //  - Android: built-in na SpeechRecognizer ng phone (Google). Mas tumpak sa Taglish at walang malaking model,
     //    pero karaniwang kailangan ng internet. Isang pangungusap lang ang kaya ng bawat "session", kaya inuulit
     //    ito nang tuloy-tuloy (restart loop) para laging nakikinig.
-    private var micEngineAndroid: Boolean
+    private var micEngineAndroidPref: Boolean
         get() = prefs.getBoolean("mic_engine_android", false)
         set(value) { prefs.edit().putBoolean("mic_engine_android", value).apply() }
+
+    // Cloud Whisper (Groq): pinakamalapit sa Alexa. Kapag naka-ON at may API key, ito ang engine at hindi ginagamit ang
+    // Android recognizer o Vosk (nananatili ang napili mong engine para pagbalik kapag in-OFF ang cloud).
+    private var cloudAsrEnabled: Boolean
+        get() = prefs.getBoolean("cloud_asr", false)
+        set(value) { prefs.edit().putBoolean("cloud_asr", value).apply() }
+    private var groqApiKey: String
+        get() = prefs.getString("groq_api_key", "") ?: ""
+        set(value) { prefs.edit().putString("groq_api_key", value.trim()).apply() }
+    private var groqAccurate: Boolean
+        get() = prefs.getBoolean("groq_accurate", true)
+        set(value) { prefs.edit().putBoolean("groq_accurate", value).apply() }
+    private val cloudModeOn: Boolean get() = cloudAsrEnabled && groqApiKey.isNotBlank()
+    private val micEngineAndroid: Boolean get() = micEngineAndroidPref && !cloudModeOn
 
     // Ang Android recognizer ay may "beep" tuwing nagsisimula/natatapos ang pakikinig (ilang segundo bawat isa).
     // Kapag ON, pansamantalang imu-mute ang notification/system stream HABANG nakikinig lang, at ibabalik pagkatapos.
@@ -3338,6 +3353,13 @@ class MainActivity : ComponentActivity() {
         // Kung na-crash ang app habang naka-mute ang beep dati, ibalik muna ang tunog
         if (prefs.getBoolean("beep_muted_by_app", false) && !androidBeepMuted) {
             applyAndroidBeepMute(false, force = true)
+        }
+        stopCloudListening()   // palaging linisin muna ang cloud mic bago pumili ng engine
+        if (cloudModeOn) {
+            releaseAndroidRecognizer()
+            releaseVosk()   // hindi kailangan ang Vosk model - palayain ang memory
+            startCloudListening()
+            return
         }
         if (micEngineAndroid) {
             releaseVosk()   // hindi kailangan ang Vosk model - palayain ang memory
@@ -3656,6 +3678,104 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ======================= CLOUD WHISPER (Groq) - "Alexa-style" na pakikinig =======================
+    // AlexaMic: auto-gain + noise gate + VAD -> kumpletong pangungusap -> Whisper (Groq) -> handleRecognizedCandidates().
+    @Volatile private var cloudMicActive = false
+    private var cloudAsr: CloudAsr? = null
+    private var cloudRestartAttempts = 0
+
+    /** Hint para sa Whisper: pangalan ng robot at mga trigger ng Mga Utos (mas tama ang "Rustech" at mga custom na utos). */
+    private fun buildWhisperPrompt(): String {
+        val sb = StringBuilder("Rustech robot. Mga utos: ")
+        try {
+            val seen = LinkedHashSet<String>()
+            commandStore.all().forEach { c -> c.triggerVariants().forEach { v -> val t = v.trim(); if (t.isNotEmpty() && t.length <= 40) seen.add(t) } }
+            sb.append(seen.take(40).joinToString(", "))
+        } catch (_: Throwable) {}
+        return sb.toString().take(350)
+    }
+
+    private val cloudListener = object : VoskListener {
+        override fun onPartialResult(hypothesis: String?) {}
+        override fun onResult(hypothesis: String?) {}
+        override fun onFinalResult(hypothesis: String?) {}
+        override fun onError(exception: Exception?) {
+            val reason = exception?.message ?: "mic error"
+            runOnUi { scheduleCloudRestart(reason) }
+        }
+        override fun onTimeout() {}
+    }
+
+    private fun scheduleCloudRestart(reason: String) {
+        if (shuttingDown || !cloudModeOn) return
+        if (cloudRestartAttempts >= 5) {
+            statusText.text = tr("❌ Hindi na bumalik ang mic. I-restart ang app.")
+            return
+        }
+        cloudRestartAttempts++
+        addVoiceLogEntry("Mic", "restart #$cloudRestartAttempts ($reason)")
+        androidMicHandler.postDelayed({
+            if (shuttingDown || !cloudModeOn) return@postDelayed
+            stopCloudListening()
+            startCloudListening()
+        }, 1000L * cloudRestartAttempts)
+    }
+
+    private fun startCloudListening() {
+        if (shuttingDown || speechService != null) return
+        val asr = CloudAsr(
+            client = httpClient,
+            apiKey = { groqApiKey },
+            model = { if (groqAccurate) "whisper-large-v3" else "whisper-large-v3-turbo" },
+            language = { if (appLanguage == "en") "en" else "tl" },
+            prompt = { buildWhisperPrompt() },
+            onText = { raw, ms -> runOnUi { onCloudText(raw, ms) } },
+            onInfo = { msg -> runOnUi { addVoiceLogEntry("Mic", msg); statusText.text = msg } }
+        )
+        cloudAsr = asr
+        val mic = AlexaMic(
+            recognizer = null,
+            sampleRate = 16000,
+            maxGain = alexaMaxGain.toFloat(),
+            gateEnabled = true,
+            bypass = false,
+            onUtterance = { pcm -> asr.submit(pcm, 16000) },
+            onSpeechStart = { if (!isSpeaking && !shuttingDown) statusText.text = tr("🎤 Nakikinig...") },
+            hangoverFrames = 26      // ~0.5 s na katahimikan = tapos na ang pangungusap
+        )
+        speechService = mic
+        cloudMicActive = true
+        mic.startListening(cloudListener)
+        if (isSpeaking) mic.setPause(true)
+        statusText.text = tr("☁️ Handa na makinig (Whisper)")
+        addVoiceLogEntry("Mic", "engine: Cloud Whisper (${if (groqAccurate) "large-v3" else "large-v3-turbo"}, ${if (appLanguage == "en") "en" else "tl"})")
+        logAudioInputs()
+    }
+
+    private fun stopCloudListening() {
+        if (!cloudMicActive && cloudAsr == null) return
+        val mic = speechService
+        speechService = null
+        cloudMicActive = false
+        try { mic?.stop() } catch (_: Throwable) {}
+        try { mic?.shutdown() } catch (_: Throwable) {}
+        try { cloudAsr?.shutdown() } catch (_: Throwable) {}
+        cloudAsr = null
+    }
+
+    private fun onCloudText(raw: String, latencyMs: Long) {
+        if (shuttingDown) return
+        val text = normalizeAndroidText(raw)
+        if (text.isBlank()) {
+            if (!isSpeaking && cloudMicActive) statusText.text = tr("☁️ Handa na makinig (Whisper)")
+            return
+        }
+        cloudRestartAttempts = 0
+        speechService?.let { addVoiceLogEntry("Mic", it.takeStats()) }
+        addVoiceLogEntry("Mic", "☁ ${latencyMs}ms: \"$text\"")
+        handleRecognizedCandidates(listOf(text to 1.0f))
+    }
+
     private fun switchMicEngine() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             statusText.text = tr("Kailangan muna ang mic permission")
@@ -3667,7 +3787,7 @@ class MainActivity : ComponentActivity() {
     private fun showMicEngineDialog() {
         val engineSwitch = Switch(this).apply {
             text = tr("🌐 Gamitin ang Android Speech Recognizer (Google)")
-            isChecked = micEngineAndroid
+            isChecked = micEngineAndroidPref
             setPadding(0, 16, 0, 8)
         }
         val engineNote = TextView(this).apply {
@@ -3715,9 +3835,34 @@ class MainActivity : ComponentActivity() {
             isChecked = alexaGate
             setPadding(0, 8, 0, 8)
         }
+        val cloudSwitch = Switch(this).apply {
+            text = tr("☁️ Cloud Whisper (Groq) - parang Alexa")
+            isChecked = cloudAsrEnabled
+            setPadding(0, 24, 0, 8)
+        }
+        val cloudNote = TextView(this).apply {
+            text = tr("Pinakamalapit sa Alexa: ang boses mo ay dadaan sa auto-gain/noise gate ng app, tapos sa Whisper (Groq) na mas tumpak sa Taglish at malayuang boses. Kailangan ng internet at libreng Groq API key (console.groq.com, walang credit card). Libre: 20 request/minuto at 2,000/araw. Kapag naka-ON ito, ito ang gagamitin kapalit ng Android recognizer/Vosk.")
+            textSize = 12f
+            setPadding(0, 0, 0, 8)
+        }
+        val groqKeyInput = EditText(this).apply {
+            hint = "Groq API key (gsk_...)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            setText(groqApiKey)
+            setSingleLine(true)
+        }
+        val accurateSwitch = Switch(this).apply {
+            text = tr("🎯 Mas tumpak (whisper-large-v3) - OFF = turbo, mas mabilis")
+            isChecked = groqAccurate
+            setPadding(0, 8, 0, 8)
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
+            addView(cloudSwitch)
+            addView(cloudNote)
+            addView(groqKeyInput)
+            addView(accurateSwitch)
             addView(engineSwitch)
             addView(engineNote)
             addView(beepSwitch)
@@ -3734,7 +3879,13 @@ class MainActivity : ComponentActivity() {
             .setTitle("🎙️ Voice Engine")
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton(tr("I-save")) { _, _ ->
-                val engineChanged = engineSwitch.isChecked != micEngineAndroid
+                val newGroqKey = groqKeyInput.text.toString().trim()
+                val cloudChanged = cloudSwitch.isChecked != cloudAsrEnabled || newGroqKey != groqApiKey ||
+                    accurateSwitch.isChecked != groqAccurate
+                val engineChanged = engineSwitch.isChecked != micEngineAndroidPref || cloudChanged
+                cloudAsrEnabled = cloudSwitch.isChecked
+                groqApiKey = newGroqKey
+                groqAccurate = accurateSwitch.isChecked
                 androidMuteBeep = beepSwitch.isChecked
                 fastPartialCmd = fastSwitch.isChecked
                 val newGain = gainInput.text.toString().toIntOrNull()?.coerceIn(1, 30) ?: alexaMaxGain
@@ -3743,8 +3894,11 @@ class MainActivity : ComponentActivity() {
                 alexaGate = gateSwitch.isChecked
                 alexaMaxGain = newGain
                 if (!androidMuteBeep) applyAndroidBeepMute(false)
-                micEngineAndroid = engineSwitch.isChecked
-                if (engineChanged) {
+                micEngineAndroidPref = engineSwitch.isChecked
+                if (cloudSwitch.isChecked && newGroqKey.isBlank()) {
+                    Toast.makeText(this, tr("Walang Groq API key - hindi pa magagamit ang Cloud Whisper"), Toast.LENGTH_LONG).show()
+                }
+                if (engineChanged || (alexaChanged && cloudModeOn)) {
                     switchMicEngine()
                 } else if (alexaChanged && !micEngineAndroid && speechService != null) {
                     restartVoskListening()   // ilapat agad ang bagong Alexa-style settings
@@ -8130,6 +8284,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         shuttingDown = true
+        stopCloudListening()
         super.onDestroy()
         if (displayListenerRegistered) {
             try { (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener) } catch (_: Exception) {}
