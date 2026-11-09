@@ -16,7 +16,8 @@ data class EspAlarm(
     val once: Boolean,
     val enabled: Boolean,
     val track: Int,
-    val label: String
+    val label: String,
+    val buzz: Boolean = true      // false = DFPlayer lang (walang buzzer)
 )
 
 data class AlarmState(
@@ -35,7 +36,8 @@ sealed class AlarmIntent {
         val minute: Int,
         val days: Int,
         val once: Boolean,
-        val relativeMinutes: Int? = null
+        val relativeMinutes: Int? = null,
+        val track: Int = 0            // 255 = musika ("... with music")
     ) : AlarmIntent()
 
     /** Magbura. [hour] null = walang sinabing oras. [hour12Only] = walang AM/PM kaya tugma ang AM at PM. */
@@ -74,6 +76,14 @@ object AlarmFormat {
             else -> (0..6).filter { m and (1 shl it) != 0 }.joinToString(", ") { dayShort[it] }
         }
         return prefix + body
+    }
+
+    /** "🔊12" / "🎵 musika" / "🔕 walang buzzer" - maikling paglalarawan ng tunog ng alarm. */
+    fun sound(track: Int, buzz: Boolean): String {
+        val parts = ArrayList<String>()
+        if (track == 255) parts.add("🎵 musika") else if (track > 0) parts.add("🔊$track")
+        if (!buzz) parts.add("🔕 walang buzzer")
+        return parts.joinToString(" · ")
     }
 
     /** Pangungusap para sa pagsasalita ng robot: "7:00 PM at 6:30 AM" */
@@ -320,11 +330,15 @@ object AlarmVoiceParser {
         findRelativeMinutes(t)?.let { mins ->
             val c = now.clone() as Calendar
             c.add(Calendar.MINUTE, mins)
-            return AlarmIntent.Set(c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), 0, true, mins)
+            return AlarmIntent.Set(c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE), 0, true, mins, musicTrack(t))
         }
         val raw = findAbsoluteTime(t) ?: return AlarmIntent.NeedTime
         val (days, once, tomorrow) = parseDays(t, now)
         val (hour, _) = resolveHour(raw, tomorrow, now) ?: return AlarmIntent.NeedTime
-        return AlarmIntent.Set(hour, raw.minute, days, once)
+        return AlarmIntent.Set(hour, raw.minute, days, once, null, musicTrack(t))
     }
+
+    /** "... with music" / "may musika" / "kantahan mo ako" -> 255 (musika bilang alarm, kasabay ng buzzer). */
+    private fun musicTrack(t: String): Int =
+        if (Regex("\\b(music|musika|kanta|song|tugtog|tugtugin)\\b").containsMatchIn(t)) 255 else 0
 }
