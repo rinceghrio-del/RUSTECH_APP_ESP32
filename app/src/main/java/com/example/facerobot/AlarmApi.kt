@@ -56,6 +56,7 @@ class AlarmApi(client: OkHttpClient, private val baseUrl: () -> String) {
 
     fun set(
         hour: Int, minute: Int, days: Int, once: Boolean, track: Int = 0, label: String = "", id: Int? = null,
+        buzz: Boolean = true,
         cb: (AlarmState?, String?) -> Unit
     ) {
         val p = ArrayList<Pair<String, String>>()
@@ -65,6 +66,7 @@ class AlarmApi(client: OkHttpClient, private val baseUrl: () -> String) {
         p.add("days" to days.toString())
         p.add("once" to (if (once) "1" else "0"))
         if (track > 0) p.add("track" to track.toString())
+        if (!buzz) p.add("buzz" to "0")            // DFPlayer lang, walang buzzer
         if (label.isNotBlank()) p.add("label" to label.trim())
         if (id != null) p.add("id" to id.toString())
         call(p, cb)
@@ -101,7 +103,8 @@ class AlarmApi(client: OkHttpClient, private val baseUrl: () -> String) {
                             once = a.optInt("once", 0) == 1,
                             enabled = a.optInt("on", 1) == 1,
                             track = a.optInt("track", 0),
-                            label = a.optString("label", "")
+                            label = a.optString("label", ""),
+                            buzz = a.optInt("buzz", 1) == 1
                         )
                     )
                 }
