@@ -7864,7 +7864,7 @@ class MainActivity : ComponentActivity() {
         return when (intent) {
             is AlarmIntent.Set -> {
                 alarmSyncThen {
-                    alarmApi.set(intent.hour, intent.minute, intent.days, intent.once) { st, err ->
+                    alarmApi.set(intent.hour, intent.minute, intent.days, intent.once, track = intent.track) { st, err ->
                         runOnUi { onAlarmSetResult(intent, st, err) }
                     }
                 }
@@ -7927,6 +7927,7 @@ class MainActivity : ComponentActivity() {
             intent.days == 0 && intent.once -> tr("Sige, naka-set na ang alarm sa {0}.", t)
             else -> tr("Sige, naka-set na ang alarm sa {0}, {1}.", t, AlarmFormat.days(intent.days, intent.once))
         }
+        if (intent.track == 255) msg += " " + tr("May music pa at buzzer!")
         if (!st.timeValid) msg += " " + tr("Pero wala pang tamang oras ang robot, kaya hindi pa tutunog.")
         statusText.text = "⏰ $msg"
         speak(msg)
@@ -8067,7 +8068,7 @@ class MainActivity : ComponentActivity() {
             val sw = Switch(this).apply {
                 text = AlarmFormat.time(a.hour, a.minute) + "\n" + AlarmFormat.days(a.days, a.once) +
                     (if (a.label.isNotBlank()) " · ${a.label}" else "") +
-                    (if (a.track > 0) " · 🔊${a.track}" else "")
+                    AlarmFormat.sound(a.track, a.buzz).let { if (it.isEmpty()) "" else " · $it" }
                 textSize = 15f
                 isChecked = a.enabled
                 setOnCheckedChangeListener { _, checked ->
@@ -8106,8 +8107,13 @@ class MainActivity : ComponentActivity() {
             setSingleLine(true)
         }
         val trackInput = EditText(this).apply {
-            hint = tr("DFPlayer track (opsyonal, 0 = buzzer lang)")
+            hint = tr("DFPlayer track (0 = buzzer lang, 255 = MUSIC)")
             inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val buzzSwitch = Switch(this).apply {
+            text = tr("🔔 Isabay ang buzzer sa DFPlayer")
+            isChecked = true
+            setPadding(0, 8, 0, 8)
         }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -8120,6 +8126,7 @@ class MainActivity : ComponentActivity() {
             addView(repeatSwitch)
             addView(labelInput)
             addView(trackInput)
+            addView(buzzSwitch)
         }
         ModernDialog()
             .setTitle(tr("⏰ Alarm sa {0}", AlarmFormat.time(hour, minute)))
@@ -8132,7 +8139,7 @@ class MainActivity : ComponentActivity() {
                 val track = trackInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 255) ?: 0
                 val label = labelInput.text.toString().trim()
                 alarmSyncThen {
-                    alarmApi.set(hour, minute, mask, once, track, label) { st, err ->
+                    alarmApi.set(hour, minute, mask, once, track, label, buzz = buzzSwitch.isChecked) { st, err ->
                         runOnUi {
                             if (st == null) alarmSpeakError(err)
                             else statusText.text = "⏰ " + tr("Naka-set: {0}", AlarmFormat.time(hour, minute))
