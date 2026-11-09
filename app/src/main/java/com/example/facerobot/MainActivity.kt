@@ -861,6 +861,7 @@ class MainActivity : ComponentActivity() {
         headScanHandler.post(headScanWatcherRunnable)
         observeHandler.postDelayed(observeTickRunnable, 8000L)
         pitHandler.postDelayed(pitPollRunnable, 3000L)
+        pitHandler.postDelayed(alarmPollRunnable, 4000L)   // alarm ng ESP32 (tumutunog? may tamang oras?)
         autoSleepHandler.postDelayed(autoSleepRunnable, 15_000L)
 
         initTts(preferredTtsEngine)
@@ -2053,6 +2054,7 @@ class MainActivity : ComponentActivity() {
         val cards = listOf(
             makeCard("🗣️", tr("Boses"), tr("Lokal na TTS")) { showLocalVoiceDialog() },
             makeCard("📶", tr("IP ng Robot"), esp32BaseUrl.removePrefix("http://")) { showIpSettingDialog() },
+            makeCard("⏰", tr("Alarm"), tr("Set ng alarm sa robot")) { showAlarmDialog() },
             makeCard(
                 "✨", tr("Mag-enroll ng mukha"),
                 if (canEnroll) tr("Bagong mukha") else tr("Kailangan ng mukha"),
@@ -5554,6 +5556,13 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // "set alarm to 7pm" / "cancel alarm" / "anong alarm ko" - lokal (ang ESP32 ang may hawak ng alarm)
+        tryHandleAlarmCommand(candidates)?.let { result ->
+            noteInteraction("lokal na utos")
+            addVoiceLogEntry(heardText, result)
+            return
+        }
+
         val useGemini = geminiEnabled && geminiApiKey.isNotBlank() &&
             System.currentTimeMillis() >= geminiCooldownUntil &&
             geminiUsedToday() < geminiDailyLimit
@@ -7756,6 +7765,383 @@ class MainActivity : ComponentActivity() {
                 statusText.text = tr("🧠 Nabura na ang memorya ng usapan")
             }
             .setNegativeButton("Cancel", null)
+            .showImmersive()
+    }
+
+    // ======================= ALARM (ESP32 main.cpp V5.5.0) =======================
+    // Ang ESP32 ang may hawak at nagti-trigger ng alarm (tutunog kahit patay ang app). Ang app ay taga-set (boses o screen),
+    // taga-tingin, at taga-patay. Tingnan ang AlarmApi.kt (HTTP) at AlarmVoice.kt (pag-intindi ng boses).
+    private val alarmApi by lazy { AlarmApi(httpClient) { esp32BaseUrl } }
+    @Volatile private var alarmRinging = false
+    @Volatile private var alarmPollInFlight = false
+    private var alarmRingDialog: android.app.Dialog? = null
+    private var lastAlarmTimeSyncAt = 0L
+
+    private val alarmPollRunnable = object : Runnable {
+        override fun run() {
+            if (shuttingDown) return
+            try { pollAlarm() } catch (_: Throwable) { }
+            pitHandler.postDelayed(this, 2000L)
+        }
+    }
+
+    /** Kada 2s: tingnan sa /ping kung tumutunog ang alarm ("|ALARM=1") at kung may tamang oras na ang ESP32 ("|TV=1"). */
+    private fun pollAlarm() {
+        if (alarmPollInFlight) return
+        alarmPollInFlight = true
+        val request = Request.Builder().url("$esp32BaseUrl/ping").build()
+        navClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                alarmPollInFlight = false
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                val body = try { response.use { it.body?.string() } } catch (e: Exception) { null }
+                alarmPollInFlight = false
+                runOnUi { onAlarmPollResult(body) }
+            }
+        })
+    }
+
+    private fun onAlarmPollResult(body: String?) {
+        val parts = body?.split("|")?.map { it.trim() } ?: return
+        if (parts.firstOrNull() != "PONG") return
+        val ringing = parts.contains("ALARM=1")
+        if (ringing && !alarmRinging) onAlarmRingStart()
+        if (!ringing && alarmRinging) onAlarmRingEnd()
+        // Walang NTP ang ESP32 (walang internet / bagong boot): ibigay ang oras ng phone para tumunog ang mga alarm.
+        if (parts.contains("TV=0")) syncEspTimeIfNeeded()
+    }
+
+    private fun syncEspTimeIfNeeded() {
+        val now = System.currentTimeMillis()
+        if (now - lastAlarmTimeSyncAt < 30_000L) return
+        lastAlarmTimeSyncAt = now
+        alarmApi.syncTime { _, _ -> }
+    }
+
+    /** I-sync muna ang oras (ina-apply lang ng ESP32 kung wala itong tamang oras), saka ituloy ang [next]. */
+    private fun alarmSyncThen(next: () -> Unit) {
+        alarmApi.syncTime { _, _ -> next() }
+    }
+
+    private fun onAlarmRingStart() {
+        alarmRinging = true
+        addVoiceLogEntry("⏰", tr("Tumutunog ang alarm ng robot"))
+        statusText.text = tr("⏰ Tumutunog ang alarm! Sabihin ang \"hinto\" para patayin.")
+        try { if (robotSleeping) wakeUpFromSleep("⏰ alarm", early = false) } catch (_: Throwable) { }
+        if (Build.VERSION.SDK_INT >= 27) {
+            try { setShowWhenLocked(true); setTurnScreenOn(true) } catch (_: Throwable) { }
+        }
+        alarmRingDialog?.let { if (it.isShowing) it.dismiss() }
+        alarmRingDialog = ModernDialog()
+            .setTitle(tr("⏰ Alarm!"))
+            .setMessage(tr("Tumutunog ang alarm ng robot."))
+            .setPositiveButton(tr("Patayin")) { _, _ ->
+                alarmApi.stop { _, _ -> runOnUi { onAlarmRingEnd() } }
+            }
+            .setNeutralButton(tr("Snooze 5 min")) { _, _ ->
+                alarmApi.snooze(5) { _, _ ->
+                    runOnUi {
+                        onAlarmRingEnd()
+                        statusText.text = tr("⏰ Snooze: tutunog ulit pagkalipas ng 5 minuto")
+                    }
+                }
+            }
+            .showImmersive()
+    }
+
+    private fun onAlarmRingEnd() {
+        alarmRinging = false
+        alarmRingDialog?.let { if (it.isShowing) it.dismiss() }
+        alarmRingDialog = null
+    }
+
+    // ---------- Boses ----------
+
+    /** "set alarm to 7pm" / "cancel alarm" / "anong alarm ko" / "patayin ang alarm" / "snooze alarm" - lokal, hindi dumadaan sa Gemini. */
+    private fun tryHandleAlarmCommand(candidates: List<String>): String? {
+        val intent = candidates.firstNotNullOfOrNull { AlarmVoiceParser.parse(it) } ?: return null
+        return when (intent) {
+            is AlarmIntent.Set -> {
+                alarmSyncThen {
+                    alarmApi.set(intent.hour, intent.minute, intent.days, intent.once) { st, err ->
+                        runOnUi { onAlarmSetResult(intent, st, err) }
+                    }
+                }
+                "⏰ mag-set ng alarm sa ${AlarmFormat.time(intent.hour, intent.minute)}"
+            }
+            is AlarmIntent.Delete -> {
+                alarmApi.list { st, err -> runOnUi { onAlarmDeletePlan(intent, st, err) } }
+                "⏰ burahin ang alarm"
+            }
+            is AlarmIntent.Snooze -> {
+                alarmApi.snooze(intent.minutes) { st, err ->
+                    runOnUi {
+                        if (st == null) { alarmSpeakError(err); return@runOnUi }
+                        onAlarmRingEnd()
+                        speak(tr("Sige, tutunog ulit pagkalipas ng {0} minuto.", intent.minutes.toString()))
+                    }
+                }
+                "⏰ snooze ${intent.minutes} min"
+            }
+            AlarmIntent.StopRinging -> {
+                alarmApi.stop { st, err ->
+                    runOnUi {
+                        if (st == null) { alarmSpeakError(err); return@runOnUi }
+                        onAlarmRingEnd()
+                        speak(tr("Napatay ko na ang alarm."))
+                    }
+                }
+                "⏰ patayin ang alarm"
+            }
+            AlarmIntent.ListAlarms -> {
+                alarmApi.list { st, err ->
+                    runOnUi {
+                        if (st == null) { alarmSpeakError(err); return@runOnUi }
+                        val on = st.alarms.filter { it.enabled }
+                        if (on.isEmpty()) speak(tr("Wala kang naka-set na alarm."))
+                        else speak(tr("May {0} kang alarm: {1}.", on.size.toString(), AlarmFormat.spokenList(on)))
+                    }
+                }
+                "⏰ listahan ng alarm"
+            }
+            AlarmIntent.NeedTime -> {
+                speak(tr("Anong oras ang alarm? Sabihin mo, halimbawa, set alarm to 7 PM."))
+                "⏰ walang oras na narinig"
+            }
+        }
+    }
+
+    private fun alarmSpeakError(err: String?) {
+        addVoiceLogEntry("⏰", err ?: "error")
+        statusText.text = "⏰ " + (err ?: tr("Hindi maabot ang robot"))
+        speak(tr("Pasensya na, hindi ko maabot ang alarm ng robot."))
+    }
+
+    private fun onAlarmSetResult(intent: AlarmIntent.Set, st: AlarmState?, err: String?) {
+        if (st == null) { alarmSpeakError(err); return }
+        val t = AlarmFormat.time(intent.hour, intent.minute)
+        var msg = when {
+            intent.relativeMinutes != null ->
+                tr("Sige, gigisingin kita pagkalipas ng {0} minuto, mga {1}.", intent.relativeMinutes.toString(), t)
+            intent.days == 0 && intent.once -> tr("Sige, naka-set na ang alarm sa {0}.", t)
+            else -> tr("Sige, naka-set na ang alarm sa {0}, {1}.", t, AlarmFormat.days(intent.days, intent.once))
+        }
+        if (!st.timeValid) msg += " " + tr("Pero wala pang tamang oras ang robot, kaya hindi pa tutunog.")
+        statusText.text = "⏰ $msg"
+        speak(msg)
+    }
+
+    private fun onAlarmDeletePlan(intent: AlarmIntent.Delete, st: AlarmState?, err: String?) {
+        if (st == null) { alarmSpeakError(err); return }
+        if (intent.all) {
+            alarmApi.deleteAll { s2, e2 ->
+                runOnUi { if (s2 == null) alarmSpeakError(e2) else speak(tr("Binura ko ang lahat ng alarm.")) }
+            }
+            return
+        }
+        val targets: List<EspAlarm>
+        val label: String
+        val hourReq = intent.hour
+        val minReq = intent.minute
+        if (hourReq != null && minReq != null) {
+            targets = st.alarms.filter {
+                it.minute == minReq && (if (intent.hour12Only) it.hour % 12 == hourReq else it.hour == hourReq)
+            }
+            label = if (intent.hour12Only) "${if (hourReq == 0) 12 else hourReq}:${minReq.toString().padStart(2, '0')}"
+            else AlarmFormat.time(hourReq, minReq)
+        } else {
+            targets = if (st.alarms.size == 1) st.alarms else emptyList()
+            label = ""
+            if (st.alarms.isEmpty()) { speak(tr("Wala kang naka-set na alarm.")); return }
+            if (st.alarms.size > 1) {
+                speak(tr("Marami kang alarm. Sabihin kung anong oras ang buburahin, o sabihin ang burahin lahat ng alarm."))
+                return
+            }
+        }
+        if (targets.isEmpty()) {
+            speak(tr("Walang alarm sa {0}.", label))
+            return
+        }
+        deleteAlarmsSequentially(targets.map { it.id }) { e ->
+            runOnUi {
+                if (e != null) alarmSpeakError(e)
+                else speak(if (label.isEmpty()) tr("Binura ko na ang alarm.") else tr("Binura ko ang alarm sa {0}.", label))
+            }
+        }
+    }
+
+    /** Isa-isa (ang web server ng ESP32 ay hindi maaasahan sa sabay-sabay na request). */
+    private fun deleteAlarmsSequentially(ids: List<Int>, done: (String?) -> Unit) {
+        if (ids.isEmpty()) { done(null); return }
+        alarmApi.delete(ids.first()) { st, err ->
+            if (st == null) done(err) else deleteAlarmsSequentially(ids.drop(1), done)
+        }
+    }
+
+    // ---------- Screen: Menu > ⏰ Alarm ----------
+
+    private fun showAlarmDialog() {
+        val statusLine = TextView(this).apply {
+            textSize = 12f
+            text = tr("Kinukuha ang listahan mula sa robot...")
+            setPadding(0, 0, 0, 12)
+        }
+        val listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var refresh: () -> Unit = {}
+        var triedSync = false
+
+        val addButton = android.widget.Button(this).apply {
+            text = tr("➕ Magdagdag ng alarm")
+            setAllCaps(false)
+            setOnClickListener {
+                android.app.TimePickerDialog(this@MainActivity, { _, h, m ->
+                    showAlarmOptionsDialog(h, m) { refresh() }
+                }, 7, 0, false).show()
+            }
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(statusLine)
+            addView(listBox)
+            addView(addButton)
+        }
+        val scroll = ScrollView(this).apply { addView(box) }
+
+        refresh = {
+            runOnUi { statusLine.text = tr("Kinukuha ang listahan mula sa robot...") }
+            alarmApi.list { st, err ->
+                if (st != null && !st.timeValid && !triedSync) {
+                    triedSync = true
+                    alarmApi.syncTime { _, _ -> refresh() }
+                } else {
+                    runOnUi { renderAlarmList(st, err, statusLine, listBox) { refresh() } }
+                }
+            }
+        }
+        refresh()
+
+        ModernDialog()
+            .setTitle(tr("⏰ Alarm ng Robot"))
+            .setMessage(tr("Ang robot ang tumutunog ng alarm, kahit patay ang app. Pwede ka ring mag-set gamit ang boses: \"set alarm to 7 PM\"."))
+            .setView(scroll)
+            .setPositiveButton(tr("Isara"), null)
+            .showImmersive()
+    }
+
+    private fun renderAlarmList(st: AlarmState?, err: String?, statusLine: TextView, listBox: LinearLayout, refresh: () -> Unit) {
+        listBox.removeAllViews()
+        if (st == null) {
+            statusLine.text = "⚠️ " + (err ?: tr("Hindi maabot ang robot"))
+            return
+        }
+        val fmt = java.text.SimpleDateFormat("h:mm a", java.util.Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("GMT+08:00")
+        }
+        val clock = if (st.timeValid) tr("🕒 Oras ng robot: {0}", fmt.format(java.util.Date(st.nowEpoch * 1000L)))
+        else tr("🕒 Wala pang tamang oras ang robot (walang internet?)")
+        statusLine.text = clock + (if (st.snooze) "  ·  💤 snooze" else "")
+
+        if (st.ringing) {
+            listBox.addView(android.widget.Button(this).apply {
+                text = tr("🔕 Patayin ang tumutunog")
+                setAllCaps(false)
+                setOnClickListener { alarmApi.stop { _, _ -> runOnUi { onAlarmRingEnd(); refresh() } } }
+            })
+        }
+        if (st.alarms.isEmpty()) {
+            listBox.addView(TextView(this).apply {
+                text = tr("Walang alarm. Pindutin ang ➕ o sabihin: \"set alarm to 7 PM\".")
+                textSize = 13f
+                setPadding(0, 12, 0, 12)
+            })
+            return
+        }
+        for (a in st.alarms) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, 8, 0, 8)
+                gravity = android.view.Gravity.CENTER_VERTICAL
+            }
+            val sw = Switch(this).apply {
+                text = AlarmFormat.time(a.hour, a.minute) + "\n" + AlarmFormat.days(a.days, a.once) +
+                    (if (a.label.isNotBlank()) " · ${a.label}" else "") +
+                    (if (a.track > 0) " · 🔊${a.track}" else "")
+                textSize = 15f
+                isChecked = a.enabled
+                setOnCheckedChangeListener { _, checked ->
+                    alarmApi.enable(a.id, checked) { s2, e2 ->
+                        if (s2 == null) runOnUi { statusLine.text = "⚠️ " + (e2 ?: "") }
+                    }
+                }
+            }
+            row.addView(sw, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(android.widget.Button(this).apply {
+                text = "🗑"
+                setAllCaps(false)
+                setOnClickListener { alarmApi.delete(a.id) { _, _ -> refresh() } }
+            })
+            listBox.addView(row)
+        }
+    }
+
+    /** Pagkatapos pumili ng oras: araw, ulitin ba, pangalan, at (opsyonal) DFPlayer track. */
+    private fun showAlarmOptionsDialog(hour: Int, minute: Int, onDone: () -> Unit) {
+        val names = listOf("Lin", "Lun", "Mar", "Miy", "Huw", "Biy", "Sab")
+        val checks = names.map { n -> android.widget.CheckBox(this).apply { text = n } }
+        val daysRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            checks.forEach { addView(it) }
+        }
+        val daysScroll = android.widget.HorizontalScrollView(this).apply { addView(daysRow) }
+        val repeatSwitch = Switch(this).apply {
+            text = tr("🔁 Ulit-ulitin (tuwing). OFF = isang beses lang")
+            isChecked = false
+            setPadding(0, 12, 0, 8)
+        }
+        val labelInput = EditText(this).apply {
+            hint = tr("Pangalan (opsyonal)")
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+        }
+        val trackInput = EditText(this).apply {
+            hint = tr("DFPlayer track (opsyonal, 0 = buzzer lang)")
+            inputType = InputType.TYPE_CLASS_NUMBER
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 16, 48, 16)
+            addView(TextView(this@MainActivity).apply {
+                text = tr("Mga araw (wala = kahit anong araw):")
+                textSize = 12f
+            })
+            addView(daysScroll)
+            addView(repeatSwitch)
+            addView(labelInput)
+            addView(trackInput)
+        }
+        ModernDialog()
+            .setTitle(tr("⏰ Alarm sa {0}", AlarmFormat.time(hour, minute)))
+            .setView(box)
+            .setPositiveButton(tr("I-set")) { _, _ ->
+                var mask = 0
+                checks.forEachIndexed { i, c -> if (c.isChecked) mask = mask or (1 shl i) }
+                if (mask == 0x7F) mask = 0
+                val once = !repeatSwitch.isChecked
+                val track = trackInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 255) ?: 0
+                val label = labelInput.text.toString().trim()
+                alarmSyncThen {
+                    alarmApi.set(hour, minute, mask, once, track, label) { st, err ->
+                        runOnUi {
+                            if (st == null) alarmSpeakError(err)
+                            else statusText.text = "⏰ " + tr("Naka-set: {0}", AlarmFormat.time(hour, minute))
+                            onDone()
+                        }
+                    }
+                }
+            }
+            .setNegativeButton(tr("Cancel"), null)
             .showImmersive()
     }
 
