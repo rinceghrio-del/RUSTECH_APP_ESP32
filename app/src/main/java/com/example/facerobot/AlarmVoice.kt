@@ -202,6 +202,15 @@ object AlarmVoiceParser {
         if (keyed != null && keyed.groupValues[1].toInt() in 0..24 && keyed.groupValues[2].toInt() in 0..59) {
             return RawTime(keyed.groupValues[1].toInt(), keyed.groupValues[2].toInt(), period)
         }
+        // "500 ng hapon" / "520 ngayong hapon" / "1030 ng gabi" / "0730": isinusulat ng speech recognizer ang oras nang walang colon
+        for (m in Regex("\\b(\\d{3,4})\\b(?! $DURATION)").findAll(t)) {
+            val digits = m.groupValues[1]
+            val v = digits.toInt()
+            val h = v / 100
+            val mi = v % 100
+            val looksLikeYear = digits.length == 4 && v in 1990..2100 && period == null
+            if (h in 0..24 && mi in 0..59 && !looksLikeYear) return RawTime(h, mi, period)
+        }
         Regex("\\b(\\d{1,2}) (am|pm)\\b").find(t)?.let { m ->
             return withMedya(t, RawTime(m.groupValues[1].toInt(), 0, period))
         }
@@ -296,7 +305,7 @@ object AlarmVoiceParser {
         val mentionsAlarm = Regex("\\b(alarm|alarma|alarms)\\b").containsMatchIn(t)
 
         // 1) Listahan
-        if (mentionsAlarm && Regex(
+        if (mentionsAlarm && findAbsoluteTime(t) == null && Regex(
                 "\\b(anong alarm|ano ang alarm|ano ang mga alarm|anong mga alarm|ano mga alarm|what alarms?|list alarms?|list of alarms?|" +
                     "show alarms?|mga alarm ko|alarms ko|ilan ang alarm|ilang alarm|may alarm ba|kailan ang alarm|" +
                     "what time is my alarm|anong oras ang alarm|check alarms?|do i have an alarm|do i have any alarms?)\\b"
