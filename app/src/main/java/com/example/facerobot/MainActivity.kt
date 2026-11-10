@@ -7915,7 +7915,7 @@ class MainActivity : ComponentActivity() {
     private fun alarmSpeakError(err: String?) {
         addVoiceLogEntry("⏰", err ?: "error")
         statusText.text = "⏰ " + (err ?: tr("Hindi maabot ang robot"))
-        speak(tr("Pasensya na, hindi ko maabot ang alarm ng robot."))
+        speak(tr("Pasensya na, hindi ko maabot ng robot."))
     }
 
     private fun onAlarmSetResult(intent: AlarmIntent.Set, st: AlarmState?, err: String?) {
