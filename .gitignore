@@ -1,0 +1,15 @@
+﻿# Gradle / Android
+.gradle/
+build/
+local.properties
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing at secrets
+*.jks
+*.keystore
+google-services.json
+secrets.properties
