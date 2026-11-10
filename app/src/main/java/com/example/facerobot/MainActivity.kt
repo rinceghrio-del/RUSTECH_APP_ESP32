@@ -7777,6 +7777,31 @@ class MainActivity : ComponentActivity() {
     private var alarmRingDialog: android.app.Dialog? = null
     private var lastAlarmTimeSyncAt = 0L
 
+    /** DFPlayer track na tutugtog pagkatapos mag-set ng alarm (0 = wala). Nakatakda sa Menu > ⏰ Alarm. */
+    private var alarmSetTrack: Int
+        get() = prefs.getInt("alarm_set_track", 0)
+        set(value) { prefs.edit().putInt("alarm_set_track", value.coerceIn(0, 255)).apply() }
+
+    /**
+     * Patugtugin ang track na napili mo para sa "naka-set na ang alarm". Hindi ito naka-mute ng Gemini/TTS setting
+     * (ikaw mismo ang pumili ng track), at minamarkahan ang mic na "nagsasalita ang robot" para hindi marinig ng sarili.
+     * Ibinabalik ang true kung may naka-set na track (ibig sabihin, hindi na kailangan ang TTS na kumpirmasyon).
+     */
+    private fun playAlarmSetTrack(track: Int = alarmSetTrack): Boolean {
+        if (track <= 0) return false
+        markDfSpeaking(track)
+        val request = Request.Builder().url("$esp32BaseUrl/command?dir=PLAY&track=$track").build()
+        httpClient.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                runOnUi { addVoiceLogEntry("⏰ track $track", "HTTP FAILED: ${e.message}") }
+            }
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.close()
+            }
+        })
+        return true
+    }
+
     private val alarmPollRunnable = object : Runnable {
         override fun run() {
             if (shuttingDown) return
@@ -7915,7 +7940,7 @@ class MainActivity : ComponentActivity() {
     private fun alarmSpeakError(err: String?) {
         addVoiceLogEntry("⏰", err ?: "error")
         statusText.text = "⏰ " + (err ?: tr("Hindi maabot ang robot"))
-        speak(tr("Pasensya na, hindi ko maabot ng robot."))
+        speak(tr("Pasensya na, hindi ko maabot ang alarm ng robot."))
     }
 
     private fun onAlarmSetResult(intent: AlarmIntent.Set, st: AlarmState?, err: String?) {
@@ -7928,9 +7953,18 @@ class MainActivity : ComponentActivity() {
             else -> tr("Sige, naka-set na ang alarm sa {0}, {1}.", t, AlarmFormat.days(intent.days, intent.once))
         }
         if (intent.track == 255) msg += " " + tr("May music pa at buzzer!")
-        if (!st.timeValid) msg += " " + tr("Pero wala pang tamang oras ang robot, kaya hindi pa tutunog.")
-        statusText.text = "⏰ $msg"
-        speak(msg)
+        val warn = if (!st.timeValid) tr("Pero wala pang tamang oras ang robot, kaya hindi pa tutunog.") else ""
+        statusText.text = "⏰ $msg $warn".trim()
+        // May napiling track sa menu: ANG TRACK LANG ang kumpirmasyon (walang TTS na sasabay para hindi magkagulo ang boses).
+        // Ang babala lang (kapag may problema) ay sasabihin PAGKATAPOS ng clip.
+        if (playAlarmSetTrack()) {
+            if (warn.isNotEmpty()) {
+                val wait = (dfSpeakingUntil - System.currentTimeMillis()).coerceIn(0L, 20_000L)
+                pitHandler.postDelayed({ if (!shuttingDown) speak(warn) }, wait)
+            }
+        } else {
+            speak("$msg $warn".trim())
+        }
     }
 
     private fun onAlarmDeletePlan(intent: AlarmIntent.Delete, st: AlarmState?, err: String?) {
@@ -8001,12 +8035,49 @@ class MainActivity : ComponentActivity() {
                 }, 7, 0, false).show()
             }
         }
+        // Track na tutugtog pagkatapos mag-set ng alarm (boses man o screen)
+        val confirmLabel = TextView(this).apply {
+            text = tr("🔊 Track na tutugtog pagkatapos mag-set ng alarm (DFPlayer, 0 = wala):")
+            textSize = 12f
+            setPadding(0, 24, 0, 4)
+        }
+        val confirmInput = EditText(this).apply {
+            hint = tr("Numero ng track (0 = wala)")
+            inputType = InputType.TYPE_CLASS_NUMBER
+            if (alarmSetTrack > 0) setText(alarmSetTrack.toString())
+        }
+        val confirmSave = android.widget.Button(this).apply {
+            text = tr("💾 I-save")
+            setAllCaps(false)
+            setOnClickListener {
+                val n = confirmInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 255) ?: 0
+                alarmSetTrack = n
+                statusLine.text = if (n > 0) tr("Na-save: track {0} ang tutugtog pagkatapos mag-set ng alarm", n.toString())
+                else tr("Na-save: walang track (TTS na lang ang kumpirmasyon)")
+            }
+        }
+        val confirmTest = android.widget.Button(this).apply {
+            text = tr("▶ Test")
+            setAllCaps(false)
+            setOnClickListener {
+                val n = confirmInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 255) ?: 0
+                if (n > 0) playAlarmSetTrack(n) else statusLine.text = tr("Maglagay muna ng track number")
+            }
+        }
+        val confirmRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(confirmSave)
+            addView(confirmTest)
+        }
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
             addView(statusLine)
             addView(listBox)
             addView(addButton)
+            addView(confirmLabel)
+            addView(confirmInput)
+            addView(confirmRow)
         }
         val scroll = ScrollView(this).apply { addView(box) }
 
@@ -8107,14 +8178,10 @@ class MainActivity : ComponentActivity() {
             setSingleLine(true)
         }
         val trackInput = EditText(this).apply {
-            hint = tr("DFPlayer track (0 = buzzer lang, 255 = MUSIC)")
+            hint = tr("DFPlayer track (0 = buzzer lang, 255 = MUSIC). Laging kasabay ng buzzer.")
             inputType = InputType.TYPE_CLASS_NUMBER
         }
-        val buzzSwitch = Switch(this).apply {
-            text = tr("🔔 Isabay ang buzzer sa DFPlayer")
-            isChecked = true
-            setPadding(0, 8, 0, 8)
-        }
+
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 16, 48, 16)
@@ -8126,7 +8193,6 @@ class MainActivity : ComponentActivity() {
             addView(repeatSwitch)
             addView(labelInput)
             addView(trackInput)
-            addView(buzzSwitch)
         }
         ModernDialog()
             .setTitle(tr("⏰ Alarm sa {0}", AlarmFormat.time(hour, minute)))
@@ -8139,10 +8205,13 @@ class MainActivity : ComponentActivity() {
                 val track = trackInput.text.toString().trim().toIntOrNull()?.coerceIn(0, 255) ?: 0
                 val label = labelInput.text.toString().trim()
                 alarmSyncThen {
-                    alarmApi.set(hour, minute, mask, once, track, label, buzz = buzzSwitch.isChecked) { st, err ->
+                    alarmApi.set(hour, minute, mask, once, track, label) { st, err ->
                         runOnUi {
                             if (st == null) alarmSpeakError(err)
-                            else statusText.text = "⏰ " + tr("Naka-set: {0}", AlarmFormat.time(hour, minute))
+                            else {
+                                statusText.text = "⏰ " + tr("Naka-set: {0}", AlarmFormat.time(hour, minute))
+                                playAlarmSetTrack()   // track na napili sa Menu > ⏰ Alarm (kung meron)
+                            }
                             onDone()
                         }
                     }
