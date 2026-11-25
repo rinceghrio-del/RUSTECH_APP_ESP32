@@ -1,6 +1,8 @@
 package com.example.facerobot
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import java.util.Base64
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -175,7 +177,28 @@ class SmartHome(context: Context) {
     @Volatile private var tuyaClientKey: String = ""
 
     init {
+        installWifiBinder(context.applicationContext)
         warmUp()
+    }
+
+    /**
+     * Ipilit na sa WiFi dumaan ang UDP ng RM (hindi sa mobile data). Kapag naka-on ang mobile data o
+     * "walang internet" ang WiFi, minsan ang default network ng Android ay hindi ang WiFi - kaya
+     * hindi naaabot ang RM sa LAN kahit tama ang IP.
+     */
+    @Suppress("DEPRECATION")
+    private fun installWifiBinder(ctx: Context) {
+        val cm = ctx.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+        Broadlink.socketBinder = { sock ->
+            try {
+                val wifi = cm.allNetworks.firstOrNull { n ->
+                    cm.getNetworkCapabilities(n)?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                }
+                if (wifi != null) wifi.bindSocket(sock)
+            } catch (_: Exception) {
+                // walang magagawa - gagamitin ang default network
+            }
+        }
     }
 
     /** I-save ang nabasang device (id, local key, ip, version) - ang walang laman ay hindi ginagalaw. */
@@ -322,7 +345,12 @@ class SmartHome(context: Context) {
         rmExecutor.execute {
             try {
                 val ip = rmIp.ifBlank { null }
-                onDone(Broadlink.discover(ip, 3500), null)
+                var found = Broadlink.discover(ip, 3500)
+                if (found.isEmpty()) {
+                    // Walang sumagot sa naka-save na IP (o walang IP) - hanapin sa buong WiFi subnet
+                    found = Broadlink.discover(null, 4500, sweepPrefixes = Esp32Finder.localPrefixes())
+                }
+                onDone(found, null)
             } catch (e: Exception) {
                 onDone(emptyList(), friendlyError(e))
             }
@@ -463,13 +491,19 @@ class SmartHome(context: Context) {
             loadCachedRm(savedIp)?.let { rmDevice = it; return it }
         }
 
-        val found = Broadlink.discover(savedIp.ifBlank { null }, 3500, stopWhenFound = true)
-        val pick = found.firstOrNull { savedIp.isBlank() || it.host == savedIp }
+        var found = Broadlink.discover(savedIp.ifBlank { null }, 3500, stopWhenFound = true)
+        if (found.isEmpty()) {
+            // Walang sagot sa naka-save na IP (o walang IP): baka nagbago ang IP ng RM - hanapin sa buong subnet
+            found = Broadlink.discover(null, 4500, sweepPrefixes = Esp32Finder.localPrefixes())
+        }
+        val pick = found.firstOrNull { it.host == savedIp }
+            ?: found.firstOrNull { savedMac().let { m -> m != null && it.macRaw.contentEquals(m) } }
+            ?: found.firstOrNull()
             ?: throw BroadlinkException(
                 if (savedIp.isBlank()) "Walang Broadlink na nakita sa WiFi - ilagay ang IP ng RM mini 3"
-                else "Walang sumagot sa $savedIp - tama ba ang IP at nasa parehong WiFi?"
+                else "Walang sumagot sa $savedIp at wala ring nakitang RM sa WiFi - nakakonekta ba ang phone sa parehong WiFi ng RM?"
             )
-        if (savedIp.isBlank()) rmIp = pick.host
+        if (pick.host != savedIp) rmIp = pick.host
         saveCachedRm(pick)
         val dev = BroadlinkDevice(pick)
         rmDevice = dev
@@ -477,6 +511,12 @@ class SmartHome(context: Context) {
     }
 
     // --- Cache ng impormasyon ng RM (para hindi na mag-discover tuwing bubuksan ang app) ---------
+
+    private fun savedMac(): ByteArray? {
+        val macHex = prefs.getString("rm_mac", "") ?: ""
+        if (macHex.length != 12) return null
+        return runCatching { Broadlink.hexToBytes(macHex) }.getOrNull()
+    }
 
     private fun saveCachedRm(f: Broadlink.Found) {
         val mac = f.macRaw.joinToString("") { "%02x".format(it) }
@@ -493,12 +533,18 @@ class SmartHome(context: Context) {
      * Ibinabalik ang bagong IP, o null kung wala/hindi nagbago. Isang beses lang bawat 30 segundo.
      */
     private fun relocateRm(): String? {
-        val macHex = prefs.getString("rm_mac", "") ?: ""
-        if (macHex.length != 12) return null
+        val mac = savedMac()
         val now = System.currentTimeMillis()
-        if (now - rmRelocateLastMs < 30_000L) return null
+        if (now - rmRelocateLastMs < 10_000L) return null
         rmRelocateLastMs = now
-        val f = Broadlink.findByMac(Broadlink.hexToBytes(macHex)) ?: return null
+        val prefixes = Esp32Finder.localPrefixes()
+        val found: Broadlink.Found? = if (mac != null) {
+            Broadlink.findByMac(mac, timeoutMs = 4000, sweepPrefixes = prefixes)
+        } else {
+            // Wala pang naka-save na MAC (lumang version ng app) - kunin ang unang Broadlink na makita
+            Broadlink.discover(null, 4000, sweepPrefixes = prefixes).firstOrNull()
+        }
+        val f = found ?: return null
         if (f.host == rmIp) return null
         rmIp = f.host
         saveCachedRm(f)
