@@ -23,6 +23,16 @@ class BroadlinkException(message: String) : Exception(message)
 object Broadlink {
     const val DEFAULT_PORT = 80
 
+    /**
+     * Hook para i-bind ang UDP socket sa WiFi network (ginagawa ng SmartHome gamit ang ConnectivityManager).
+     * Kung hindi naka-bind, puwedeng dumaan sa mobile data ang packet at hindi maabot ang RM sa LAN.
+     */
+    @Volatile var socketBinder: ((DatagramSocket) -> Unit)? = null
+
+    internal fun bindToWifi(sock: DatagramSocket) {
+        try { socketBinder?.invoke(sock) } catch (_: Exception) { }
+    }
+
     internal val INIT_KEY: ByteArray = hexToBytes("097628343fe99e23765c1513accf8b02")
     internal val INIT_IV: ByteArray = hexToBytes("562e17996d093d28ddb3ba695a2e6f58")
 
@@ -100,7 +110,8 @@ object Broadlink {
         targetIp: String? = null,
         timeoutMs: Int = 3000,
         port: Int = DEFAULT_PORT,
-        stopWhenFound: Boolean = false // huminto agad sa unang sagot (mas mabilis; hindi na hinihintay ang buong timeout)
+        stopWhenFound: Boolean = false, // huminto agad sa unang sagot (mas mabilis; hindi na hinihintay ang buong timeout)
+        sweepPrefixes: List<String> = emptyList() // hal. "192.168.1." - kapag may laman, tinitingnan ang .1-.254 isa-isa (unicast) + subnet broadcast
     ): List<Found> {
         val packet = ByteArray(0x30)
         val now = ZonedDateTime.now()
@@ -120,6 +131,7 @@ object Broadlink {
         val seen = HashSet<String>()
 
         DatagramSocket().use { sock ->
+            bindToWifi(sock)
             sock.broadcast = true
             val deadline = System.currentTimeMillis() + timeoutMs
             var nextSend = 0L
@@ -127,7 +139,18 @@ object Broadlink {
             while (System.currentTimeMillis() < deadline) {
                 val t = System.currentTimeMillis()
                 if (t >= nextSend) {
-                    sock.send(DatagramPacket(packet, packet.size, target, port))
+                    if (sweepPrefixes.isEmpty() || !targetIp.isNullOrBlank()) {
+                        sock.send(DatagramPacket(packet, packet.size, target, port))
+                    } else {
+                        // Hindi maaasahan ang 255.255.255.255 sa Android - kaya subnet broadcast + isa-isang unicast sa bawat IP
+                        for (prefix in sweepPrefixes) {
+                            for (host in 255 downTo 1) {
+                                try {
+                                    sock.send(DatagramPacket(packet, packet.size, InetAddress.getByName(prefix + host), port))
+                                } catch (_: Exception) { }
+                            }
+                        }
+                    }
                     nextSend = t + 1000
                 }
                 sock.soTimeout = 250
@@ -158,8 +181,14 @@ object Broadlink {
      * Hanapin ang RM na may ganitong MAC (para makita pa rin kahit nagbago ang IP). Broadcast sa buong WiFi
      * (o sa "via" kung ibinigay). Naghihintay ng buong timeout dahil kailangang makita ang lahat ng sumagot.
      */
-    fun findByMac(mac: ByteArray, via: String? = null, timeoutMs: Int = 2500, port: Int = DEFAULT_PORT): Found? =
-        discover(via, timeoutMs, port).firstOrNull { it.macRaw.contentEquals(mac) }
+    fun findByMac(
+        mac: ByteArray,
+        via: String? = null,
+        timeoutMs: Int = 2500,
+        port: Int = DEFAULT_PORT,
+        sweepPrefixes: List<String> = emptyList()
+    ): Found? =
+        discover(via, timeoutMs, port, sweepPrefixes = sweepPrefixes).firstOrNull { it.macRaw.contentEquals(mac) }
 }
 
 /**
@@ -304,6 +333,7 @@ class BroadlinkDevice(
 
         val addr = InetAddress.getByName(host)
         DatagramSocket().use { sock ->
+            Broadlink.bindToWifi(sock)
             sock.connect(addr, port) // sagot lang galing sa device na ito ang tatanggapin
             val deadline = System.currentTimeMillis() + totalMs
             val buf = ByteArray(2048)
